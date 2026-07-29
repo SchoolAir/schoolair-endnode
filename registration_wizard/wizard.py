@@ -875,6 +875,17 @@ def _fix_owner(path: str) -> None:
             pass
 
 
+def _has_token() -> bool:
+    """Return True if AUTH_TOKEN is present and non-empty in the telemetry .env."""
+    try:
+        for line in open(PI_MAIN_ENV_PATH).read().splitlines():
+            if line.startswith("AUTH_TOKEN="):
+                return bool(line[len("AUTH_TOKEN="):].strip())
+    except OSError:
+        pass
+    return False
+
+
 def _write_env_key(key: str, value: str) -> None:
     content = ""
     if os.path.exists(PI_MAIN_ENV_PATH):
@@ -1533,6 +1544,8 @@ async def _idle_watchdog() -> None:
     await asyncio.sleep(5)
     if await _ap_is_active():
         return  # setup mode — wizard shuts down after successful registration
+    if not _has_token():
+        return  # not yet registered — don't idle-timeout during initial registration
     while True:
         await asyncio.sleep(60)
         if time.time() - _last_activity > IDLE_TIMEOUT:

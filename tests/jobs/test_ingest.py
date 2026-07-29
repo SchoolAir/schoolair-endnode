@@ -362,7 +362,7 @@ async def test_run_read_triggers_drain_when_interval_elapsed(monkeypatch):
     with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 400}}), \
          patch("jobs.ingest.load_criteria", return_value=[]), \
          patch("jobs.ingest.state"):
-        await _run_read(S)
+        await _run_read(S, [])
 
     assert triggered, "trigger_drain should be called after drain interval elapses"
 
@@ -376,7 +376,7 @@ async def test_run_read_does_not_trigger_drain_before_interval(monkeypatch):
     with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 400}}), \
          patch("jobs.ingest.load_criteria", return_value=[]), \
          patch("jobs.ingest.state"):
-        await _run_read(S)
+        await _run_read(S, [])
 
     assert not triggered, "trigger_drain must not be called before drain interval"
 
@@ -393,7 +393,7 @@ async def test_run_read_does_not_trigger_drain_during_verification(monkeypatch):
     with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 400}}), \
          patch("jobs.ingest.load_criteria", return_value=[]), \
          patch("jobs.ingest.state"):
-        await _run_read(S)
+        await _run_read(S, [])
 
     assert not triggered, "trigger_drain must be suppressed during alert verification"
 
@@ -407,7 +407,7 @@ async def test_run_read_does_not_trigger_drain_on_sensor_error(monkeypatch):
     monkeypatch.setattr(ingest, "trigger_drain", lambda: triggered.append(1))
 
     with patch("jobs.ingest.read_sensor", side_effect=RuntimeError("sensor off")):
-        await _run_read(S)
+        await _run_read(S, [])
 
     assert not triggered, "trigger_drain must not be called when sensor read fails"
     assert ingest._buffer == [], "nothing should be buffered on sensor error"

@@ -25,14 +25,14 @@ from datetime import datetime, timezone, timedelta, time
 from pathlib import Path
 import httpx
 from dotenv import load_dotenv
-from services.sensor import read_sensor, extract_metric
+from services.sensor import read_sensor, extract_metric, probe_aux_sensors, read_aux_sensor
 import db.queue as queue
 import jobs.aggregate as aggregate
 import state
 
 load_dotenv()
 
-VERSION            = "2.0.0"
+VERSION            = "2.1.0"
 
 # Primary (authoritative) server — AWS.  Buffer/SQLite retention is decided by
 # whether this server accepts or rejects the drain.
@@ -726,7 +726,7 @@ def _should_drain(settings: dict) -> bool:
     return elapsed >= current_drain_interval(settings) - current_read_interval(settings)
 
 
-async def _run_read(settings: dict):
+async def _run_read(settings: dict, active_sensors: list):
     """Read one sensor sample, update buffer, and trigger verification on any breach."""
     recorded_at = datetime.now(timezone.utc).isoformat()
     try:
@@ -734,6 +734,11 @@ async def _run_read(settings: dict):
     except RuntimeError as e:
         print(f"Sensor read failed: {e}")
         return
+
+    for sensor in active_sensors:
+        reading = read_aux_sensor(sensor)
+        if reading:
+            data.update(reading)
 
     state.set(data, recorded_at)
     entry = {"data": data, "recorded_at": recorded_at, "severity": 0}
@@ -909,7 +914,7 @@ async def _run_drain(settings: dict):
 # --------------------------- Loops ---------------------------
 
 
-async def _read_loop(settings: dict):
+async def _read_loop(settings: dict, active_sensors: list):
     prev_active = _in_active_window(settings)
     while True:
         curr_active = _in_active_window(settings)
@@ -924,7 +929,7 @@ async def _read_loop(settings: dict):
                 print("[transition] idle→active: immediate read")
             prev_active = curr_active
 
-        await _run_read(settings)
+        await _run_read(settings, active_sensors)
         interval = current_read_interval(settings)
         delay = _seconds_to_next_boundary(interval)
         mode = "active" if curr_active else "idle"
@@ -962,17 +967,19 @@ async def _drain_loop(settings: dict):
 
 
 async def ingest_loop():
-    """Initialise SQLite, then run the read and drain loops concurrently."""
+    """Initialise SQLite, probe aux sensors once, then run read and drain loops."""
     queue.init()
     settings = load_settings()
     validate_settings(settings)
+    active_sensors = probe_aux_sensors()
     print(
         f"Ingest started — "
         f"reads {READ_ACTIVE_SECONDS}s/{READ_IDLE_SECONDS}s (active/idle) | "
         f"drains {DRAIN_ACTIVE_SECONDS}s/{DRAIN_IDLE_SECONDS}s (active/idle) | "
         f"buffer capacity {BUFFER_CAPACITY}"
+        + (f" | aux sensors: {', '.join(s['name'] for s in active_sensors)}" if active_sensors else "")
     )
     await asyncio.gather(
-        _read_loop(settings),
+        _read_loop(settings, active_sensors),
         _drain_loop(settings),
     )

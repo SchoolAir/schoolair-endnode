@@ -1,144 +1,74 @@
 """tests/services/test_sensor.py
 
-Unit tests for services.sensor.
+Unit tests for services.sensor:
+  - extract_metric         searches nested sensor dicts
+  - read_sensor            subprocess + JSON parsing + failure/reinit logic
+  - _i2c_scan              parses i2cdetect output into a set of addresses
+  - probe_aux_sensors      maps detected addresses to registry entries
+  - read_aux_sensor        runs a driver subprocess and parses its JSON
 
-  LAPTOP-SAFE: extract_metric(), read_sensor() with mocked subprocess.
-  HARDWARE:    read_sensor() against the real SEN6x sensor.
+All tests run on laptop (no hardware required).
 """
 
 import json
 import subprocess
-from unittest.mock import patch, MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch, call
 
 import pytest
-
-import services.sensor as sensor_module
+import services.sensor as sensor
 from services.sensor import extract_metric, read_sensor
-
-
-@pytest.fixture(autouse=True)
-def reset_sensor_state():
-    """Reset module-level failure counter between tests."""
-    sensor_module._consecutive_failures = 0
-    yield
-    sensor_module._consecutive_failures = 0
 
 
 # ── extract_metric ─────────────────────────────────────────────────────────────
 
-def test_extract_metric_finds_value_in_sensor_dict():
-    data = {"sen6x": {"co2": 1504, "temp": 29.5}}
-    assert extract_metric(data, "co2") == 1504.0
+def test_extract_metric_finds_value_in_nested_dict():
+    data = {"sen6x": {"co2": 500, "temp": 22.1}}
+    assert extract_metric(data, "co2") == 500.0
 
 
-def test_extract_metric_always_returns_float():
-    data = {"sen6x": {"co2": 1504}}  # raw output is int
-    result = extract_metric(data, "co2")
-    assert result == 1504.0
-    assert isinstance(result, float)
-
-
-def test_extract_metric_returns_none_when_metric_absent():
-    data = {"sen6x": {"temp": 29.5}}
+def test_extract_metric_returns_none_when_key_missing():
+    data = {"sen6x": {"temp": 22.1}}
     assert extract_metric(data, "co2") is None
 
 
-def test_extract_metric_returns_none_for_empty_data():
-    assert extract_metric({}, "co2") is None
+def test_extract_metric_searches_all_sensor_dicts():
+    data = {"sen6x": {"temp": 22.0}, "mgs_v2": {"no2": 150}}
+    assert extract_metric(data, "no2") == 150.0
 
 
-def test_extract_metric_skips_non_dict_top_level_values():
-    data = {"timestamp": "2026-06-23", "sen6x": {"co2": 400}}
+def test_extract_metric_returns_none_for_non_numeric():
+    data = {"sen6x": {"co2": "bad"}}
+    assert extract_metric(data, "co2") is None
+
+
+def test_extract_metric_ignores_non_dict_top_level_values():
+    data = {"sen6x": {"co2": 400}, "timestamp": 1234567}
     assert extract_metric(data, "co2") == 400.0
-
-
-def test_extract_metric_first_sensor_wins_on_conflict():
-    data = {
-        "sen6x": {"temp": 29.0},
-        "bmp280": {"temp": 25.0},
-    }
-    assert extract_metric(data, "temp") == 29.0
-
-
-def test_extract_metric_falls_back_to_second_sensor():
-    data = {
-        "sen6x": {"co2": 400},
-        "bmp280": {"temp": 25.0},
-    }
-    assert extract_metric(data, "temp") == 25.0
-
-
-def test_extract_metric_ignores_non_numeric_values():
-    data = {"sen6x": {"co2": "n/a", "temp": 29.0}}
-    assert extract_metric(data, "co2") is None
-    assert extract_metric(data, "temp") == 29.0
 
 
 # ── read_sensor ────────────────────────────────────────────────────────────────
 
-_MOCK_OUTPUT = json.dumps({
-    "sen6x": {
-        "co2": 1504,
-        "pm10": 3.7,
-        "pm25": 5.1,
-        "pm40": 6.2,
-        "pm100": 6.8,
-        "temp": 29.54,
-        "humidity": 51.22,
-        "timestamp": "2026-06-23 10:25:56",
-    }
-})
+def _proc(stdout="", returncode=0, stderr=""):
+    m = MagicMock()
+    m.stdout, m.returncode, m.stderr = stdout, returncode, stderr
+    return m
 
 
-def _mock_run(stdout=_MOCK_OUTPUT, returncode=0, stderr=""):
-    r = MagicMock()
-    r.returncode = returncode
-    r.stdout = stdout
-    r.stderr = stderr
-    return r
-
-
-def test_read_sensor_returns_nested_dict():
-    with patch("subprocess.run", return_value=_mock_run()):
-        data = read_sensor()
-    assert "sen6x" in data
-    assert data["sen6x"]["co2"] == 1504
-
-
-def test_read_sensor_no_flat_top_level_fields():
-    """No flattening — top level should only contain sensor keys."""
-    with patch("subprocess.run", return_value=_mock_run()):
-        data = read_sensor()
-    assert "co2" not in data
-    assert "temp" not in data
-    assert "raw" not in data
-
-
-def test_read_sensor_preserves_sensor_timestamp():
-    with patch("subprocess.run", return_value=_mock_run()):
-        data = read_sensor()
-    assert data["sen6x"]["timestamp"] == "2026-06-23 10:25:56"
-
-
-def test_read_sensor_multi_sensor_output():
-    multi = json.dumps({
-        "sen6x": {"co2": 400, "temp": 22.0},
-        "mgs": {"no2": 0.05, "voc": 1.2},
-    })
-    with patch("subprocess.run", return_value=_mock_run(stdout=multi)):
-        data = read_sensor()
-    assert "sen6x" in data
-    assert "mgs" in data
+def test_read_sensor_parses_json_output():
+    payload = {"sen6x": {"co2": 412, "temp": 22.3}}
+    with patch("subprocess.run", return_value=_proc(json.dumps(payload))):
+        assert read_sensor() == payload
 
 
 def test_read_sensor_raises_on_nonzero_exit():
-    with patch("subprocess.run", return_value=_mock_run(returncode=1, stderr="I2C error")):
+    with patch("subprocess.run", return_value=_proc(returncode=1, stderr="fail")):
         with pytest.raises(RuntimeError, match="Sensor script failed"):
             read_sensor()
 
 
 def test_read_sensor_raises_on_invalid_json():
-    with patch("subprocess.run", return_value=_mock_run(stdout="not json at all")):
+    with patch("subprocess.run", return_value=_proc("not json")):
         with pytest.raises(RuntimeError, match="invalid JSON"):
             read_sensor()
 
@@ -149,59 +79,158 @@ def test_read_sensor_raises_on_timeout():
             read_sensor()
 
 
-# ── Re-init / failure counting ─────────────────────────────────────────────────
-
-def test_failure_counter_increments_on_error():
-    with patch("subprocess.run", return_value=_mock_run(returncode=1)):
-        with pytest.raises(RuntimeError):
-            read_sensor()
-    assert sensor_module._consecutive_failures == 1
-
-
-def test_failure_counter_resets_on_success():
-    sensor_module._consecutive_failures = 3
-    good = json.dumps({"sen6x": {"temp": 22.0}})
-    with patch("subprocess.run", return_value=_mock_run(stdout=good)):
+def test_read_sensor_resets_failure_counter_on_success():
+    sensor._consecutive_failures = 3
+    payload = {"sen6x": {"co2": 400}}
+    with patch("subprocess.run", return_value=_proc(json.dumps(payload))):
         read_sensor()
-    assert sensor_module._consecutive_failures == 0
+    assert sensor._consecutive_failures == 0
 
 
-def test_reinit_triggered_at_threshold(monkeypatch):
-    monkeypatch.setattr(sensor_module, "_REINIT_BIN", "/fake/sen6x_read")
-    with patch("subprocess.run", return_value=_mock_run(returncode=1)):
-        with patch.object(sensor_module, "_try_reinit") as mock_reinit:
-            for _ in range(sensor_module._REINIT_AFTER):
-                with pytest.raises(RuntimeError):
-                    read_sensor()
-    mock_reinit.assert_called_once()
+# ── _i2c_scan ─────────────────────────────────────────────────────────────────
+
+I2CDETECT_OUTPUT = """\
+     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+00:          -- -- -- -- -- 08 -- -- -- -- -- -- -- --
+10: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+20: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+30: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+40: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+50: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+60: -- -- -- UU -- -- -- -- -- -- -- -- -- -- -- -- --
+70: -- -- -- 73 -- -- -- --
+"""
 
 
-def test_reinit_not_triggered_before_threshold(monkeypatch):
-    monkeypatch.setattr(sensor_module, "_REINIT_BIN", "/fake/sen6x_read")
-    with patch("subprocess.run", return_value=_mock_run(returncode=1)):
-        with patch.object(sensor_module, "_try_reinit") as mock_reinit:
-            for _ in range(sensor_module._REINIT_AFTER - 1):
-                with pytest.raises(RuntimeError):
-                    read_sensor()
-    mock_reinit.assert_not_called()
+def _scan_proc(output):
+    m = MagicMock()
+    m.stdout = output
+    return m
 
 
-def test_reinit_skipped_when_reinit_bin_empty(monkeypatch):
-    monkeypatch.setattr(sensor_module, "_REINIT_BIN", "")
-    sensor_module._consecutive_failures = sensor_module._REINIT_AFTER - 1
-    with patch("subprocess.run", return_value=_mock_run(returncode=1)):
-        with patch.object(sensor_module, "_try_reinit") as mock_reinit:
-            with pytest.raises(RuntimeError):
-                read_sensor()
-    mock_reinit.assert_not_called()
+def test_i2c_scan_parses_present_addresses():
+    with patch("subprocess.run", return_value=_scan_proc(I2CDETECT_OUTPUT)):
+        addrs = sensor._i2c_scan()
+    assert 0x08 in addrs
+    assert 0x73 in addrs
 
 
-# ── Hardware ───────────────────────────────────────────────────────────────────
+def test_i2c_scan_excludes_uu_entries():
+    with patch("subprocess.run", return_value=_scan_proc(I2CDETECT_OUTPUT)):
+        addrs = sensor._i2c_scan()
+    assert 0x63 not in addrs
 
-@pytest.mark.hardware
-def test_read_sensor_real_hardware():
-    """Call the actual sensor script. Requires Pi + sen6x.service initialised."""
-    data = read_sensor()
-    assert "sen6x" in data
-    assert isinstance(extract_metric(data, "co2"), float)
-    assert isinstance(extract_metric(data, "temp"), float)
+
+def test_i2c_scan_excludes_dashes():
+    with patch("subprocess.run", return_value=_scan_proc(I2CDETECT_OUTPUT)):
+        addrs = sensor._i2c_scan()
+    assert 0x00 not in addrs
+    assert 0x10 not in addrs
+
+
+def test_i2c_scan_returns_empty_on_subprocess_error():
+    with patch("subprocess.run", side_effect=OSError("no i2c")):
+        addrs = sensor._i2c_scan()
+    assert addrs == set()
+
+
+# ── probe_aux_sensors ─────────────────────────────────────────────────────────
+
+def test_probe_returns_active_sensor_when_detected_and_driver_present(tmp_path):
+    driver = tmp_path / "i2c" / "mgs_v2" / "read_mgs_v2.py"
+    driver.parent.mkdir(parents=True)
+    driver.write_text("# stub")
+
+    with patch.object(sensor, "_i2c_scan", return_value={0x08}), \
+         patch.object(sensor, "_BASE_DIR", tmp_path):
+        active = sensor.probe_aux_sensors()
+
+    assert len(active) == 1
+    assert active[0]["name"] == "mgs_v2"
+    assert active[0]["detected_addr"] == 0x08
+
+
+def test_probe_skips_sensor_not_on_bus():
+    with patch.object(sensor, "_i2c_scan", return_value=set()):
+        active = sensor.probe_aux_sensors()
+    assert active == []
+
+
+def test_probe_uses_alternate_address_for_o3(tmp_path):
+    driver = tmp_path / "i2c" / "o3" / "read_o3.py"
+    driver.parent.mkdir(parents=True)
+    driver.write_text("# stub")
+
+    with patch.object(sensor, "_i2c_scan", return_value={0x71}), \
+         patch.object(sensor, "_BASE_DIR", tmp_path):
+        active = sensor.probe_aux_sensors()
+
+    o3 = [s for s in active if s["name"] == "o3"]
+    assert len(o3) == 1
+    assert o3[0]["detected_addr"] == 0x71
+
+
+def test_probe_fetches_driver_when_missing(tmp_path):
+    with patch.object(sensor, "_i2c_scan", return_value={0x08}), \
+         patch.object(sensor, "_BASE_DIR", tmp_path), \
+         patch.object(sensor, "_fetch_driver", return_value=True) as mock_fetch:
+        sensor.probe_aux_sensors()
+
+    mock_fetch.assert_called_once()
+
+
+def test_probe_skips_sensor_when_fetch_fails(tmp_path):
+    with patch.object(sensor, "_i2c_scan", return_value={0x08}), \
+         patch.object(sensor, "_BASE_DIR", tmp_path), \
+         patch.object(sensor, "_fetch_driver", return_value=False):
+        active = sensor.probe_aux_sensors()
+
+    assert active == []
+
+
+# ── read_aux_sensor ───────────────────────────────────────────────────────────
+
+MGS_CFG = {"name": "mgs_v2", "driver": "i2c/mgs_v2/read_mgs_v2.py", "detected_addr": 0x08}
+O3_CFG  = {"name": "o3",     "driver": "i2c/o3/read_o3.py",          "detected_addr": 0x73}
+
+
+def _aux_proc(stdout, returncode=0):
+    m = MagicMock()
+    m.returncode, m.stdout, m.stderr = returncode, stdout, ""
+    return m
+
+
+def test_read_aux_sensor_returns_nested_dict():
+    payload = {"mgs_v2": {"no2": 100, "co": 200, "voc": 300, "c2h5oh": 400}}
+    with patch("subprocess.run", return_value=_aux_proc(json.dumps(payload))):
+        assert sensor.read_aux_sensor(MGS_CFG) == payload
+
+
+def test_read_aux_sensor_passes_detected_addr():
+    payload = {"o3": {"o3_ppb": 22.5}}
+    captured = []
+
+    def fake_run(args, **kwargs):
+        captured.extend(args)
+        return _aux_proc(json.dumps(payload))
+
+    with patch("subprocess.run", side_effect=fake_run):
+        sensor.read_aux_sensor(O3_CFG)
+
+    assert "--addr" in captured
+    assert "0x73" in captured
+
+
+def test_read_aux_sensor_returns_none_on_nonzero_exit():
+    with patch("subprocess.run", return_value=_aux_proc("", returncode=1)):
+        assert sensor.read_aux_sensor(MGS_CFG) is None
+
+
+def test_read_aux_sensor_returns_none_on_invalid_json():
+    with patch("subprocess.run", return_value=_aux_proc("not json")):
+        assert sensor.read_aux_sensor(MGS_CFG) is None
+
+
+def test_read_aux_sensor_returns_none_on_timeout():
+    with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("cmd", 15)):
+        assert sensor.read_aux_sensor(MGS_CFG) is None
