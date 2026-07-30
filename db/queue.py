@@ -9,6 +9,7 @@ On startup, resets any rows stuck in 'sending' back to 'pending' for retry.
 
 import sqlite3
 import json
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 
@@ -205,3 +206,37 @@ def remove_alerts(ids: list[int]):
             "DELETE FROM alerts_queue WHERE id = ?",
             [(i,) for i in ids]
         )
+
+
+# ── Clock correction ─────────────────────────────────────────────────────────
+
+
+def apply_clock_correction(boundary_iso: str, delta_seconds: float) -> int:
+    """Shift recorded_at on all rows at or before boundary_iso by delta_seconds.
+
+    Called once after the first NTP sync when the Pi booted without a synced
+    clock.  Returns the number of rows updated.
+    """
+    delta = timedelta(seconds=delta_seconds)
+    with _connect() as con:
+        rows = con.execute(
+            "SELECT id, recorded_at FROM measurements_queue WHERE recorded_at <= ?",
+            (boundary_iso,),
+        ).fetchall()
+        if not rows:
+            return 0
+        updates = []
+        for row in rows:
+            try:
+                ts = datetime.fromisoformat(row["recorded_at"])
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                updates.append(((ts + delta).isoformat(), row["id"]))
+            except ValueError:
+                pass
+        if updates:
+            con.executemany(
+                "UPDATE measurements_queue SET recorded_at = ? WHERE id = ?",
+                updates,
+            )
+        return len(updates)

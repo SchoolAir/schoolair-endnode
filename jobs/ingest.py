@@ -1,26 +1,28 @@
 """jobs/ingest.py
 
-Two-speed data pipeline:
+Write-through pipeline with local fallback and server-controlled backlog drain:
 
-  Read loop  — collects a sensor reading every READ_ACTIVE_SECONDS (active
-               window) or READ_IDLE_SECONDS (outside window) and holds it in
-               an in-memory buffer.  Nothing is written to disk here.
+  Read loop   — collects a sensor reading every READ_ACTIVE_SECONDS (active
+                window) or READ_IDLE_SECONDS (outside window), aligned to the
+                device's upload offset, and signals _live_event.
 
-  Drain loop — event-driven: the read loop triggers a drain after each standard
-               read once DRAIN_ACTIVE_SECONDS / DRAIN_IDLE_SECONDS have elapsed
-               since the last drain.  The drain loop itself is a pure event
-               consumer with a long fallback timeout as a safety net.
+  Upload loop — on each live reading: POSTs immediately to the server with
+                the current backlog count; falls back to SQLite on failure.
+                On success, drains any SQLite backlog using the server-granted
+                credit_bytes, pacing between batches with recommended_delay_seconds.
+                A new live reading interrupts the drain sleep and is sent first;
+                the drain then resumes with the freshly returned credit.
 
-SQLite is written only when the buffer hits BUFFER_CAPACITY *and* the server is
-unreachable — so during normal operation the SD card is never touched for
-telemetry data.  If the device later reconnects, the next drain sends both the
-SQLite backlog and the current in-memory buffer together.
+  NTP task    — monitors wall-clock divergence from the monotonic projection.
+                On first NTP step fires a one-time bulk timestamp correction
+                on SQLite readings taken before sync was established.
 """
 
 import asyncio
 import json
 import os
 import random
+import time as _time_mod
 from datetime import datetime, timezone, timedelta, time
 from pathlib import Path
 import httpx
@@ -32,67 +34,61 @@ import state
 
 load_dotenv()
 
-VERSION            = "2.1.0"
+VERSION = "2.1.0"
 
-# Primary (authoritative) server — AWS.  Buffer/SQLite retention is decided by
-# whether this server accepts or rejects the drain.
 _PRIMARY_SERVER_URL   = os.getenv("NEW_SERVER_URL", "").rstrip("/")
 _PRIMARY_INGEST_URL   = os.getenv("NEW_INGEST_URL", f"{_PRIMARY_SERVER_URL}/aqc/v1/ingest") if _PRIMARY_SERVER_URL else ""
-
-# Secondary (legacy) server — best-effort mirror.  Failures are logged but
-# never affect buffering or retries.
 _SECONDARY_SERVER_URL = os.getenv("SERVER_URL", "").rstrip("/")
 _SECONDARY_INGEST_URL = os.getenv("INGEST_URL", f"{_SECONDARY_SERVER_URL}/aqc/v1/ingest")
 _SECONDARY_AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
-ALERT_NEAR_PCT     = float(os.getenv("ALERT_NEAR_PCT", 10))  # within N% of threshold = "near"
-ALERT_COOLDOWN_HRS = float(os.getenv("ALERT_COOLDOWN_HOURS", 1))
-BUFFER_CAPACITY    = int(os.getenv("BUFFER_CAPACITY", 500))
 
-# Read and drain intervals are hardcoded, not user-configurable.
-# Overridable via env var for development and testing only.
-READ_ACTIVE_SECONDS  = int(os.getenv("READ_INTERVAL_ACTIVE",  300))   # 5 min
-READ_IDLE_SECONDS    = int(os.getenv("READ_INTERVAL_IDLE",    900))   # 15 min
-DRAIN_ACTIVE_SECONDS = int(os.getenv("DRAIN_INTERVAL_ACTIVE", 1800))  # 30 min
-DRAIN_IDLE_SECONDS   = int(os.getenv("DRAIN_INTERVAL_IDLE",   7200))  # 2 h
-DRAIN_JITTER_MAX     = int(os.getenv("DRAIN_JITTER_MAX",       120))  # 2 min spread
+ALERT_NEAR_PCT        = float(os.getenv("ALERT_NEAR_PCT", 10))
+ALERT_COOLDOWN_HRS    = float(os.getenv("ALERT_COOLDOWN_HOURS", 1))
+
+# Read intervals (not user-configurable; env vars for testing only)
+READ_ACTIVE_SECONDS   = int(os.getenv("READ_INTERVAL_ACTIVE",  300))   # 5 min
+READ_IDLE_SECONDS     = int(os.getenv("READ_INTERVAL_IDLE",    900))   # 15 min
+
+# Drain interval constants kept as reference (no longer drive a timer)
+DRAIN_ACTIVE_SECONDS  = int(os.getenv("DRAIN_INTERVAL_ACTIVE", 1800))
+DRAIN_IDLE_SECONDS    = int(os.getenv("DRAIN_INTERVAL_IDLE",   7200))
+DRAIN_JITTER_MAX      = int(os.getenv("DRAIN_JITTER_MAX",       120))  # fallback jitter cap
 
 CRITERIA_PATH = Path("config/criteria.json")
 SETTINGS_PATH = Path("config/settings.json")
 
-DEFAULT_SETTINGS = {
-    "active_window": {"start": "07:00", "end": "16:00"},
-}
+DEFAULT_SETTINGS = {"active_window": {"start": "07:00", "end": "16:00"}}
 
 MAX_ACTIVE_HOURS = 9
-BATCH_SIZE       = 500
 
-# In-memory buffer: readings not yet sent to the server.
-# Each entry: {"data": dict, "recorded_at": str}
-_buffer: list[dict] = []
+NTP_CORRECTED_KEY    = "ntp_clock_corrected"
+NTP_STEP_THRESHOLD_S = 30  # divergence above this (seconds) indicates an NTP step
+
+# ── Upload state ──────────────────────────────────────────────────────────────
+
+_pending_live:      dict | None   = None   # reading ready to POST (set by _run_read)
+_live_event:        asyncio.Event | None = None  # signalled when _pending_live is ready
+_credit_bytes:      int   = 0              # server-granted byte budget; always overwritten
+_recommended_delay: float = 0.0            # seconds to wait between drain batches
+
+# ── Alert state ───────────────────────────────────────────────────────────────
+
+_alert_buffer:        list[dict]         = []
+ALERT_BUFFER_CAPACITY = int(os.getenv("ALERT_BUFFER_CAPACITY", 50))
+alert_cooldown:       dict[str, datetime] = {}
+_verifying:           set[str]           = set()
+
+# ── OTA state ─────────────────────────────────────────────────────────────────
+
 _update_in_progress = False
 
-alert_cooldown:       dict[str, datetime] = {}
-_verifying:           set[str]            = set()   # metrics currently in a verify routine
-_alert_buffer:        list[dict]          = []      # alerts pending send (in-memory first)
-ALERT_BUFFER_CAPACITY = int(os.getenv("ALERT_BUFFER_CAPACITY", 50))
+# ── NTP correction state ──────────────────────────────────────────────────────
 
-# Set by trigger_drain() (SIGUSR2 handler or internal callers) to wake the
-# drain loop.  Initialised to None until the event loop is running.
-_drain_trigger:   asyncio.Event | None = None
-_last_drained_at: datetime | None     = None
+_ntp_fake_wall: datetime | None = None   # wall-clock value recorded at service start
+_ntp_mono_ref:  float    | None = None   # monotonic value recorded at service start
 
 
-def trigger_drain() -> None:
-    """Request an immediate out-of-schedule drain.
-
-    Safe to call from asyncio signal handlers or from any coroutine.
-    No-op if the drain loop hasn't started yet.
-    """
-    if _drain_trigger is not None:
-        _drain_trigger.set()
-
-
-# --------------------------- Settings ---------------------------
+# ── Settings ──────────────────────────────────────────────────────────────────
 
 
 def _parse_hhmm(hhmm: str) -> time:
@@ -130,12 +126,11 @@ def load_settings() -> dict:
 
 
 def _ensure_drain_jitter(settings: dict) -> int:
-    """Return the persisted drain jitter offset for this device.
+    """Return the persisted upload jitter offset for this device.
 
-    If `drain_jitter_seconds` is already in settings, that value is used
-    unchanged — making it easy to migrate to server-assigned slots later by
-    simply writing the value into settings.json.  If absent, a random offset
-    in [0, DRAIN_JITTER_MAX] is generated, saved to settings.json, and returned.
+    If drain_jitter_seconds is already in settings it is used unchanged —
+    making migration to server-assigned offsets easy (write the value into
+    settings.json).  If absent a random offset is generated, saved, and returned.
     """
     if "drain_jitter_seconds" in settings:
         return int(settings["drain_jitter_seconds"])
@@ -143,8 +138,20 @@ def _ensure_drain_jitter(settings: dict) -> int:
     settings["drain_jitter_seconds"] = jitter
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
-    print(f"[drain] jitter slot assigned: {jitter}s — saved to {SETTINGS_PATH}")
+    print(f"[upload] jitter slot assigned: {jitter}s — saved to {SETTINGS_PATH}")
     return jitter
+
+
+def _get_upload_offset(settings: dict) -> int:
+    """Return upload offset in seconds.
+
+    Prefers server-assigned UPLOAD_OFFSET from .env (written at provisioning).
+    Falls back to locally-generated jitter stored in settings.json.
+    """
+    env_val = os.getenv("UPLOAD_OFFSET", "").strip()
+    if env_val.lstrip("-").isdigit():
+        return int(env_val)
+    return _ensure_drain_jitter(settings)
 
 
 _VALID_BOUNDARY_MINUTES = {0, 15, 30, 45}
@@ -175,21 +182,19 @@ def current_drain_interval(settings: dict, now: time | None = None) -> int:
     return DRAIN_ACTIVE_SECONDS if _in_active_window(settings, now) else DRAIN_IDLE_SECONDS
 
 
-def _seconds_to_next_boundary(interval: int, now: datetime | None = None) -> float:
-    """Seconds until the next wall-clock multiple of *interval* seconds.
+def _seconds_to_next_boundary(interval: int, offset: int = 0, now: datetime | None = None) -> float:
+    """Seconds until the next upload boundary for this device.
 
-    Uses the Unix epoch as reference — valid because 300 and 900 both divide
-    evenly into 86400, so :00/:05/… and :00/:15/… boundaries align to whole
-    minutes regardless of date.  Callers always land on the same grid, so
-    accumulated per-read latency never carries forward.
+    offset shifts the boundary grid so devices within an organisation are
+    staggered.  offset=0 aligns to the Unix epoch (same as before).
     """
     if now is None:
         now = datetime.now(timezone.utc)
-    past = now.timestamp() % interval
+    past = (now.timestamp() - offset) % interval
     return float(interval - past)
 
 
-# --------------------------- Criteria ---------------------------
+# ── Criteria ──────────────────────────────────────────────────────────────────
 
 
 def save_criteria(criteria: list[dict]):
@@ -206,26 +211,20 @@ def load_criteria() -> list[dict]:
         return []
 
 
-# --------------------------- Alert verification ---------------------------
+# ── Alert verification ────────────────────────────────────────────────────────
 
 
 def _breached(value: float, threshold: float, condition: str) -> bool:
     if condition == "above":
         return value > threshold
-    return value < threshold  # "below"
+    return value < threshold
 
 
 def _near_or_breached(value: float, threshold: float, condition: str) -> bool:
-    """True if value is at or within ALERT_NEAR_PCT% of the threshold.
-
-    'Near' prevents the verify routine from declaring an event safe when the
-    reading has only just crept back below the line — e.g. PM2.5 = 24.8 with
-    threshold 25 is still worth watching.
-    """
     margin = threshold * ALERT_NEAR_PCT / 100
     if condition == "above":
         return value >= threshold - margin
-    return value <= threshold + margin  # "below" — near means slightly above the floor
+    return value <= threshold + margin
 
 
 def _set_cooldown(breaching: list[tuple[str, dict]], now_dt: datetime | None = None) -> None:
@@ -236,12 +235,6 @@ def _set_cooldown(breaching: list[tuple[str, dict]], now_dt: datetime | None = N
 
 
 def _buffer_alert(alert: dict):
-    """Add alert to the in-memory buffer; flush to SQLite if it hits capacity.
-
-    Mirrors the measurement buffer philosophy: SQLite is only written when both
-    the buffer is full AND the server is unreachable, keeping SD card writes rare.
-    With a 1h cooldown per metric, 50 slots covers days of outage.
-    """
     _alert_buffer.append(alert)
     if len(_alert_buffer) >= ALERT_BUFFER_CAPACITY:
         for a in _alert_buffer:
@@ -277,7 +270,6 @@ async def _send_or_queue_alert(
     r3: dict,
     r4: dict | None,
 ) -> None:
-    """Build and immediately send an alert for one metric; queue on failure."""
     threshold = float(criterion["threshold"])
     condition = criterion["condition"]
 
@@ -331,22 +323,7 @@ async def _send_or_queue_alert(
 
 
 async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
-    """Two-stage verification for all metrics that breached at T.
-
-    One sensor read per timing point, shared across all metrics.
-
-    Severity scoring (integer, 0-7 range):
-      +1  stage 1 launched (always, once any metric breaches)
-      +1  T+10s: any breaching metric still near/above its threshold
-      +1  T+30s: any breaching metric still near/above its threshold
-      +2  T+1m:  any breaching metric still near/above its threshold
-      +2  T+2m:  any breaching metric still near/above its threshold
-
-    Outcomes:
-      severity=1 (fluke)    — patch entry, drop all verification reads
-      severity 2-3 (momentary) — patch entry, add T+1m to buffer
-      severity>=4 (alert)   — patch entry, send per-metric alerts, drop reads
-    """
+    """Two-stage verification for all metrics that breached at T."""
     metrics_str = ", ".join(m for m, _ in breaching)
 
     def any_high(data: dict) -> bool:
@@ -356,12 +333,11 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
             for m, c in breaching
         )
 
-    sev = 1  # baseline: stage 1 launched
+    sev = 1
     r3: dict | None = None
     r3_at: str = ""
 
     try:
-        # ── Stage 1: T+10s ─────────────────────────────────────────────────────
         await asyncio.sleep(10)
         r1_at = datetime.now(timezone.utc).isoformat()
         try:
@@ -374,7 +350,6 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
         if any_high(r1):
             sev += 1
 
-        # ── Stage 1: T+30s ─────────────────────────────────────────────────────
         await asyncio.sleep(20)
         r2_at = datetime.now(timezone.utc).isoformat()
         try:
@@ -397,7 +372,6 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
             f"— advancing to stage 2 (severity so far={sev})"
         )
 
-        # ── Stage 2: T+1m ──────────────────────────────────────────────────────
         await asyncio.sleep(30)
         r3_at = datetime.now(timezone.utc).isoformat()
         try:
@@ -411,7 +385,6 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
         if any_high(r3):
             sev += 2
 
-        # ── Stage 2: T+2m ──────────────────────────────────────────────────────
         await asyncio.sleep(60)
         r4_at = datetime.now(timezone.utc).isoformat()
         r4: dict | None = None
@@ -432,29 +405,24 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
             print(f"[verify/{metrics_str}] stage 2: persistent breach (severity={sev})")
             for metric, criterion in breaching:
                 await _send_or_queue_alert(metric, criterion, entry, now_dt, r1, r2, r3, r4)
-            trigger_drain()
         else:
             print(
                 f"[verify/{metrics_str}] stage 2: both reads low "
                 f"— momentary event (severity={sev})"
             )
-            _buffer.append({"data": r3, "recorded_at": r3_at})
+            # r3 (T+1m) stored in SQLite; drained on next successful live POST
+            queue.enqueue(r3, r3_at)
 
     finally:
         for metric, _ in breaching:
             _verifying.discard(metric)
 
 
+# ── Alert drain ───────────────────────────────────────────────────────────────
+
+
 async def _drain_alerts():
-    """Flush the in-memory alert buffer (and any SQLite overflow) to the server.
-
-    Called after a successful measurement batch so we know we have connectivity.
-
-    Buffer-first:   alerts live in _alert_buffer in memory.
-    SQLite fallback: only written when the buffer hits ALERT_BUFFER_CAPACITY
-                     while the server is unreachable — rare with a 1h cooldown.
-    """
-    # ── Send in-memory buffer ─────────────────────────────────────────────────
+    """Flush the in-memory alert buffer (and any SQLite overflow) to the server."""
     if _alert_buffer:
         sent = 0
         try:
@@ -470,13 +438,10 @@ async def _drain_alerts():
                     except httpx.HTTPStatusError as e:
                         print(f"  Alert rejected ({e.response.status_code}) — will not retry")
                     sent += 1
-
             _alert_buffer.clear()
             if sent:
                 print(f"  Sent {sent} buffered alert(s)")
-
         except httpx.ConnectError:
-            # Keep unsent alerts in buffer; if now full, overflow to SQLite
             unsent = _alert_buffer[sent:]
             _alert_buffer.clear()
             _alert_buffer.extend(unsent)
@@ -487,9 +452,8 @@ async def _drain_alerts():
                     queue.enqueue_alert(a, a.get("recorded_at", datetime.now(timezone.utc).isoformat()))
                 _alert_buffer.clear()
                 print(f"  Alert buffer full — flushed to SQLite")
-            return  # connection is down; no point trying SQLite drain
+            return
 
-    # ── Drain SQLite overflow (from previous capacity events) ─────────────────
     sqlite_rows = queue.get_pending_alerts()
     if not sqlite_rows:
         return
@@ -525,43 +489,65 @@ async def _drain_alerts():
         queue.set_alert_status_many(unsent, "pending")
 
 
-# --------------------------- HTTP helpers ---------------------------
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 
 def _auth_headers() -> dict:
     return {
-        "Authorization": f"Bearer {os.getenv('NEW_AUTH_TOKEN', '').strip()}",
-        "Content-Type": "application/json",
+        "Authorization":      f"Bearer {os.getenv('NEW_AUTH_TOKEN', '').strip()}",
+        "Content-Type":       "application/json",
         "X-Schoolair-Version": VERSION,
     }
 
 
-async def _post_batch(client: httpx.AsyncClient, measurements: list[dict]) -> dict:
+async def _try_post(
+    readings: list[dict],
+    backlog_count: int,
+    bpr: int | None = None,
+    timeout: float = 3.0,
+) -> dict | None:
+    """POST readings to the primary server. Returns parsed response or None on failure.
+
+    Request body:
+      readings        — always an array; single element for live readings
+      backlog_readings — count still in SQLite after this batch (0 = no backlog)
+      bytes_per_reading — serialised size of one reading; present only when backlog > 0
+    """
+    body: dict = {"readings": readings, "backlog_readings": backlog_count}
+    if backlog_count > 0 and bpr is not None:
+        body["bytes_per_reading"] = bpr
+
     wifi_state   = _load_wifi_state()
     pending_acks = wifi_state.get("pending_acks", [])
-    body: dict   = {"measurements": measurements}
     if pending_acks:
         body["wifi_acks"] = pending_acks
 
-    res = await client.post(
-        _PRIMARY_INGEST_URL,
-        headers=_auth_headers(),
-        json=body,
-    )
-    if res.status_code == 401:
-        print("Batch ingest failed: auth token rejected.")
-        raise httpx.HTTPStatusError("Unauthorised", request=res.request, response=res)
-    res.raise_for_status()
-    result = res.json()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            res = await client.post(
+                _PRIMARY_INGEST_URL,
+                headers=_auth_headers(),
+                json=body,
+            )
+        if res.status_code == 401:
+            print("Ingest failed: auth token rejected.")
+            return None
+        res.raise_for_status()
 
-    if pending_acks:
-        wifi_state["pending_acks"] = []
-        _save_wifi_state(wifi_state)
+        if pending_acks:
+            wifi_state["pending_acks"] = []
+            _save_wifi_state(wifi_state)
 
-    return result
+        return res.json()
+
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return None
+    except Exception as e:
+        print(f"Ingest POST error: {e}")
+        return None
 
 
-async def _mirror_batch(measurements: list[dict]) -> None:
+async def _mirror_batch(readings: list[dict]) -> None:
     """Best-effort POST to the legacy secondary server. Never raises."""
     if not _SECONDARY_INGEST_URL:
         return
@@ -570,28 +556,20 @@ async def _mirror_batch(measurements: list[dict]) -> None:
             res = await client.post(
                 _SECONDARY_INGEST_URL,
                 headers={"Authorization": f"Bearer {_SECONDARY_AUTH_TOKEN}", "Content-Type": "application/json"},
-                json={"measurements": measurements},
+                json={"measurements": readings},
             )
         if not res.is_success:
             print(f"[mirror] legacy server returned {res.status_code}")
         else:
-            print(f"[mirror] legacy server received {len(measurements)} measurement(s)")
+            print(f"[mirror] legacy server received {len(readings)} reading(s)")
     except Exception as e:
         print(f"[mirror] legacy server unreachable: {e}")
 
 
-# --------------------------- OTA update ---------------------------
+# ── OTA update ────────────────────────────────────────────────────────────────
 
 
 async def _trigger_update():
-    """Invoke the OTA update script as root via the pre-approved sudoers rule.
-
-    The update script re-fetches schoolair_setup.sh from GitHub and runs it
-    with --update, which re-deploys code, recompiles the C binary if needed,
-    and restarts schoolair.service — killing this process.  systemd brings it
-    back up immediately with the new code.  This function therefore may not
-    return; that's expected and safe.
-    """
     global _update_in_progress
     if _update_in_progress:
         print("[OTA] Update already in progress — skipping duplicate trigger")
@@ -618,12 +596,12 @@ async def _trigger_update():
         _update_in_progress = False
 
 
-# --------------------------- WiFi push ---------------------------
+# ── WiFi push ─────────────────────────────────────────────────────────────────
 
 _WIFI_STATE_FILE  = "config/wifi_state.json"
 _WIFI_CONN_PREFIX = "schoolair-"
 _WIFI_MAX_ENTRIES = 100
-_WIFI_PRUNE_KEEP  = 50  # keep newest N when pruning
+_WIFI_PRUNE_KEEP  = 50
 
 
 def _load_wifi_state() -> dict:
@@ -633,12 +611,11 @@ def _load_wifi_state() -> dict:
         return {"pending_acks": [], "managed": []}
 
 
-def _save_wifi_state(state: dict) -> None:
-    Path(_WIFI_STATE_FILE).write_text(json.dumps(state, indent=2))
+def _save_wifi_state(s: dict) -> None:
+    Path(_WIFI_STATE_FILE).write_text(json.dumps(s, indent=2))
 
 
 async def _nmcli_run(*args: str) -> bool:
-    """Run nmcli with the given arguments. Returns True on success."""
     proc = await asyncio.create_subprocess_exec(
         "nmcli", *args,
         stdout=asyncio.subprocess.PIPE,
@@ -652,10 +629,8 @@ async def _nmcli_run(*args: str) -> bool:
 
 
 async def _apply_wifi_credential(credential_id: int, ssid: str, password: str) -> bool:
-    """Append a new NM connection for ssid. Never removes existing connections."""
     conn_name = f"{_WIFI_CONN_PREFIX}{credential_id}-{ssid[:30]}"
-    args = ["connection", "add", "type", "wifi",
-            "con-name", conn_name, "ssid", ssid]
+    args = ["connection", "add", "type", "wifi", "con-name", conn_name, "ssid", ssid]
     if password:
         args += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password]
     ok = await _nmcli_run(*args)
@@ -664,9 +639,8 @@ async def _apply_wifi_credential(credential_id: int, ssid: str, password: str) -
     return ok
 
 
-async def _prune_wifi_if_needed(state: dict) -> None:
-    """Remove oldest SchoolAir-managed connections when count exceeds the cap."""
-    managed: list = state.get("managed", [])
+async def _prune_wifi_if_needed(s: dict) -> None:
+    managed: list = s.get("managed", [])
     if len(managed) <= _WIFI_MAX_ENTRIES:
         return
     managed.sort(key=lambda e: e.get("added_at", ""))
@@ -674,16 +648,15 @@ async def _prune_wifi_if_needed(state: dict) -> None:
     for entry in to_prune:
         await _nmcli_run("connection", "delete", entry["conn_name"])
         print(f"[wifi-push] Pruned '{entry['conn_name']}'")
-    state["managed"] = keep
+    s["managed"] = keep
 
 
 async def _handle_wifi_push(push_list: list) -> None:
-    """Process wifi_push entries from an ingest response."""
     if not push_list:
         return
-    state   = _load_wifi_state()
-    managed: list = state.setdefault("managed", [])
-    pending: list = state.setdefault("pending_acks", [])
+    s       = _load_wifi_state()
+    managed: list = s.setdefault("managed", [])
+    pending: list = s.setdefault("pending_acks", [])
     known   = {e["credential_id"] for e in managed}
 
     for entry in push_list:
@@ -693,7 +666,7 @@ async def _handle_wifi_push(push_list: list) -> None:
         if cred_id is None or not ssid:
             continue
         if cred_id in known:
-            continue  # already applied, ack was already sent
+            continue
         success = await _apply_wifi_credential(cred_id, ssid, password)
         pending.append({"credential_id": cred_id, "success": success})
         if success:
@@ -705,29 +678,99 @@ async def _handle_wifi_push(push_list: list) -> None:
             })
             known.add(cred_id)
 
-    await _prune_wifi_if_needed(state)
-    _save_wifi_state(state)
+    await _prune_wifi_if_needed(s)
+    _save_wifi_state(s)
 
 
-# --------------------------- Read step ---------------------------
+# ── Response handling ─────────────────────────────────────────────────────────
 
 
-def _should_drain(settings: dict) -> bool:
-    """True if skipping this read would cause the drain deadline to be missed.
+def _update_credit(response: dict) -> None:
+    """Overwrite credit with the latest server grant. Never accumulates."""
+    global _credit_bytes, _recommended_delay
+    _credit_bytes      = int(response.get("credit_bytes", 0))
+    _recommended_delay = float(response.get("recommended_delay_seconds", 0))
 
-    Fires when the time remaining until the drain deadline is less than one read
-    interval — i.e. the next scheduled read would arrive after the deadline.
-    This guarantees drains happen *within* the configured interval (25–30 min
-    active, 105–120 min idle).
-    """
-    if _last_drained_at is None:
-        return False  # let the initial drain in _drain_loop handle startup
-    elapsed = (datetime.now(timezone.utc) - _last_drained_at).total_seconds()
-    return elapsed >= current_drain_interval(settings) - current_read_interval(settings)
+
+async def _handle_response(response: dict) -> None:
+    """Process server directives from any successful ingest response."""
+    if response.get("criteria"):
+        save_criteria(response["criteria"])
+    if response.get("update_available"):
+        asyncio.create_task(_trigger_update())
+    if response.get("wifi_push"):
+        asyncio.create_task(_handle_wifi_push(response["wifi_push"]))
+    await _drain_alerts()
+
+
+# ── NTP correction ────────────────────────────────────────────────────────────
+
+
+async def _ntp_correction_task():
+    """One-shot: detect first NTP sync and correct pre-sync SQLite timestamps."""
+    global _ntp_fake_wall, _ntp_mono_ref
+
+    settings_data = load_settings()
+    if settings_data.get(NTP_CORRECTED_KEY):
+        return  # already corrected on a previous boot
+
+    # One subprocess call to check if NTP is already synced at startup
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "timedatectl", "show", "--property=NTPSynchronized",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+        if b"NTPSynchronized=yes" in stdout:
+            settings_data[NTP_CORRECTED_KEY] = True
+            SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_PATH.write_text(json.dumps(settings_data, indent=2))
+            print("[ntp] already synced at startup — no correction needed")
+            return
+    except Exception:
+        pass  # can't determine — proceed with monitoring
+
+    # Record reference point: wrong wall time + monotonic (never jumps)
+    _ntp_fake_wall = datetime.now(timezone.utc)
+    _ntp_mono_ref  = _time_mod.monotonic()
+    print(f"[ntp] monitoring for NTP step (pre-sync ref: {_ntp_fake_wall.isoformat()})")
+
+    while _ntp_fake_wall is not None:
+        await asyncio.sleep(5)
+
+        elapsed    = _time_mod.monotonic() - _ntp_mono_ref
+        projected  = _ntp_fake_wall + timedelta(seconds=elapsed)
+        divergence = abs((datetime.now(timezone.utc) - projected).total_seconds())
+
+        if divergence < NTP_STEP_THRESHOLD_S:
+            continue
+
+        # NTP stepped the clock
+        real_now = datetime.now(timezone.utc)
+        delta    = (real_now - projected).total_seconds()
+        print(f"[ntp] step detected: delta={delta:+.0f}s, boundary={projected.isoformat()}")
+
+        if abs(delta) >= 10:
+            corrected = queue.apply_clock_correction(projected.isoformat(), delta)
+            if corrected:
+                print(f"[ntp] corrected timestamps on {corrected} queued reading(s)")
+
+        current = load_settings()
+        current[NTP_CORRECTED_KEY] = True
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(json.dumps(current, indent=2))
+
+        _ntp_fake_wall = None  # exit loop
+
+
+# ── Read step ─────────────────────────────────────────────────────────────────
 
 
 async def _run_read(settings: dict, active_sensors: list):
-    """Read one sensor sample, update buffer, and trigger verification on any breach."""
+    """Read one sensor sample, check for breaches, signal the upload loop."""
+    global _pending_live
+
     recorded_at = datetime.now(timezone.utc).isoformat()
     try:
         data = read_sensor()
@@ -742,7 +785,6 @@ async def _run_read(settings: dict, active_sensors: list):
 
     state.set(data, recorded_at)
     entry = {"data": data, "recorded_at": recorded_at, "severity": 0}
-    _buffer.append(entry)
 
     criteria = load_criteria()
     if criteria:
@@ -773,201 +815,171 @@ async def _run_read(settings: dict, active_sensors: list):
                 _verifying.add(metric)
             asyncio.create_task(_verify_all(breaching, entry))
 
-    # Trigger drain on standard reads — not during alert verification.
-    if not _verifying and _should_drain(settings):
-        trigger_drain()
+    # Signal upload loop — overwrites any previous unsent reading
+    _pending_live = entry
+    if _live_event is not None:
+        _live_event.set()
 
 
-# --------------------------- Drain step ---------------------------
+# ── Upload and drain ──────────────────────────────────────────────────────────
 
 
-async def _run_drain(settings: dict):
-    """Send the in-memory buffer plus any SQLite backlog to the server.
+def _format_reading(item: dict) -> dict:
+    return {
+        "recorded_at":   item["recorded_at"],
+        "data":          item["data"],
+        "is_aggregated": item.get("is_aggregated", False),
+        "severity":      item.get("severity", 0),
+    }
 
-    SQLite is written only when both conditions are true:
-      1. The buffer has reached BUFFER_CAPACITY.
-      2. The server is unreachable.
-    All other drain attempts go memory → server with no disk I/O.
-    """
-    global _buffer, _last_drained_at
 
-    # Compact old SQLite rows into hourly means (no-op when SQLite is empty)
+def _format_sqlite_row(row) -> dict:
+    return {
+        "recorded_at":   row["recorded_at"],
+        "data":          json.loads(row["data"]),
+        "is_aggregated": bool(row["is_aggregated"]),
+        "severity":      0,
+    }
+
+
+async def _wait_for_live(seconds: float) -> bool:
+    """Sleep up to `seconds`. Returns True early if a live reading arrives."""
+    if _live_event is None or seconds <= 0:
+        return False if seconds <= 0 else _live_event is not None and _live_event.is_set()
+    try:
+        await asyncio.wait_for(asyncio.shield(_live_event.wait()), timeout=seconds)
+        return True
+    except asyncio.TimeoutError:
+        return _live_event.is_set()
+
+
+async def _drain_backlog() -> None:
+    """Drain SQLite backlog using current credit. Interruptible by live readings."""
+    global _credit_bytes, _recommended_delay
+
+    # Compact old rows before draining
     try:
         summary = aggregate.run_aggregation()
         if summary["buckets"]:
-            print(f"Aggregated {summary['rows_in']} old row(s) into {summary['buckets']} hourly row(s)")
+            print(f"[drain] aggregated {summary['rows_in']} row(s) → {summary['buckets']} hourly")
     except Exception as e:
-        print(f"Aggregation failed: {e}")
+        print(f"[drain] aggregation error: {e}")
 
-    # Hard cap: if SQLite has grown very large during an extended outage,
-    # drop the oldest aggregated rows to keep it bounded.
     depth = queue.count_pending()
     if depth > aggregate.MAX_QUEUE_ROWS:
         dropped = queue.trim_aggregated(depth - aggregate.QUEUE_LOW_WATER)
         if dropped:
-            print(f"SQLite queue over cap — discarded {dropped} oldest aggregated row(s)")
+            print(f"[drain] queue over cap — dropped {dropped} oldest aggregated row(s)")
 
-    _last_drained_at = datetime.now(timezone.utc)
+    while True:
+        backlog = queue.count_pending()
+        if backlog == 0 or _credit_bytes <= 0:
+            break
 
-    token = os.getenv("NEW_AUTH_TOKEN", "").strip()
-    if not token:
-        # No token yet — keep buffering; spill to SQLite only when buffer is full
-        if len(_buffer) >= BUFFER_CAPACITY:
-            for item in _buffer:
-                queue.enqueue(item["data"], item["recorded_at"])
-            _buffer.clear()
-            print(f"[drain] no token — buffer full, flushed {BUFFER_CAPACITY} readings to SQLite")
-        else:
-            print(f"[drain] no token — {len(_buffer)} reading(s) held in memory, waiting for registration")
-        return
+        # Wait recommended_delay but wake early if a live reading arrives
+        if _recommended_delay > 0:
+            interrupted = await _wait_for_live(seconds=_recommended_delay)
+            if interrupted:
+                break  # live reading ready — let _upload_loop handle it first
 
-    if not _buffer and not queue.count_pending():
-        return
+        # Measure bytes per reading from one queued row to size the batch
+        sample = queue.get_pending(limit=1)
+        if not sample:
+            break
+        sample_reading = _format_sqlite_row(sample[0])
+        bpr        = len(json.dumps(sample_reading).encode())
+        batch_size = max(1, _credit_bytes // bpr)
 
-    # Build payload: fresh buffer readings first, then any SQLite backlog
-    sqlite_rows = queue.get_pending(limit=BATCH_SIZE)
-    sqlite_ids  = [r["id"] for r in sqlite_rows]
+        rows = queue.get_pending(limit=batch_size)
+        ids  = [r["id"] for r in rows]
+        readings  = [_format_sqlite_row(r) for r in rows]
+        remaining = backlog - len(rows)
 
-    payload = [
-        {
-            "recorded_at":   item["recorded_at"],
-            "data":          item["data"],
-            "is_aggregated": False,
-            "severity":      item.get("severity", 0),
-        }
-        for item in _buffer
-    ] + [
-        {
-            "recorded_at":   r["recorded_at"],
-            "data":          json.loads(r["data"]),
-            "is_aggregated": bool(r["is_aggregated"]),
-        }
-        for r in sqlite_rows
-    ]
+        queue.set_status_many(ids, "sending")
 
-    print(
-        f"Draining {len(payload)} measurement(s) "
-        f"({len(_buffer)} buffered, {len(sqlite_rows)} from SQLite)…"
-    )
+        response = await _try_post(readings, remaining, bpr, timeout=10.0)
 
-    if sqlite_ids:
-        queue.set_status_many(sqlite_ids, "sending")
+        if response is None:
+            queue.set_status_many(ids, "pending")
+            print(f"[drain] server unreachable — {backlog} reading(s) held in SQLite")
+            break
 
-    # Snapshot the buffer length before the async POST so any reading appended
-    # by _run_read during the HTTP call is not accidentally discarded.
-    n_buffered = len(_buffer)
+        queue.remove_many(ids)
+        _update_credit(response)
+        await _handle_response(response)
+        print(f"[drain] sent {len(rows)} reading(s), {remaining} remaining")
 
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await _post_batch(client, payload)
-
-        del _buffer[:n_buffered]
-        if sqlite_ids:
-            queue.remove_many(sqlite_ids)
-
-        if response.get("criteria"):
-            save_criteria(response["criteria"])
-
-        print(f"  Sent {response.get('count', len(payload))} measurement(s)")
-
-        await _mirror_batch(payload)
-
-        if response.get("update_available"):
-            asyncio.create_task(_trigger_update())
-
-        if response.get("wifi_push"):
-            asyncio.create_task(_handle_wifi_push(response["wifi_push"]))
-
-        # Flush alert buffer now that we know we have connectivity
-        await _drain_alerts()
-
-    except httpx.ConnectError:
-        if sqlite_ids:
-            queue.set_status_many(sqlite_ids, "pending")
-
-        if len(_buffer) >= BUFFER_CAPACITY:
-            print(
-                f"Server unreachable and buffer full ({len(_buffer)}/{BUFFER_CAPACITY}) "
-                f"— flushing buffer to SQLite"
-            )
-            for item in _buffer:
-                queue.enqueue(item["data"], item["recorded_at"])
-            _buffer.clear()
-        else:
-            remaining = BUFFER_CAPACITY - len(_buffer)
-            print(
-                f"Server unreachable — {len(_buffer)} reading(s) held in memory "
-                f"({remaining} slot(s) before SQLite fallback)"
-            )
-
-    except httpx.HTTPStatusError:
-        if sqlite_ids:
-            queue.set_status_many(sqlite_ids, "pending")
-        print("Server returned an error — will retry next drain cycle")
-
-    except Exception as e:
-        if sqlite_ids:
-            queue.set_status_many(sqlite_ids, "pending")
-        print(f"Drain failed unexpectedly: {e}")
+    if queue.count_pending() == 0:
+        print("[drain] backlog cleared")
 
 
-# --------------------------- Loops ---------------------------
+async def _upload_loop(settings: dict) -> None:
+    """Send live readings immediately; drain backlog on server credit."""
+    global _live_event
+
+    _live_event = asyncio.Event()
+
+    while True:
+        await _live_event.wait()
+        _live_event.clear()
+
+        entry = _pending_live
+        if entry is None:
+            continue
+
+        token = os.getenv("NEW_AUTH_TOKEN", "").strip()
+        if not token:
+            queue.enqueue(entry["data"], entry["recorded_at"])
+            print(f"[upload] no token — reading stored in SQLite")
+            continue
+
+        backlog_count = queue.count_pending()
+        bpr = len(json.dumps(_format_reading(entry)).encode()) if backlog_count > 0 else None
+
+        response = await _try_post([_format_reading(entry)], backlog_count, bpr)
+
+        if response is None:
+            queue.enqueue(entry["data"], entry["recorded_at"])
+            total = backlog_count + 1
+            print(f"[upload] server unreachable — reading queued (SQLite total: {total})")
+            continue
+
+        _update_credit(response)
+        asyncio.create_task(_mirror_batch([_format_reading(entry)]))
+        await _handle_response(response)
+        print(f"[upload] live reading sent (backlog: {backlog_count})")
+
+        if backlog_count > 0 and _credit_bytes > 0:
+            await _drain_backlog()
+
+
+# ── Loops ─────────────────────────────────────────────────────────────────────
 
 
 async def _read_loop(settings: dict, active_sensors: list):
+    offset      = _get_upload_offset(settings)
     prev_active = _in_active_window(settings)
+
     while True:
         curr_active = _in_active_window(settings)
 
         if curr_active != prev_active:
             if prev_active and not curr_active:
-                # active→idle: flush pending school-hours data before long cadence starts
-                print("[transition] active→idle: triggering drain")
-                trigger_drain()
+                print("[transition] active→idle")
             else:
-                # idle→active: log (the immediate read below anchors us to the boundary)
                 print("[transition] idle→active: immediate read")
             prev_active = curr_active
 
         await _run_read(settings, active_sensors)
         interval = current_read_interval(settings)
-        delay = _seconds_to_next_boundary(interval)
-        mode = "active" if curr_active else "idle"
-        print(f"[read/{mode}] next in {delay:.0f}s")
+        delay    = _seconds_to_next_boundary(interval, offset)
+        mode     = "active" if curr_active else "idle"
+        print(f"[read/{mode}] next in {delay:.0f}s (offset={offset}s)")
         await asyncio.sleep(delay)
 
 
-async def _drain_loop(settings: dict):
-    global _drain_trigger
-    _drain_trigger = asyncio.Event()
-
-    jitter = _ensure_drain_jitter(settings)
-
-    # Brief settle so the read loop collects at least one reading, and to clear
-    # any SQLite backlog left from a previous outage.  No jitter here — devices
-    # haven't converged to the same grid yet so there's no herd to scatter.
-    await asyncio.sleep(15)
-    await _run_drain(settings)
-
-    # Drains are triggered by _run_read once the drain interval has elapsed.
-    # The fallback timeout fires only if reads stop arriving for an extended period
-    # (e.g. sensor failure) so the loop never blocks indefinitely.
-    fallback = float(DRAIN_IDLE_SECONDS * 2)
-    while True:
-        try:
-            await asyncio.wait_for(_drain_trigger.wait(), timeout=fallback)
-            _drain_trigger.clear()
-            print("[drain] triggered")
-        except asyncio.TimeoutError:
-            print("[drain] fallback — no reads received, draining anyway")
-        if jitter:
-            print(f"[drain] jitter: {jitter}s")
-            await asyncio.sleep(jitter)
-        await _run_drain(settings)
-
-
 async def ingest_loop():
-    """Initialise SQLite, probe aux sensors once, then run read and drain loops."""
+    """Initialise SQLite, probe aux sensors, run read / upload / NTP tasks."""
     queue.init()
     settings = load_settings()
     validate_settings(settings)
@@ -975,11 +987,11 @@ async def ingest_loop():
     print(
         f"Ingest started — "
         f"reads {READ_ACTIVE_SECONDS}s/{READ_IDLE_SECONDS}s (active/idle) | "
-        f"drains {DRAIN_ACTIVE_SECONDS}s/{DRAIN_IDLE_SECONDS}s (active/idle) | "
-        f"buffer capacity {BUFFER_CAPACITY}"
+        f"write-through with SQLite fallback"
         + (f" | aux sensors: {', '.join(s['name'] for s in active_sensors)}" if active_sensors else "")
     )
     await asyncio.gather(
         _read_loop(settings, active_sensors),
-        _drain_loop(settings),
+        _upload_loop(settings),
+        _ntp_correction_task(),
     )
