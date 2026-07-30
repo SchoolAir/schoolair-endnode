@@ -36,6 +36,17 @@ load_dotenv()
 
 VERSION = "2.1.0"
 
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in v.split("."))
+
+
+def _version_is_older_than(min_version: str) -> bool:
+    try:
+        return _version_tuple(VERSION) < _version_tuple(min_version)
+    except (ValueError, AttributeError):
+        return False
+
 _PRIMARY_SERVER_URL   = os.getenv("NEW_SERVER_URL", "").rstrip("/")
 _PRIMARY_INGEST_URL   = os.getenv("NEW_INGEST_URL", f"{_PRIMARY_SERVER_URL}/aqc/v1/ingest") if _PRIMARY_SERVER_URL else ""
 _SECONDARY_SERVER_URL = os.getenv("SERVER_URL", "").rstrip("/")
@@ -696,7 +707,8 @@ async def _handle_response(response: dict) -> None:
     """Process server directives from any successful ingest response."""
     if response.get("criteria"):
         save_criteria(response["criteria"])
-    if response.get("update_available"):
+    min_ver = response.get("min_version")
+    if min_ver and _version_is_older_than(min_ver):
         asyncio.create_task(_trigger_update())
     if response.get("wifi_push"):
         asyncio.create_task(_handle_wifi_push(response["wifi_push"]))

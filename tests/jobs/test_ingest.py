@@ -35,6 +35,7 @@ from jobs.ingest import (
     _handle_response,
     _update_credit,
     _get_upload_offset,
+    _version_is_older_than,
     _auth_headers,
     _trigger_update,
     _ensure_drain_jitter,
@@ -558,22 +559,50 @@ async def test_handle_response_saves_criteria():
     mock_save.assert_called_once_with(criteria)
 
 
-async def test_handle_response_schedules_update_when_flagged():
-    """update_available=True causes a task to be scheduled for _trigger_update."""
+async def test_handle_response_schedules_update_when_min_version_newer():
+    """min_version higher than running version → update task scheduled."""
     tasks = []
     with patch("jobs.ingest._drain_alerts", new_callable=AsyncMock), \
          patch("asyncio.create_task", side_effect=tasks.append):
-        await _handle_response({"update_available": True})
+        await _handle_response({"min_version": "99.0.0"})
     assert len(tasks) >= 1
 
 
-async def test_handle_response_no_update_when_flag_false():
-    """update_available=False means no update task is created."""
+async def test_handle_response_no_update_when_min_version_met():
+    """min_version at or below running version → no update task."""
     tasks = []
     with patch("jobs.ingest._drain_alerts", new_callable=AsyncMock), \
          patch("asyncio.create_task", side_effect=tasks.append):
-        await _handle_response({"update_available": False})
+        await _handle_response({"min_version": "1.0.0"})
     assert len(tasks) == 0
+
+
+async def test_handle_response_no_update_when_min_version_null():
+    """min_version=None → no update task."""
+    tasks = []
+    with patch("jobs.ingest._drain_alerts", new_callable=AsyncMock), \
+         patch("asyncio.create_task", side_effect=tasks.append):
+        await _handle_response({"min_version": None})
+    assert len(tasks) == 0
+
+
+# ── _version_is_older_than ────────────────────────────────────────────────────
+
+def test_version_is_older_than_true_when_behind():
+    assert _version_is_older_than("99.0.0") is True
+
+def test_version_is_older_than_false_when_equal():
+    assert _version_is_older_than(VERSION) is False
+
+def test_version_is_older_than_false_when_ahead():
+    assert _version_is_older_than("0.0.1") is False
+
+def test_version_is_older_than_compares_semantically_not_lexically():
+    # "2.9.0" < "2.10.0" semantically; lexically "9" > "10"
+    assert _version_is_older_than("2.10.0") is True  # assumes VERSION is 2.x where x < 10
+
+def test_version_is_older_than_returns_false_on_malformed():
+    assert _version_is_older_than("not-a-version") is False
 
 
 # ── _upload_loop queues on missing token ──────────────────────────────────────
