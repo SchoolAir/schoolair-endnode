@@ -145,6 +145,26 @@ else
     skip "2 / System packages  (update mode — already installed)"
 fi
 
+# ── 2b. SD card longevity ─────────────────────────────────────────────────────
+# Runs in both setup and update mode — changes are idempotent.
+step "2b / SD card longevity"
+
+# journald volatile: journal lives in /run (already tmpfs) — never writes to SD
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/00-schoolair.conf << 'EOF'
+[Journal]
+Storage=volatile
+RuntimeMaxUse=32M
+EOF
+systemctl restart systemd-journald 2>/dev/null || true
+ok "journald: volatile storage, 32 MB RAM cap"
+
+# Disable swap — Pi Zero 512 MB is sufficient; SD swap is the #1 card killer
+systemctl disable dphys-swapfile 2>/dev/null || true
+systemctl stop    dphys-swapfile 2>/dev/null || true
+dphys-swapfile swapoff           2>/dev/null || true
+ok "swap: disabled"
+
 # ── 3. Clone / update SchoolAir app ───────────────────────────────────────────
 step "3 / Clone SchoolAir app  →  ${SCHOOLAIR_DIR}"
 rm -rf "$REPO_DIR"
@@ -430,6 +450,8 @@ chk() {
 
 chk "hostname is schoolair-*"              bash -c '[[ "$(hostname)" == schoolair-* ]]'
 chk "unattended-upgrades configured"      test -f /etc/apt/apt.conf.d/50unattended-upgrades
+chk "journald volatile"                   grep -q "Storage=volatile" /etc/systemd/journald.conf.d/00-schoolair.conf
+chk "swap disabled"                       bash -c "! systemctl is-enabled dphys-swapfile 2>/dev/null"
 chk "microdot importable"                  python3 -c "import microdot"
 chk "httpx importable"                     python3 -c "import httpx"
 chk "launcher.sh executable"              test -x "${WIZARD_DIR}/launcher.sh"
