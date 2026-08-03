@@ -60,18 +60,20 @@ S = {
 def reset_ingest_state():
     """Clear mutable module-level state before and after each test."""
     ingest._alert_buffer.clear()
-    ingest._pending_live    = None
-    ingest._live_event      = None
-    ingest._credit_bytes    = 0
+    ingest._pending_live      = None
+    ingest._live_event        = None
+    ingest._credit_bytes      = 0
     ingest._recommended_delay = 0.0
+    ingest._update_in_progress = False
     ingest._verifying.clear()
     ingest.alert_cooldown.clear()
     yield
     ingest._alert_buffer.clear()
-    ingest._pending_live    = None
-    ingest._live_event      = None
-    ingest._credit_bytes    = 0
+    ingest._pending_live      = None
+    ingest._live_event        = None
+    ingest._credit_bytes      = 0
     ingest._recommended_delay = 0.0
+    ingest._update_in_progress = False
     ingest._verifying.clear()
 
 
@@ -666,14 +668,14 @@ async def test_trigger_update_guard_skips_subprocess_when_already_running():
         ingest._update_in_progress = False
 
 
-async def test_trigger_update_resets_flag_after_success():
-    """`_update_in_progress` must be False after a successful subprocess run."""
+async def test_trigger_update_leaves_flag_true_after_success():
+    """`_update_in_progress` stays True after success — blocks re-trigger before restart."""
     mock_proc = AsyncMock()
     mock_proc.returncode = 0
     mock_proc.communicate.return_value = (b"ok", b"")
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
         await _trigger_update()
-    assert ingest._update_in_progress is False
+    assert ingest._update_in_progress is True
 
 
 async def test_trigger_update_resets_flag_after_subprocess_failure():

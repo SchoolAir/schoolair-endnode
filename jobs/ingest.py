@@ -596,15 +596,15 @@ async def _trigger_update():
         stdout, _ = await proc.communicate()
         output = stdout.decode(errors="replace") if stdout else ""
         if proc.returncode == 0:
-            print("[OTA] Update finished successfully")
+            print("[OTA] Update finished successfully — service will restart")
+            return  # _update_in_progress stays True; blocks re-trigger before restart
         else:
             print(f"[OTA] Update exited with code {proc.returncode}")
             if output:
                 print(output[-2000:])
     except Exception as e:
         print(f"[OTA] Update failed: {e}")
-    finally:
-        _update_in_progress = False
+    _update_in_progress = False  # only reached on failure
 
 
 # ── WiFi push ─────────────────────────────────────────────────────────────────
