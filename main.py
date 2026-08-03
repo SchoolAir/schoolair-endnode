@@ -24,7 +24,8 @@ from dotenv import load_dotenv
 from microdot import Microdot, Response
 from microdot.websocket import with_websocket
 from setup import check_registration
-from jobs.ingest import ingest_loop, trigger_drain
+import jobs.ingest as _ingest
+from jobs.ingest import ingest_loop
 from services.sensor import extract_metric
 import state
 
@@ -113,28 +114,25 @@ async def ws_sensors(request, ws):
 # ----------------------- Signal handlers -----------------------
 
 async def _graceful_shutdown():
-    """SIGTERM: flush in-memory buffers to SQLite, then cancel all tasks.
+    """SIGTERM: flush in-flight data to SQLite, then cancel all tasks.
 
     Covers systemctl stop/restart and OS shutdown (reboot/poweroff).
     Does NOT cover SIGKILL or physical power loss.
     """
-    from jobs.ingest import _buffer, _alert_buffer
-
     queue.init()
     ts = datetime.now(timezone.utc).isoformat()
 
-    if _buffer:
-        n = len(_buffer)
-        for item in _buffer:
-            queue.enqueue(item["data"], item["recorded_at"])
-        _buffer.clear()
-        print(f"[shutdown] Flushed {n} reading(s) to SQLite before exit")
+    if _ingest._pending_live:
+        item = _ingest._pending_live
+        queue.enqueue(item["data"], item["recorded_at"])
+        _ingest._pending_live = None
+        print("[shutdown] Flushed 1 unsent live reading to SQLite before exit")
 
-    if _alert_buffer:
-        n = len(_alert_buffer)
-        for a in _alert_buffer:
+    if _ingest._alert_buffer:
+        n = len(_ingest._alert_buffer)
+        for a in _ingest._alert_buffer:
             queue.enqueue_alert(a, a.get("recorded_at", ts))
-        _alert_buffer.clear()
+        _ingest._alert_buffer.clear()
         print(f"[shutdown] Flushed {n} alert(s) to SQLite before exit")
 
     current = asyncio.current_task()
@@ -148,8 +146,7 @@ async def _graceful_shutdown():
 async def main():
     loop = asyncio.get_event_loop()
 
-    loop.add_signal_handler(signal.SIGTERM,  lambda: asyncio.ensure_future(_graceful_shutdown()))
-    loop.add_signal_handler(signal.SIGUSR2,  trigger_drain)
+    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(_graceful_shutdown()))
 
     await asyncio.gather(
         ingest_loop(),

@@ -117,14 +117,53 @@ if [[ "$MODE" == "setup" ]]; then
     step "2 / System packages"
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3-pip i2c-tools nginx avahi-daemon gcc make
-    ok "git python3-pip i2c-tools nginx avahi-daemon gcc make"
+        git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades
+    ok "git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades"
+
+    # Security-only automatic updates — reboot at 03:00 if needed (outside school hours)
+    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+
+    cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename},label=Debian-Security";
+    "origin=Raspbian,codename=${distro_codename},label=Raspbian";
+    "origin=Raspberry Pi Foundation,codename=${distro_codename},label=Raspberry Pi Foundation";
+};
+Unattended-Upgrade::Package-Blacklist {};
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+EOF
+    ok "unattended-upgrades: security-only, auto-reboot at 03:00"
 
     systemctl disable nginx 2>/dev/null || true
     systemctl stop    nginx 2>/dev/null || true
 else
     skip "2 / System packages  (update mode — already installed)"
 fi
+
+# ── 2b. SD card longevity ─────────────────────────────────────────────────────
+# Runs in both setup and update mode — changes are idempotent.
+step "2b / SD card longevity"
+
+# journald volatile: journal lives in /run (already tmpfs) — never writes to SD
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/00-schoolair.conf << 'EOF'
+[Journal]
+Storage=volatile
+RuntimeMaxUse=32M
+EOF
+systemctl restart systemd-journald 2>/dev/null || true
+ok "journald: volatile storage, 32 MB RAM cap"
+
+# Disable swap — Pi Zero 512 MB is sufficient; SD swap is the #1 card killer
+systemctl disable dphys-swapfile 2>/dev/null || true
+systemctl stop    dphys-swapfile 2>/dev/null || true
+dphys-swapfile swapoff           2>/dev/null || true
+ok "swap: disabled"
 
 # ── 3. Clone / update SchoolAir app ───────────────────────────────────────────
 step "3 / Clone SchoolAir app  →  ${SCHOOLAIR_DIR}"
@@ -380,7 +419,20 @@ systemctl enable schoolair-first-boot.service 2>/dev/null || true
 ok "Services enabled"
 
 if [[ "$MODE" == "--update" ]]; then
-    step "15b / Restart updated services"
+    step "15b / Migrate .env + restart updated services"
+    # Rewrite NEW_SERVER_URL if it still points to the old bare-IP endpoint.
+    # The .env is preserved across OTA runs, so this is the only way to move
+    # already-registered devices to the new domain without touching them manually.
+    _ENV="${SCHOOLAIR_DIR}/.env"
+    _OLD_URL="http://54.252.165.86:3000"
+    _NEW_URL="https://dashboard.schoolair.org"
+    if grep -qF "NEW_SERVER_URL=${_OLD_URL}" "$_ENV" 2>/dev/null; then
+        sed -i "s|NEW_SERVER_URL=${_OLD_URL}|NEW_SERVER_URL=${_NEW_URL}|" "$_ENV"
+        ok "NEW_SERVER_URL migrated → ${_NEW_URL}"
+    else
+        ok "NEW_SERVER_URL already up to date (no migration needed)"
+    fi
+
     if systemctl is-active --quiet nginx; then systemctl restart nginx; fi
     systemctl restart sen6x.service     || warn "sen6x.service restart failed"
     systemctl restart schoolair.service || warn "schoolair.service restart failed"
@@ -397,6 +449,9 @@ chk() {
 }
 
 chk "hostname is schoolair-*"              bash -c '[[ "$(hostname)" == schoolair-* ]]'
+chk "unattended-upgrades configured"      test -f /etc/apt/apt.conf.d/50unattended-upgrades
+chk "journald volatile"                   grep -q "Storage=volatile" /etc/systemd/journald.conf.d/00-schoolair.conf
+chk "swap disabled"                       bash -c "! systemctl is-enabled dphys-swapfile 2>/dev/null"
 chk "microdot importable"                  python3 -c "import microdot"
 chk "httpx importable"                     python3 -c "import httpx"
 chk "launcher.sh executable"              test -x "${WIZARD_DIR}/launcher.sh"
@@ -416,6 +471,7 @@ if [[ "$MODE" == "setup" ]]; then
     chk "nginx disabled (correct pre-reg)"   bash -c "! systemctl is-enabled nginx >/dev/null 2>&1"
 fi
 chk "sudoers rule present"               test -f /etc/sudoers.d/schoolair-wizard
+chk "wizard config uses new server URL"  grep -q "dashboard.schoolair.org" "${SCHOOLAIR_DIR}/registration_wizard/config.py"
 
 # ── Summary ────────────────────────────────────────────────────────────────────
 _LABEL="Setup"; [[ "$MODE" == "--update" ]] && _LABEL="Update"

@@ -1,8 +1,8 @@
 """tests/jobs/test_ingest.py
 
 Unit tests for jobs.ingest: scheduling intervals, breach detection,
-alert buffering, trigger_drain event, drain token guard, and shared
-verification task with severity scoring.
+alert buffering, live-event signalling, write-through pipeline,
+credit management, and shared verification task with severity scoring.
 
 Run laptop-safe tests only:
     pytest -m "not hardware"
@@ -12,8 +12,9 @@ import asyncio
 import json
 import re
 from datetime import time, datetime, timezone, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import jobs.ingest as ingest
 import db.queue as queue
@@ -27,10 +28,14 @@ from jobs.ingest import (
     _near_or_breached,
     _buffer_alert,
     _verify_all,
-    _run_drain,
     _run_read,
-    _should_drain,
-    trigger_drain,
+    _try_post,
+    _wait_for_live,
+    _drain_backlog,
+    _handle_response,
+    _update_credit,
+    _get_upload_offset,
+    _version_is_older_than,
     _auth_headers,
     _trigger_update,
     _ensure_drain_jitter,
@@ -55,14 +60,21 @@ S = {
 def reset_ingest_state():
     """Clear mutable module-level state before and after each test."""
     ingest._alert_buffer.clear()
-    ingest._buffer.clear()
+    ingest._pending_live      = None
+    ingest._live_event        = None
+    ingest._credit_bytes      = 0
+    ingest._recommended_delay = 0.0
+    ingest._update_in_progress = False
     ingest._verifying.clear()
     ingest.alert_cooldown.clear()
-    ingest._last_drained_at = None
     yield
     ingest._alert_buffer.clear()
-    ingest._buffer.clear()
-    ingest._last_drained_at = None
+    ingest._pending_live      = None
+    ingest._live_event        = None
+    ingest._credit_bytes      = 0
+    ingest._recommended_delay = 0.0
+    ingest._update_in_progress = False
+    ingest._verifying.clear()
 
 
 @pytest.fixture
@@ -107,19 +119,27 @@ def test_drain_end_is_exclusive():
 # ── Clock-boundary sleep ───────────────────────────────────────────────────────
 
 def test_next_boundary_mid_interval():
-    """5 s past a 300 s boundary → sleep 295 s to the next :05 mark."""
-    t = datetime(2026, 1, 1, 8, 0, 5, tzinfo=timezone.utc)  # 8:00:05
+    """5 s past a 300 s boundary → sleep 295 s to the next mark."""
+    t = datetime(2026, 1, 1, 8, 0, 5, tzinfo=timezone.utc)
     assert _seconds_to_next_boundary(300, now=t) == pytest.approx(295.0, abs=0.01)
 
 def test_next_boundary_exactly_on_boundary():
     """Exactly on a 300 s boundary → sleep the full 300 s to the next one."""
-    t = datetime(2026, 1, 1, 8, 0, 0, tzinfo=timezone.utc)  # 8:00:00
+    t = datetime(2026, 1, 1, 8, 0, 0, tzinfo=timezone.utc)
     assert _seconds_to_next_boundary(300, now=t) == pytest.approx(300.0, abs=0.01)
 
 def test_next_boundary_idle_interval():
-    """5 s past a 900 s boundary (7:45:05) → sleep 895 s to land at 8:00:00."""
+    """5 s past a 900 s boundary (7:45:05) → sleep 895 s to 8:00:00."""
     t = datetime(2026, 1, 1, 7, 45, 5, tzinfo=timezone.utc)
     assert _seconds_to_next_boundary(900, now=t) == pytest.approx(895.0, abs=0.01)
+
+def test_next_boundary_with_offset():
+    """offset shifts the grid: with offset=60, the next slot is 60 s away from an exact 300 s boundary."""
+    t = datetime(2026, 1, 1, 8, 0, 0, tzinfo=timezone.utc)
+    # No offset: exactly on boundary → 300 s to go
+    assert _seconds_to_next_boundary(300, offset=0, now=t) == pytest.approx(300.0, abs=0.01)
+    # offset=60: device grid is shifted — next slot at :01 → 60 s away
+    assert _seconds_to_next_boundary(300, offset=60, now=t) == pytest.approx(60.0, abs=0.01)
 
 
 # ── Window helpers ─────────────────────────────────────────────────────────────
@@ -132,6 +152,20 @@ def test_validate_rejects_long_window():
     bad = {**S, "active_window": {"start": "06:00", "end": "20:00"}}  # 14 h
     with pytest.raises(SystemExit):
         validate_settings(bad)
+
+def test_validate_rejects_non_quarter_hour_start():
+    bad = {**S, "active_window": {"start": "07:10", "end": "16:00"}}
+    with pytest.raises(SystemExit):
+        validate_settings(bad)
+
+def test_validate_rejects_non_quarter_hour_end():
+    bad = {**S, "active_window": {"start": "07:00", "end": "16:05"}}
+    with pytest.raises(SystemExit):
+        validate_settings(bad)
+
+def test_validate_accepts_quarter_hour_boundaries():
+    for start, end in [("07:00", "16:00"), ("07:15", "15:45"), ("08:30", "15:30")]:
+        validate_settings({**S, "active_window": {"start": start, "end": end}})
 
 
 # ── Breach detection ───────────────────────────────────────────────────────────
@@ -201,65 +235,6 @@ def test_buffer_alert_flushes_to_sqlite_at_capacity(tmp_db):
     assert len(queue.get_pending_alerts()) == ALERT_BUFFER_CAPACITY
 
 
-# ── trigger_drain ──────────────────────────────────────────────────────────────
-
-def test_trigger_drain_noop_before_event_created():
-    """trigger_drain must not raise when _drain_trigger is None."""
-    original = ingest._drain_trigger
-    ingest._drain_trigger = None
-    try:
-        trigger_drain()
-    finally:
-        ingest._drain_trigger = original
-
-
-async def test_trigger_drain_sets_event():
-    original = ingest._drain_trigger
-    ingest._drain_trigger = asyncio.Event()
-    try:
-        assert not ingest._drain_trigger.is_set()
-        trigger_drain()
-        assert ingest._drain_trigger.is_set()
-    finally:
-        ingest._drain_trigger = original
-
-
-# ── _run_drain token guard ─────────────────────────────────────────────────────
-
-async def test_run_drain_holds_buffer_in_memory_when_no_token(tmp_db, monkeypatch):
-    """Buffer below capacity stays in memory when AUTH_TOKEN is absent."""
-    monkeypatch.setenv("NEW_AUTH_TOKEN", "")
-    ingest._buffer.append({
-        "data": {"sen6x": {"co2": 400}},
-        "recorded_at": "2026-06-23T10:00:00+00:00",
-    })
-    with patch("jobs.ingest.aggregate.run_aggregation",
-               return_value={"buckets": 0, "rows_in": 0, "rows_removed": 0}):
-        await _run_drain(S)
-
-    assert len(ingest._buffer) == 1
-    assert queue.count_pending() == 0
-
-
-async def test_run_drain_flushes_to_sqlite_when_full_and_no_token(tmp_db, monkeypatch):
-    """Buffer at capacity is flushed to SQLite when AUTH_TOKEN is absent."""
-    monkeypatch.setenv("NEW_AUTH_TOKEN", "")
-    monkeypatch.setattr(ingest, "BUFFER_CAPACITY", 5)
-    entry = {
-        "data": {"sen6x": {"co2": 400}},
-        "recorded_at": "2026-06-23T10:00:00+00:00",
-    }
-    for _ in range(5):
-        ingest._buffer.append(entry)
-
-    with patch("jobs.ingest.aggregate.run_aggregation",
-               return_value={"buckets": 0, "rows_in": 0, "rows_removed": 0}):
-        await _run_drain(S)
-
-    assert ingest._buffer == []
-    assert queue.count_pending() == 5
-
-
 # ── Shared verification task (_verify_all) ────────────────────────────────────
 
 _CO2_CRITERION = {
@@ -297,8 +272,8 @@ async def test_verify_all_fluke_sets_severity_1():
     assert not ingest._verifying, "_verifying must be cleared on completion"
 
 
-async def test_verify_all_momentary_severity_and_r3_buffered():
-    """Stage 1 both high, stage 2 both low → momentary, T+1m added to buffer."""
+async def test_verify_all_momentary_r3_stored_in_sqlite(tmp_db):
+    """Stage 1 both high, stage 2 both low → momentary event: T+1m stored in SQLite."""
     entry = _breach_entry()
     ingest._verifying.update(["co2"])
 
@@ -310,21 +285,20 @@ async def test_verify_all_momentary_severity_and_r3_buffered():
 
     # severity = 1 (baseline) + 1 (r1 high) + 1 (r2 high) = 3
     assert entry["severity"] == 3
-    assert len(ingest._buffer) == 1, "T+1m read must be added to buffer for momentary event"
-    assert ingest._buffer[0]["data"] == _low_read()
+    assert queue.count_pending() == 1, "T+1m read must be stored in SQLite for momentary event"
+    row = queue.get_pending(limit=1)[0]
+    assert json.loads(row["data"]) == _low_read()
 
 
-async def test_verify_all_alert_sends_and_triggers_drain():
-    """Stage 1 both high, stage 2 one high → severity>=4, alert sent, drain triggered."""
+async def test_verify_all_alert_sends_on_persistent_breach():
+    """Stage 1 both high, stage 2 one high → persistent breach, alert sent."""
     entry = _breach_entry()
     ingest._verifying.update(["co2"])
 
     reads = [_high_read(), _high_read(), _high_read(), _low_read()]
-    drain_calls = []
     with patch("asyncio.sleep", new_callable=AsyncMock), \
          patch("jobs.ingest.read_sensor", side_effect=reads), \
          patch("jobs.ingest.state"), \
-         patch("jobs.ingest.trigger_drain", side_effect=lambda: drain_calls.append(1)), \
          patch("jobs.ingest._send_or_queue_alert", new_callable=AsyncMock) as mock_send, \
          patch.dict("os.environ", {"NEW_AUTH_TOKEN": "tok"}):
         await _verify_all([("co2", _CO2_CRITERION)], entry)
@@ -332,8 +306,7 @@ async def test_verify_all_alert_sends_and_triggers_drain():
     # severity = 1 + 1 + 1 + 2 = 5
     assert entry["severity"] == 5
     assert mock_send.call_count == 1
-    assert drain_calls, "trigger_drain must be called after persistent breach"
-    assert not ingest._buffer, "no verification reads should be in buffer for alert outcome"
+    assert not ingest._verifying
 
 
 async def test_verify_all_clears_verifying_on_sensor_error():
@@ -349,158 +322,323 @@ async def test_verify_all_clears_verifying_on_sensor_error():
     assert not ingest._verifying
 
 
-# ── Read-triggered drain ───────────────────────────────────────────────────────
+# ── _run_read signals live event ───────────────────────────────────────────────
 
-async def test_run_read_triggers_drain_when_interval_elapsed(monkeypatch):
-    """A standard read triggers drain once the drain interval has elapsed."""
-    ingest._last_drained_at = (
-        datetime.now(timezone.utc) - timedelta(seconds=DRAIN_IDLE + 10)
-    )
-    triggered = []
-    monkeypatch.setattr(ingest, "trigger_drain", lambda: triggered.append(1))
+async def test_run_read_sets_pending_live_and_signals_event():
+    """A successful read stores _pending_live and signals _live_event."""
+    ingest._live_event = asyncio.Event()
 
     with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 400}}), \
          patch("jobs.ingest.load_criteria", return_value=[]), \
          patch("jobs.ingest.state"):
-        await _run_read(S)
+        await _run_read(S, [])
 
-    assert triggered, "trigger_drain should be called after drain interval elapses"
-
-
-async def test_run_read_does_not_trigger_drain_before_interval(monkeypatch):
-    """A read does not trigger drain when the interval has not yet elapsed."""
-    ingest._last_drained_at = datetime.now(timezone.utc)  # just drained
-    triggered = []
-    monkeypatch.setattr(ingest, "trigger_drain", lambda: triggered.append(1))
-
-    with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 400}}), \
-         patch("jobs.ingest.load_criteria", return_value=[]), \
-         patch("jobs.ingest.state"):
-        await _run_read(S)
-
-    assert not triggered, "trigger_drain must not be called before drain interval"
+    assert ingest._pending_live is not None
+    assert ingest._pending_live["data"] == {"sen6x": {"co2": 400}}
+    assert ingest._live_event.is_set()
 
 
-async def test_run_read_does_not_trigger_drain_during_verification(monkeypatch):
-    """During alert verification _verifying is non-empty; drain must be suppressed."""
-    ingest._last_drained_at = (
-        datetime.now(timezone.utc) - timedelta(seconds=DRAIN_IDLE + 10)
-    )
-    ingest._verifying.add("co2")
-    triggered = []
-    monkeypatch.setattr(ingest, "trigger_drain", lambda: triggered.append(1))
-
-    with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 400}}), \
-         patch("jobs.ingest.load_criteria", return_value=[]), \
-         patch("jobs.ingest.state"):
-        await _run_read(S)
-
-    assert not triggered, "trigger_drain must be suppressed during alert verification"
-
-
-async def test_run_read_does_not_trigger_drain_on_sensor_error(monkeypatch):
-    """A failed sensor read returns early without touching the drain logic."""
-    ingest._last_drained_at = (
-        datetime.now(timezone.utc) - timedelta(seconds=DRAIN_IDLE + 10)
-    )
-    triggered = []
-    monkeypatch.setattr(ingest, "trigger_drain", lambda: triggered.append(1))
+async def test_run_read_no_signal_on_sensor_error():
+    """A failed sensor read returns early without setting _pending_live or event."""
+    ingest._live_event = asyncio.Event()
 
     with patch("jobs.ingest.read_sensor", side_effect=RuntimeError("sensor off")):
-        await _run_read(S)
+        await _run_read(S, [])
 
-    assert not triggered, "trigger_drain must not be called when sensor read fails"
-    assert ingest._buffer == [], "nothing should be buffered on sensor error"
-
-
-def test_should_drain_false_when_never_drained():
-    """_should_drain returns False at startup (initial drain handled by _drain_loop)."""
-    assert ingest._last_drained_at is None
-    assert _should_drain(S) is False
+    assert ingest._pending_live is None
+    assert not ingest._live_event.is_set()
 
 
-def test_should_drain_true_after_interval_elapsed():
-    """_should_drain returns True once the drain interval has passed."""
-    ingest._last_drained_at = (
-        datetime.now(timezone.utc) - timedelta(seconds=DRAIN_IDLE + 1)
-    )
-    assert _should_drain(S) is True
+# ── _try_post ─────────────────────────────────────────────────────────────────
+
+def _mock_client(response_json: dict, status: int = 200):
+    """Return a mock httpx.AsyncClient context manager with a canned response."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = status
+    mock_resp.raise_for_status = MagicMock()
+    if status == 401:
+        mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "401", request=MagicMock(), response=mock_resp
+        )
+    mock_resp.json.return_value = response_json
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    return mock_client
 
 
-def test_should_drain_false_before_interval_elapsed():
-    """_should_drain returns False when the drain interval has not yet passed."""
-    ingest._last_drained_at = datetime.now(timezone.utc)
-    assert _should_drain(S) is False
+async def test_try_post_returns_none_on_connect_error(monkeypatch):
+    """Connection failure returns None without raising."""
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://localhost:0/ingest")
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = httpx.ConnectError("refused")
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        result = await _try_post([{"recorded_at": "t", "data": {}}], 0)
+
+    assert result is None
 
 
-def test_should_drain_triggers_one_read_before_deadline():
-    """Drain fires when exactly drain_interval - read_interval seconds have elapsed.
+async def test_try_post_returns_none_on_auth_rejection(monkeypatch):
+    """401 from server returns None."""
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://server/ingest")
+    mock_client = _mock_client({}, status=401)
 
-    The criterion is: 'would skipping this read cause the deadline to be missed?'
-    At elapsed = drain_interval - read_interval the answer is yes (the next read
-    would land after the deadline), so _should_drain must return True here.
-    """
-    ingest._last_drained_at = (
-        datetime.now(timezone.utc) - timedelta(seconds=DRAIN_IDLE - READ_IDLE)
-    )
-    assert _should_drain(S) is True
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        result = await _try_post([{"recorded_at": "t", "data": {}}], 0)
+
+    assert result is None
 
 
-def test_should_drain_false_one_second_before_deadline():
-    """One second before the trigger point, _should_drain is still False."""
-    ingest._last_drained_at = (
-        datetime.now(timezone.utc) - timedelta(seconds=DRAIN_IDLE - READ_IDLE - 1)
-    )
-    assert _should_drain(S) is False
-
-
-def test_validate_rejects_non_quarter_hour_start():
-    """validate_settings exits when the window start minute is not :00/:15/:30/:45."""
-    bad = {**S, "active_window": {"start": "07:10", "end": "16:00"}}
-    with pytest.raises(SystemExit):
-        validate_settings(bad)
-
-
-def test_validate_rejects_non_quarter_hour_end():
-    """validate_settings exits when the window end minute is not :00/:15/:30/:45."""
-    bad = {**S, "active_window": {"start": "07:00", "end": "16:05"}}
-    with pytest.raises(SystemExit):
-        validate_settings(bad)
-
-
-def test_validate_accepts_quarter_hour_boundaries():
-    """validate_settings passes for :00/:15/:30/:45 boundaries."""
-    for start, end in [("07:00", "16:00"), ("07:15", "15:45"), ("08:30", "15:30")]:
-        validate_settings({**S, "active_window": {"start": start, "end": end}})
-
-
-# ── Option 1: buffer slice on POST success ─────────────────────────────────────
-
-async def test_run_drain_does_not_discard_reading_added_during_post(tmp_db, monkeypatch):
-    """Reading appended to _buffer during the async POST is preserved after drain."""
+async def test_try_post_includes_backlog_metadata_when_backlog_nonzero(monkeypatch):
+    """Request body carries backlog_readings and bytes_per_reading when backlog > 0."""
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://server/ingest")
     monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
-    ingest._last_drained_at = datetime.now(timezone.utc) - timedelta(hours=1)
 
-    initial_entry = {"data": {"sen6x": {"co2": 400}}, "recorded_at": "2026-06-23T10:00:00+00:00"}
-    concurrent_entry = {"data": {"sen6x": {"co2": 410}}, "recorded_at": "2026-06-23T10:05:00+00:00"}
-    ingest._buffer.append(initial_entry)
+    captured: dict = {}
 
-    async def fake_post(client, measurements):
-        # Simulate a reading arriving during the HTTP call
-        ingest._buffer.append(concurrent_entry)
-        return {}
+    async def fake_post(url, **kwargs):
+        captured.update(kwargs.get("json", {}))
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"credit_bytes": 500}
+        return resp
+
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = fake_post
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        result = await _try_post(
+            [{"recorded_at": "t", "data": {"co2": 400}}],
+            backlog_count=5,
+            bpr=100,
+        )
+
+    assert result == {"credit_bytes": 500}
+    assert captured["backlog_readings"] == 5
+    assert captured["bytes_per_reading"] == 100
+    assert len(captured["readings"]) == 1
+
+
+async def test_try_post_omits_bytes_per_reading_when_no_backlog(monkeypatch):
+    """bytes_per_reading must be absent from the request body when backlog_count=0."""
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://server/ingest")
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+
+    captured: dict = {}
+
+    async def fake_post(url, **kwargs):
+        captured.update(kwargs.get("json", {}))
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"credit_bytes": 0}
+        return resp
+
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = fake_post
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        await _try_post([{"recorded_at": "t", "data": {}}], backlog_count=0)
+
+    assert "bytes_per_reading" not in captured
+
+
+# ── _wait_for_live ─────────────────────────────────────────────────────────────
+
+async def test_wait_for_live_returns_false_on_timeout():
+    """Timeout expires without an event → False."""
+    ingest._live_event = asyncio.Event()
+    result = await _wait_for_live(0.01)
+    assert result is False
+
+
+async def test_wait_for_live_returns_true_when_event_already_set():
+    """If the event is already set before the call, return True immediately."""
+    ingest._live_event = asyncio.Event()
+    ingest._live_event.set()
+    result = await _wait_for_live(1.0)
+    assert result is True
+
+
+async def test_wait_for_live_returns_false_when_no_event():
+    """When _live_event is None, return False without blocking."""
+    ingest._live_event = None
+    result = await _wait_for_live(1.0)
+    assert result is False
+
+
+# ── _update_credit ─────────────────────────────────────────────────────────────
+
+def test_update_credit_overwrites_not_accumulates():
+    """A second credit grant overwrites the first — credits never accumulate."""
+    ingest._credit_bytes      = 5000
+    ingest._recommended_delay = 10.0
+
+    _update_credit({"credit_bytes": 2000, "recommended_delay_seconds": 5.0})
+    assert ingest._credit_bytes      == 2000
+    assert ingest._recommended_delay == 5.0
+
+    _update_credit({"credit_bytes": 3000, "recommended_delay_seconds": 0.0})
+    assert ingest._credit_bytes == 3000  # overwritten, not 2000 + 3000
+    assert ingest._recommended_delay == 0.0
+
+
+# ── _drain_backlog ─────────────────────────────────────────────────────────────
+
+async def test_drain_backlog_exits_immediately_when_empty(tmp_db):
+    """No queued rows → drain returns without touching the server."""
+    ingest._credit_bytes = 10_000
 
     with patch("jobs.ingest.aggregate.run_aggregation",
                return_value={"buckets": 0, "rows_in": 0, "rows_removed": 0}), \
-         patch("jobs.ingest._post_batch", new=fake_post), \
-         patch("jobs.ingest._drain_alerts"):
-        await _run_drain(S)
+         patch("jobs.ingest._try_post", new_callable=AsyncMock) as mock_post:
+        await _drain_backlog()
 
-    assert ingest._buffer == [concurrent_entry], (
-        "the reading added during POST must survive — only the pre-POST entries are cleared"
-    )
+    mock_post.assert_not_called()
 
-# ── OTA update / version ───────────────────────────────────────────────────────
+
+async def test_drain_backlog_exits_when_no_credit(tmp_db):
+    """credit_bytes=0 → no drain even when rows exist."""
+    queue.enqueue({"co2": 400}, "2026-06-23T10:00:00+00:00")
+    ingest._credit_bytes = 0
+
+    with patch("jobs.ingest.aggregate.run_aggregation",
+               return_value={"buckets": 0, "rows_in": 0, "rows_removed": 0}), \
+         patch("jobs.ingest._try_post", new_callable=AsyncMock) as mock_post:
+        await _drain_backlog()
+
+    mock_post.assert_not_called()
+    assert queue.count_pending() == 1
+
+
+async def test_drain_backlog_sends_and_removes_rows(tmp_db):
+    """With sufficient credit, queued rows are POSTed and removed from SQLite."""
+    queue.enqueue({"co2": 400}, "2026-06-23T10:00:00+00:00")
+    queue.enqueue({"co2": 410}, "2026-06-23T10:05:00+00:00")
+    ingest._credit_bytes = 100_000  # generous credit
+
+    with patch("jobs.ingest.aggregate.run_aggregation",
+               return_value={"buckets": 0, "rows_in": 0, "rows_removed": 0}), \
+         patch("jobs.ingest._try_post", new_callable=AsyncMock,
+               return_value={"credit_bytes": 0, "recommended_delay_seconds": 0}), \
+         patch("jobs.ingest._handle_response", new_callable=AsyncMock):
+        await _drain_backlog()
+
+    assert queue.count_pending() == 0
+
+
+async def test_drain_backlog_holds_rows_on_server_error(tmp_db):
+    """When _try_post returns None, rows remain pending for retry."""
+    queue.enqueue({"co2": 400}, "2026-06-23T10:00:00+00:00")
+    ingest._credit_bytes = 10_000
+
+    with patch("jobs.ingest.aggregate.run_aggregation",
+               return_value={"buckets": 0, "rows_in": 0, "rows_removed": 0}), \
+         patch("jobs.ingest._try_post", new_callable=AsyncMock, return_value=None):
+        await _drain_backlog()
+
+    assert queue.count_pending() == 1
+
+
+# ── _handle_response ──────────────────────────────────────────────────────────
+
+async def test_handle_response_saves_criteria():
+    """Criteria list in response is persisted to disk."""
+    criteria = [{"metric": "co2", "threshold": 1000, "condition": "above", "severity": "warning"}]
+    with patch("jobs.ingest.save_criteria") as mock_save, \
+         patch("jobs.ingest._drain_alerts", new_callable=AsyncMock):
+        await _handle_response({"criteria": criteria})
+    mock_save.assert_called_once_with(criteria)
+
+
+async def test_handle_response_schedules_update_when_min_version_newer():
+    """min_version higher than running version → update task scheduled."""
+    tasks = []
+    with patch("jobs.ingest._drain_alerts", new_callable=AsyncMock), \
+         patch("asyncio.create_task", side_effect=tasks.append):
+        await _handle_response({"min_version": "99.0.0"})
+    assert len(tasks) >= 1
+
+
+async def test_handle_response_no_update_when_min_version_met():
+    """min_version at or below running version → no update task."""
+    tasks = []
+    with patch("jobs.ingest._drain_alerts", new_callable=AsyncMock), \
+         patch("asyncio.create_task", side_effect=tasks.append):
+        await _handle_response({"min_version": "1.0.0"})
+    assert len(tasks) == 0
+
+
+async def test_handle_response_no_update_when_min_version_null():
+    """min_version=None → no update task."""
+    tasks = []
+    with patch("jobs.ingest._drain_alerts", new_callable=AsyncMock), \
+         patch("asyncio.create_task", side_effect=tasks.append):
+        await _handle_response({"min_version": None})
+    assert len(tasks) == 0
+
+
+# ── _version_is_older_than ────────────────────────────────────────────────────
+
+def test_version_is_older_than_true_when_behind():
+    assert _version_is_older_than("99.0.0") is True
+
+def test_version_is_older_than_false_when_equal():
+    assert _version_is_older_than(VERSION) is False
+
+def test_version_is_older_than_false_when_ahead():
+    assert _version_is_older_than("0.0.1") is False
+
+def test_version_is_older_than_compares_semantically_not_lexically():
+    # "2.9.0" < "2.10.0" semantically; lexically "9" > "10"
+    assert _version_is_older_than("2.10.0") is True  # assumes VERSION is 2.x where x < 10
+
+def test_version_is_older_than_returns_false_on_malformed():
+    assert _version_is_older_than("not-a-version") is False
+
+
+# ── _upload_loop queues on missing token ──────────────────────────────────────
+
+async def test_upload_loop_queues_to_sqlite_when_no_token(tmp_db, monkeypatch):
+    """When no auth token, live reading is stored in SQLite without an HTTP call."""
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "")
+
+    entry = {
+        "data": {"sen6x": {"co2": 400}},
+        "recorded_at": "2026-06-23T10:00:00+00:00",
+        "severity": 0,
+    }
+    from jobs.ingest import _upload_loop
+
+    task = asyncio.create_task(_upload_loop(S))
+    await asyncio.sleep(0)  # let the loop start and create _live_event
+
+    ingest._pending_live = entry
+    ingest._live_event.set()
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert queue.count_pending() == 1
+
+
+# ── OTA update ────────────────────────────────────────────────────────────────
 
 def test_version_is_semver():
     assert re.fullmatch(r"\d+\.\d+\.\d+", VERSION), \
@@ -530,22 +668,18 @@ async def test_trigger_update_guard_skips_subprocess_when_already_running():
         ingest._update_in_progress = False
 
 
-async def test_trigger_update_resets_flag_after_success():
-    """`_update_in_progress` must be False after a successful subprocess run."""
+async def test_trigger_update_leaves_flag_true_after_success():
+    """`_update_in_progress` stays True after success — blocks re-trigger before restart."""
     mock_proc = AsyncMock()
     mock_proc.returncode = 0
     mock_proc.communicate.return_value = (b"ok", b"")
     with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
         await _trigger_update()
-    assert ingest._update_in_progress is False
+    assert ingest._update_in_progress is True
 
 
 async def test_trigger_update_resets_flag_after_subprocess_failure():
-    """`_update_in_progress` must be False even when the update script exits non-zero.
-
-    A stuck True would silently suppress all future OTA signals until the
-    process is restarted.
-    """
+    """`_update_in_progress` must be False even when the update script exits non-zero."""
     mock_proc = AsyncMock()
     mock_proc.returncode = 1
     mock_proc.communicate.return_value = (b"fatal error", b"")
@@ -554,65 +688,24 @@ async def test_trigger_update_resets_flag_after_subprocess_failure():
     assert ingest._update_in_progress is False
 
 
-async def test_run_drain_fires_trigger_update_when_update_available(tmp_db, monkeypatch):
-    """`_run_drain` must schedule `_trigger_update` when the server flags update_available."""
-    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
-    ingest._last_drained_at = datetime.now(timezone.utc) - timedelta(hours=1)
-    ingest._buffer.append({"data": {"sen6x": {"co2": 400}}, "recorded_at": "2026-06-23T10:00:00+00:00"})
+# ── Upload offset / drain jitter ───────────────────────────────────────────────
 
-    async def fake_post(client, measurements):
-        return {"update_available": True}
-
-    trigger_mock = AsyncMock()
-    with patch("jobs.ingest.aggregate.run_aggregation",
-               return_value={"buckets": 0, "rows_in": 0, "rows_removed": 0}), \
-         patch("jobs.ingest._post_batch", new=fake_post), \
-         patch("jobs.ingest._drain_alerts"), \
-         patch("jobs.ingest._trigger_update", trigger_mock):
-        await _run_drain(S)
-
-    trigger_mock.assert_called_once()
+def test_get_upload_offset_prefers_env_var(tmp_path, monkeypatch):
+    """UPLOAD_OFFSET env var takes precedence over jitter in settings."""
+    monkeypatch.setenv("UPLOAD_OFFSET", "77")
+    settings = {"active_window": {"start": "07:00", "end": "16:00"}}
+    assert _get_upload_offset(settings) == 77
 
 
-async def test_run_drain_skips_trigger_update_when_flag_false(tmp_db, monkeypatch):
-    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
-    ingest._last_drained_at = datetime.now(timezone.utc) - timedelta(hours=1)
-    ingest._buffer.append({"data": {"sen6x": {"co2": 400}}, "recorded_at": "2026-06-23T10:00:00+00:00"})
+def test_get_upload_offset_falls_back_to_jitter(tmp_path, monkeypatch):
+    """When UPLOAD_OFFSET is absent, the jitter from settings is used."""
+    monkeypatch.setenv("UPLOAD_OFFSET", "")
+    settings_file = tmp_path / "config" / "settings.json"
+    monkeypatch.setattr(ingest, "SETTINGS_PATH", settings_file)
+    settings = {"active_window": {"start": "07:00", "end": "16:00"},
+                "drain_jitter_seconds": 42}
+    assert _get_upload_offset(settings) == 42
 
-    async def fake_post(client, measurements):
-        return {"update_available": False}
-
-    trigger_mock = AsyncMock()
-    with patch("jobs.ingest.aggregate.run_aggregation",
-               return_value={"buckets": 0, "rows_in": 0, "rows_removed": 0}), \
-         patch("jobs.ingest._post_batch", new=fake_post), \
-         patch("jobs.ingest._drain_alerts"), \
-         patch("jobs.ingest._trigger_update", trigger_mock):
-        await _run_drain(S)
-
-    trigger_mock.assert_not_called()
-
-
-async def test_run_drain_skips_trigger_update_when_key_absent(tmp_db, monkeypatch):
-    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
-    ingest._last_drained_at = datetime.now(timezone.utc) - timedelta(hours=1)
-    ingest._buffer.append({"data": {"sen6x": {"co2": 400}}, "recorded_at": "2026-06-23T10:00:00+00:00"})
-
-    async def fake_post(client, measurements):
-        return {}
-
-    trigger_mock = AsyncMock()
-    with patch("jobs.ingest.aggregate.run_aggregation",
-               return_value={"buckets": 0, "rows_in": 0, "rows_removed": 0}), \
-         patch("jobs.ingest._post_batch", new=fake_post), \
-         patch("jobs.ingest._drain_alerts"), \
-         patch("jobs.ingest._trigger_update", trigger_mock):
-        await _run_drain(S)
-
-    trigger_mock.assert_not_called()
-
-
-# ── Drain jitter ───────────────────────────────────────────────────────────────
 
 def test_ensure_drain_jitter_generates_and_saves_when_absent(tmp_path, monkeypatch):
     """When drain_jitter_seconds is missing, a value is generated and persisted."""
@@ -640,7 +733,7 @@ def test_ensure_drain_jitter_is_stable_across_calls(tmp_path, monkeypatch):
 
 
 def test_ensure_drain_jitter_honours_existing_value(tmp_path, monkeypatch):
-    """When drain_jitter_seconds is already present, it is used as-is and the
+    """When drain_jitter_seconds is already present it is used as-is and the
     file is not rewritten (server-assigned slots must never be overwritten)."""
     settings_file = tmp_path / "config" / "settings.json"
     monkeypatch.setattr(ingest, "SETTINGS_PATH", settings_file)

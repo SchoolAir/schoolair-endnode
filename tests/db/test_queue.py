@@ -12,7 +12,7 @@ import pytest
 import db.queue as queue
 
 
-TS  = "2026-06-23T08:00:00+00:00"
+TS  = datetime.now(timezone.utc).isoformat()   # "recent" — must stay above any aggregation cutoff
 OLD = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
 DATA = {"co2": 400, "temp": 22.5}
 

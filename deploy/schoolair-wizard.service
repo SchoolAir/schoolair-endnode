@@ -4,6 +4,9 @@ After=NetworkManager.service
 
 [Service]
 Type=simple
+# Grab port 80 from nginx on start; give it back on exit.
+ExecStartPre=-/bin/systemctl stop nginx
+ExecStopPost=-/bin/systemctl start nginx
 ExecStart=/usr/bin/python3 -u /home/admin/schoolair/registration_wizard/wizard.py
 WorkingDirectory=/home/admin/schoolair/registration_wizard
 User=root
