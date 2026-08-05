@@ -82,6 +82,11 @@ _live_event:        asyncio.Event | None = None  # signalled when _pending_live 
 _credit_bytes:      int   = 0              # server-granted byte budget; always overwritten
 _recommended_delay: float = 0.0            # seconds to wait between drain batches
 
+# ── Settings state ────────────────────────────────────────────────────────────
+
+_settings:        dict             = {}    # live settings; updated by server schedule pushes
+_settings_event:  asyncio.Event | None = None  # fired when active_window changes mid-sleep
+
 # ── Alert state ───────────────────────────────────────────────────────────────
 
 _alert_buffer:        list[dict]         = []
@@ -703,6 +708,44 @@ def _update_credit(response: dict) -> None:
     _recommended_delay = float(response.get("recommended_delay_seconds", 0))
 
 
+def _apply_window_update(new_window: dict) -> bool:
+    """Apply a server-provided active_window if it differs from the current one.
+
+    Compares against the in-memory value first — writes settings.json only on
+    actual change.  Invalid windows (bad boundaries, window too wide) are
+    silently ignored so a bad server response can't crash the service.
+    Returns True if the window was changed.
+    """
+    global _settings
+    if new_window == _settings.get("active_window"):
+        return False
+    candidate = {**_settings, "active_window": new_window}
+    try:
+        validate_settings(candidate)
+    except SystemExit as e:
+        print(f"[settings] server sent invalid active_window — ignoring ({e})")
+        return False
+    _settings["active_window"] = new_window
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(_settings, indent=2))
+    print(f"[settings] active_window updated: {new_window['start']}–{new_window['end']}")
+    return True
+
+
+async def _wait_for_boundary(seconds: float) -> None:
+    """Sleep until the next read boundary, waking early if active_window changes."""
+    if seconds <= 0:
+        return
+    if _settings_event is None:
+        await asyncio.sleep(seconds)
+        return
+    _settings_event.clear()
+    try:
+        await asyncio.wait_for(asyncio.shield(_settings_event.wait()), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def _handle_response(response: dict) -> None:
     """Process server directives from any successful ingest response."""
     if response.get("criteria"):
@@ -710,6 +753,11 @@ async def _handle_response(response: dict) -> None:
     min_ver = response.get("min_version")
     if min_ver and _version_is_older_than(min_ver):
         asyncio.create_task(_trigger_update())
+    schedule = response.get("schedule")
+    if schedule and "active_start" in schedule and "active_end" in schedule:
+        new_window = {"start": schedule["active_start"], "end": schedule["active_end"]}
+        if _apply_window_update(new_window) and _settings_event is not None:
+            _settings_event.set()
     if response.get("wifi_push"):
         asyncio.create_task(_handle_wifi_push(response["wifi_push"]))
     await _drain_alerts()
@@ -925,7 +973,7 @@ async def _drain_backlog() -> None:
         print("[drain] backlog cleared")
 
 
-async def _upload_loop(settings: dict) -> None:
+async def _upload_loop() -> None:
     """Send live readings immediately; drain backlog on server credit."""
     global _live_event
 
@@ -968,12 +1016,12 @@ async def _upload_loop(settings: dict) -> None:
 # ── Loops ─────────────────────────────────────────────────────────────────────
 
 
-async def _read_loop(settings: dict, active_sensors: list):
-    offset      = _get_upload_offset(settings)
-    prev_active = _in_active_window(settings)
+async def _read_loop(active_sensors: list):
+    offset      = _get_upload_offset(_settings)
+    prev_active = _in_active_window(_settings)
 
     while True:
-        curr_active = _in_active_window(settings)
+        curr_active = _in_active_window(_settings)
 
         if curr_active != prev_active:
             if prev_active and not curr_active:
@@ -982,19 +1030,22 @@ async def _read_loop(settings: dict, active_sensors: list):
                 print("[transition] idle→active: immediate read")
             prev_active = curr_active
 
-        await _run_read(settings, active_sensors)
-        interval = current_read_interval(settings)
+        await _run_read(_settings, active_sensors)
+        interval = current_read_interval(_settings)
+        offset   = _get_upload_offset(_settings)  # re-read in case settings changed
         delay    = _seconds_to_next_boundary(interval, offset)
         mode     = "active" if curr_active else "idle"
         print(f"[read/{mode}] next in {delay:.0f}s (offset={offset}s)")
-        await asyncio.sleep(delay)
+        await _wait_for_boundary(delay)
 
 
 async def ingest_loop():
     """Initialise SQLite, probe aux sensors, run read / upload / NTP tasks."""
+    global _settings, _settings_event
     queue.init()
-    settings = load_settings()
-    validate_settings(settings)
+    _settings = load_settings()
+    validate_settings(_settings)
+    _settings_event = asyncio.Event()
     active_sensors = probe_aux_sensors()
     print(
         f"Ingest started — "
@@ -1003,7 +1054,7 @@ async def ingest_loop():
         + (f" | aux sensors: {', '.join(s['name'] for s in active_sensors)}" if active_sensors else "")
     )
     await asyncio.gather(
-        _read_loop(settings, active_sensors),
-        _upload_loop(settings),
+        _read_loop(active_sensors),
+        _upload_loop(),
         _ntp_correction_task(),
     )
