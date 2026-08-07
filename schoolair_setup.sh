@@ -22,7 +22,7 @@
 #   10. Captive-portal DNS hijacking via NM dnsmasq plugin
 #   11. Avahi  →  schoolair-register.local
 #   12. dhcpcd conflict prevention (Bullseye only)
-#   13. nginx  →  proxies port 80 → telemetry :8080 (disabled until registered)
+#   13. nginx  →  port 80 (HTTP) + 443 (HTTPS, self-signed) → telemetry :8080 (disabled until registered)
 #   14. Sudoers rule for telemetry to start wizard
 #   15. systemd services
 #   16. Verification + summary
@@ -360,12 +360,31 @@ fi
 
 # ── 13. nginx ─────────────────────────────────────────────────────────────────
 step "13 / nginx  (configured, disabled until registration)"
-# nginx proxies port 80 → telemetry :8080 once the device is registered.
-# Stays disabled here — wizard.py's _delayed_shutdown() enables it on success.
+# nginx proxies port 80 (HTTP) and port 443 (HTTPS, self-signed cert) to
+# telemetry :8080. Stays disabled here — wizard.py enables it on registration.
+# Port 443 uses the same self-signed cert generated for the wizard in step 6.
+# Browsers that auto-upgrade to https:// get a clickable cert warning rather
+# than a hard SSL_ERROR_RX_RECORD_TOO_LONG failure.
+CERT_FILE="${SCHOOLAIR_DIR}/registration_wizard/cert.pem"
+KEY_FILE="${SCHOOLAIR_DIR}/registration_wizard/key.pem"
 cat > /etc/nginx/sites-available/default << NGINXEOF
 server {
     listen 80;
     server_name _;
+    location / {
+        proxy_pass http://127.0.0.1:${TELEMETRY_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 300s;
+    }
+}
+server {
+    listen 443 ssl;
+    server_name _;
+    ssl_certificate     ${CERT_FILE};
+    ssl_certificate_key ${KEY_FILE};
     location / {
         proxy_pass http://127.0.0.1:${TELEMETRY_PORT};
         proxy_http_version 1.1;

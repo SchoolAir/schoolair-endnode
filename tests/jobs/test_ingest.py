@@ -31,9 +31,11 @@ from jobs.ingest import (
     _run_read,
     _try_post,
     _wait_for_live,
+    _wait_for_boundary,
     _drain_backlog,
     _handle_response,
     _update_credit,
+    _apply_window_update,
     _get_upload_offset,
     _version_is_older_than,
     _auth_headers,
@@ -60,20 +62,24 @@ S = {
 def reset_ingest_state():
     """Clear mutable module-level state before and after each test."""
     ingest._alert_buffer.clear()
-    ingest._pending_live      = None
-    ingest._live_event        = None
-    ingest._credit_bytes      = 0
-    ingest._recommended_delay = 0.0
+    ingest._pending_live       = None
+    ingest._live_event         = None
+    ingest._credit_bytes       = 0
+    ingest._recommended_delay  = 0.0
     ingest._update_in_progress = False
+    ingest._settings           = dict(S)
+    ingest._settings_event     = None
     ingest._verifying.clear()
     ingest.alert_cooldown.clear()
     yield
     ingest._alert_buffer.clear()
-    ingest._pending_live      = None
-    ingest._live_event        = None
-    ingest._credit_bytes      = 0
-    ingest._recommended_delay = 0.0
+    ingest._pending_live       = None
+    ingest._live_event         = None
+    ingest._credit_bytes       = 0
+    ingest._recommended_delay  = 0.0
     ingest._update_in_progress = False
+    ingest._settings           = dict(S)
+    ingest._settings_event     = None
     ingest._verifying.clear()
 
 
@@ -579,6 +585,41 @@ async def test_handle_response_no_update_when_min_version_met():
     assert len(tasks) == 0
 
 
+async def test_handle_response_applies_schedule(tmp_path, monkeypatch):
+    """schedule in response updates _settings and writes settings.json."""
+    monkeypatch.setattr(ingest, "SETTINGS_PATH", tmp_path / "config" / "settings.json")
+    ingest._settings = {"active_window": {"start": "07:00", "end": "16:00"}}
+
+    with patch("jobs.ingest._drain_alerts", new_callable=AsyncMock):
+        await _handle_response({"schedule": {"active_start": "08:00", "active_end": "17:00"}})
+
+    assert ingest._settings["active_window"] == {"start": "08:00", "end": "17:00"}
+
+
+async def test_handle_response_fires_settings_event_on_schedule_change(tmp_path, monkeypatch):
+    """When the window changes, _settings_event is set to wake _read_loop."""
+    monkeypatch.setattr(ingest, "SETTINGS_PATH", tmp_path / "config" / "settings.json")
+    ingest._settings       = {"active_window": {"start": "07:00", "end": "16:00"}}
+    ingest._settings_event = asyncio.Event()
+
+    with patch("jobs.ingest._drain_alerts", new_callable=AsyncMock):
+        await _handle_response({"schedule": {"active_start": "08:00", "active_end": "17:00"}})
+
+    assert ingest._settings_event.is_set()
+
+
+async def test_handle_response_no_event_when_schedule_unchanged(tmp_path, monkeypatch):
+    """No event fired when the server sends the same window we already have."""
+    monkeypatch.setattr(ingest, "SETTINGS_PATH", tmp_path / "config" / "settings.json")
+    ingest._settings       = {"active_window": {"start": "07:00", "end": "16:00"}}
+    ingest._settings_event = asyncio.Event()
+
+    with patch("jobs.ingest._drain_alerts", new_callable=AsyncMock):
+        await _handle_response({"schedule": {"active_start": "07:00", "active_end": "16:00"}})
+
+    assert not ingest._settings_event.is_set()
+
+
 async def test_handle_response_no_update_when_min_version_null():
     """min_version=None → no update task."""
     tasks = []
@@ -586,6 +627,69 @@ async def test_handle_response_no_update_when_min_version_null():
          patch("asyncio.create_task", side_effect=tasks.append):
         await _handle_response({"min_version": None})
     assert len(tasks) == 0
+
+
+# ── _apply_window_update ──────────────────────────────────────────────────────
+
+def test_apply_window_update_returns_false_when_unchanged(tmp_path, monkeypatch):
+    """Same window → no file write, returns False."""
+    monkeypatch.setattr(ingest, "SETTINGS_PATH", tmp_path / "config" / "settings.json")
+    ingest._settings = {"active_window": {"start": "07:00", "end": "16:00"}}
+    result = _apply_window_update({"start": "07:00", "end": "16:00"})
+    assert result is False
+    assert not (tmp_path / "config" / "settings.json").exists()
+
+
+def test_apply_window_update_writes_and_returns_true(tmp_path, monkeypatch):
+    """Different window → updates _settings, writes file, returns True."""
+    monkeypatch.setattr(ingest, "SETTINGS_PATH", tmp_path / "config" / "settings.json")
+    ingest._settings = {"active_window": {"start": "07:00", "end": "16:00"}}
+    result = _apply_window_update({"start": "08:00", "end": "15:00"})
+    assert result is True
+    assert ingest._settings["active_window"] == {"start": "08:00", "end": "15:00"}
+    saved = json.loads((tmp_path / "config" / "settings.json").read_text())
+    assert saved["active_window"] == {"start": "08:00", "end": "15:00"}
+
+
+def test_apply_window_update_ignores_invalid_window(tmp_path, monkeypatch):
+    """Window that fails validate_settings is rejected; state unchanged."""
+    monkeypatch.setattr(ingest, "SETTINGS_PATH", tmp_path / "config" / "settings.json")
+    original = {"start": "07:00", "end": "16:00"}
+    ingest._settings = {"active_window": dict(original)}
+    result = _apply_window_update({"start": "06:00", "end": "20:00"})  # 14 h — too wide
+    assert result is False
+    assert ingest._settings["active_window"] == original
+
+
+# ── _wait_for_boundary ────────────────────────────────────────────────────────
+
+async def test_wait_for_boundary_sleeps_full_duration_without_event():
+    """Without the event firing, blocks until the timeout expires."""
+    import time as _t
+    ingest._settings_event = asyncio.Event()  # not set — will timeout
+    start = _t.monotonic()
+    await _wait_for_boundary(0.05)            # 50 ms — enough to verify it waits
+    assert _t.monotonic() - start >= 0.04
+
+
+async def test_wait_for_boundary_returns_early_when_event_fires():
+    """Event fired mid-sleep causes _wait_for_boundary to return well before the timeout."""
+    ingest._settings_event = asyncio.Event()
+
+    async def _fire():
+        await asyncio.sleep(0.02)  # fire after the wait is already blocking
+        ingest._settings_event.set()
+
+    import time as _t
+    start = _t.monotonic()
+    await asyncio.gather(_wait_for_boundary(60), _fire())
+    assert _t.monotonic() - start < 1.0
+
+
+async def test_wait_for_boundary_skips_when_zero_seconds():
+    """Zero or negative duration returns immediately without touching the event."""
+    ingest._settings_event = asyncio.Event()
+    await _wait_for_boundary(0)   # must not block
 
 
 # ── _version_is_older_than ────────────────────────────────────────────────────
@@ -620,7 +724,7 @@ async def test_upload_loop_queues_to_sqlite_when_no_token(tmp_db, monkeypatch):
     }
     from jobs.ingest import _upload_loop
 
-    task = asyncio.create_task(_upload_loop(S))
+    task = asyncio.create_task(_upload_loop())
     await asyncio.sleep(0)  # let the loop start and create _live_event
 
     ingest._pending_live = entry
