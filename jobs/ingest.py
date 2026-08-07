@@ -122,7 +122,7 @@ def _window_hours(window: dict) -> float:
 
 def _in_active_window(settings: dict, now: time | None = None) -> bool:
     if now is None:
-        now = datetime.now().time()
+        now = datetime.now(timezone.utc).time()
     w = settings["active_window"]
     start, end = _parse_hhmm(w["start"]), _parse_hhmm(w["end"])
     if start <= end:
