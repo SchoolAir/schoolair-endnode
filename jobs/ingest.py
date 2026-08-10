@@ -34,7 +34,7 @@ import state
 
 load_dotenv()
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
