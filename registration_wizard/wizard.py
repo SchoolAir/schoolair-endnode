@@ -603,6 +603,9 @@ const AP_DROP_1="Testing your Wi-Fi — the setup hotspot briefly dropped. This 
 const AP_DROP_2="The setup hotspot dropped — the device is connecting to the school Wi-Fi. "+
   "If successful, registration is complete. If the hotspot reappears within 60 seconds, "+
   "tap Try Again.";
+const MGMT_DROP="Switching networks — this page's connection to the device dropped, which "+
+  "is expected. If the new network works, the device will reappear on it. If not, it will "+
+  "fall back to its setup hotspot after a couple of minutes.";
 function icon(t){const el=document.getElementById('icon');
   if(t==='spin')el.innerHTML='<div class="spin"></div>';else el.textContent=t;}
 function hint(t){const h=document.getElementById('hint');h.textContent=t;h.style.display='block';}
@@ -620,7 +623,15 @@ function connect(){
       icon('✅');hint('Token verified! Opening the device details form…');
       showQuote();setTimeout(()=>{window.location.href=d.redirect;},2000);
     } else if(d.state==='success'){
-      icon('✅');hint(STEP===2?'Registration complete. This hotspot will close shortly.':'Done!');showQuote();
+      icon('✅');
+      if(STEP==='mgmt'){
+        hint('Connected and saved.');
+        const r=document.getElementById('retry');
+        r.textContent='← Back to Device Configuration';r.style.display='inline-block';
+      } else {
+        hint(STEP===2?'Registration complete. This hotspot will close shortly.':'Done!');
+      }
+      showQuote();
     } else if(d.state==='error'){
       icon('❌');document.getElementById('retry').style.display='inline-block';dropped=true;ws.close();
     }
@@ -629,8 +640,8 @@ function connect(){
     clearTimeout(reconnTimer);
     if(!dropped){
       dropped=true;icon('📶');
-      msg(STEP===1?AP_DROP_1:AP_DROP_2);
-      hint('On Pi Zero hardware the hotspot may drop during connection — this is normal.');
+      msg(STEP===1?AP_DROP_1:(STEP==='mgmt'?MGMT_DROP:AP_DROP_2));
+      hint(STEP==='mgmt'?'':'On Pi Zero hardware the hotspot may drop during connection — this is normal.');
     }
     reconnTimer=setTimeout(connect,3000);
   };
@@ -776,6 +787,30 @@ input:focus{border-color:#1a56db}
 .net-priority{font-size:.7rem;color:#6b7280;font-family:monospace;background:#f3f4f6;
   border-radius:4px;padding:.1rem .35rem;white-space:nowrap}
 .empty-msg{font-size:.85rem;color:#9ca3af;padding:.5rem 0}
+.pw{position:relative}
+.pw input{padding-right:3.5rem}
+.pw button{position:absolute;right:.75rem;top:50%;transform:translateY(-50%);
+  background:none;border:none;cursor:pointer;color:#6b7280;font-size:.85rem;padding:.2rem}
+.btn-scan{width:100%;margin-top:.75rem;padding:.65rem;border:1.5px solid #1a56db;
+  border-radius:10px;background:#eff6ff;color:#1a56db;font-size:.9rem;font-weight:600;
+  cursor:pointer;transition:background .2s}
+.btn-scan:hover:not(:disabled){background:#dbeafe}
+.btn-scan:disabled{opacity:.5;cursor:not-allowed}
+.scan-list{margin-top:.4rem}
+.scan-item{display:flex;align-items:center;justify-content:space-between;
+  padding:.5rem .75rem;border:1.5px solid #e5e7eb;border-radius:8px;
+  margin-top:.35rem;cursor:pointer;transition:border-color .15s,background .15s}
+.scan-item:hover{border-color:#1a56db;background:#eff6ff}
+.scan-ssid{font-size:.875rem;color:#374151;font-weight:500;word-break:break-all}
+.scan-meta{font-size:.75rem;color:#6b7280;white-space:nowrap;margin-left:.5rem}
+.tabs{display:flex;gap:.4rem;margin-bottom:.5rem}
+.tab-btn{flex:1;padding:.6rem;border:1.5px solid #d1d5db;border-radius:8px;
+  background:#f9fafb;color:#6b7280;font-size:.85rem;font-weight:600;cursor:pointer;
+  transition:all .2s}
+.tab-btn:hover{border-color:#1a56db}
+.tab-btn.active{background:#1a56db;color:#fff;border-color:#1a56db}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
 </style>
 </head>
 <body>
@@ -784,38 +819,119 @@ input:focus{border-color:#1a56db}
     <h1>[[wizard_emoji]] Device Configuration</h1>
     <div class="badge">Registered</div>
   </div>
+  <div class="tabs">
+    <button type="button" class="tab-btn active" id="tab-btn-reg" onclick="showTab('reg')">Registration</button>
+    <button type="button" class="tab-btn" id="tab-btn-net" onclick="showTab('net')">Network</button>
+  </div>
   <div id="notice" class="notice" style="display:none"></div>
 
-  <div class="sect">Device Identity</div>
-  <label for="site">Site Name</label>
-  <input type="text" id="site" value="[[site]]">
-  <label for="asset">Asset Name</label>
-  <input type="text" id="asset" value="[[asset]]">
+  <div id="tab-reg" class="tab-panel active">
+    <div class="sect">Device Identity</div>
+    <label for="site">Site Name</label>
+    <input type="text" id="site" value="[[site]]">
+    <label for="asset">Asset Name</label>
+    <input type="text" id="asset" value="[[asset]]">
 
-  <div class="sect">Environment</div>
-  <div class="tog">
-    <input type="radio" id="ev_in"  name="environment" value="indoor"  [[indoor_checked]]>
-    <label for="ev_in">Indoor</label>
-    <input type="radio" id="ev_out" name="environment" value="outdoor" [[outdoor_checked]]>
-    <label for="ev_out">Outdoor</label>
+    <div class="sect">Environment</div>
+    <div class="tog">
+      <input type="radio" id="ev_in"  name="environment" value="indoor"  [[indoor_checked]]>
+      <label for="ev_in">Indoor</label>
+      <input type="radio" id="ev_out" name="environment" value="outdoor" [[outdoor_checked]]>
+      <label for="ev_out">Outdoor</label>
+    </div>
+
+    <button type="button" class="btn btn-blue" onclick="doUpdate()">Save Changes</button>
+
+    <hr class="divider">
+    <button type="button" class="btn btn-danger"
+            onclick="if(confirm('Reboot the device now?'))doReboot()">↻ Reboot Device</button>
   </div>
 
-  <button type="button" class="btn btn-blue" onclick="doUpdate()">Save Changes</button>
+  <div id="tab-net" class="tab-panel">
+    <div class="sect">Add Network</div>
+    <button type="button" id="scan-btn" class="btn-scan" onclick="doScan()">🔍 Scan for Networks</button>
+    <div id="scan-list" class="scan-list" onclick="handleScanClick(event)"></div>
+    <label for="new-ssid">Network Name (SSID)</label>
+    <input type="text" id="new-ssid" placeholder="Network name (or scan above)">
+    <label for="new-password">Password</label>
+    <div class="pw">
+      <input type="password" id="new-password" placeholder="Leave blank for open networks">
+      <button type="button" onclick="tpw()">Show</button>
+    </div>
+    <button type="button" class="btn btn-blue" onclick="doConnect()">Connect &amp; Save →</button>
+    <form id="cf" method="POST" action="/management/connect" style="display:none">
+      <input type="hidden" name="session"  value="[[session_token]]">
+      <input type="hidden" name="ssid"     id="f-ssid">
+      <input type="hidden" name="password" id="f-password">
+    </form>
 
-  <hr class="divider">
-  [[saved_networks_html]]
-
-  <hr class="divider">
-  <button type="button" class="btn btn-danger"
-          onclick="if(confirm('Reboot the device now?'))doReboot()">↻ Reboot Device</button>
+    <hr class="divider">
+    [[saved_networks_html]]
+  </div>
 </div>
 <script>
 const SESSION="[[session_token]]";
 function authHdr(){return{'Content-Type':'application/json','X-Session':SESSION};}
+function showTab(name){
+  for(const t of ['reg','net']){
+    document.getElementById('tab-'+t).classList.toggle('active', t===name);
+    document.getElementById('tab-btn-'+t).classList.toggle('active', t===name);
+  }
+  try{sessionStorage.setItem('sa_tab',name);}catch{}
+}
+try{
+  const saved=sessionStorage.getItem('sa_tab');
+  if(saved==='net')showTab('net');
+}catch{}
 function showNotice(msg,type){
   const el=document.getElementById('notice');
   el.className='notice notice-'+type;el.textContent=msg;el.style.display='';
   if(type==='ok')setTimeout(()=>{el.style.display='none';},5000);
+}
+function tpw(){
+  const f=document.getElementById('new-password'),b=f.nextElementSibling;
+  if(f.type==='password'){f.type='text';b.textContent='Hide';}
+  else{f.type='password';b.textContent='Show';}
+}
+function signalBars(s){
+  if(s>=75)return'||||';if(s>=50)return'||| ';if(s>=25)return'||  ';return'|   ';
+}
+function handleScanClick(e){
+  const item=e.target.closest('.scan-item');if(!item)return;
+  document.getElementById('new-ssid').value=item.dataset.ssid;
+  if(item.dataset.secured==='1')document.getElementById('new-password').focus();
+  else document.getElementById('new-ssid').focus();
+}
+async function doScan(){
+  const btn=document.getElementById('scan-btn');
+  const list=document.getElementById('scan-list');
+  btn.disabled=true;btn.textContent='Scanning…';list.innerHTML='';
+  try{
+    const r=await fetch('/wifi/scan',{method:'POST',headers:authHdr(),body:'{}'});
+    const d=await r.json();
+    if(d.error){showNotice(d.error,'err');return;}
+    const nets=d.networks||[];
+    if(!nets.length){list.innerHTML='<p class="empty-msg">No networks found.</p>';return;}
+    list.innerHTML=nets.map(n=>{
+      const safe=n.ssid.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      const disp=n.ssid.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return`<div class="scan-item" data-ssid="${safe}" data-secured="${n.secured?'1':'0'}">
+        <span class="scan-ssid">${disp}</span>
+        <span class="scan-meta">${signalBars(n.signal)} ${n.secured?'🔒':'🔓'}</span>
+      </div>`;
+    }).join('');
+  }catch{showNotice('Scan failed — try again.','err');}
+  btn.disabled=false;btn.textContent='🔍 Scan for Networks';
+}
+function doConnect(){
+  const ssid=document.getElementById('new-ssid').value.trim();
+  if(!ssid){showNotice('Network name (SSID) is required.','err');return;}
+  if(!confirm('This device will switch to "'+ssid+'". If it can\\'t reach that '+
+      'network, the netwatch service will fall back to the setup hotspot after '+
+      'a few minutes. Continue?')) return;
+  document.getElementById('f-ssid').value=ssid;
+  document.getElementById('f-password').value=document.getElementById('new-password').value;
+  document.getElementById('cf').submit();
 }
 async function doUpdate(){
   const site=document.getElementById('site').value.trim();
@@ -990,6 +1106,30 @@ async def _cmd(cmd: str) -> tuple:
     return proc.returncode, out.decode().strip(), err.decode().strip()
 
 
+def _display_ssid(name: str) -> str:
+    """Fallback human-readable name when the real SSID can't be read.
+
+    Profiles the wizard created itself (SAVED_PREFIX) have their sanitized
+    SSID embedded in the name, so that's recoverable even without asking
+    NetworkManager. For anything else this just returns the raw connection
+    name — callers should prefer _profile_ssid() when a profile name is
+    available, since that reads the actual SSID instead of guessing.
+    """
+    return name[len(SAVED_PREFIX):].replace("_", " ") if name.startswith(SAVED_PREFIX) else name
+
+
+async def _profile_ssid(name: str) -> str:
+    """The real SSID of a connection profile, read from NetworkManager.
+
+    Falls back to _display_ssid() if the property is empty (e.g. profile
+    vanished between listing and lookup) — not for regular wifi profiles,
+    which always have this set.
+    """
+    _, out, _ = await _cmd(f'nmcli -t -f 802-11-wireless.ssid con show "{name}"')
+    ssid = out.split(":", 1)[-1].strip() if ":" in out else ""
+    return ssid or _display_ssid(name)
+
+
 async def _current_wifi() -> tuple:
     _, out, _ = await _cmd("nmcli -t -f NAME,TYPE,STATE con show --active")
     for line in out.splitlines():
@@ -999,18 +1139,29 @@ async def _current_wifi() -> tuple:
         name, ctype, state = parts[0], parts[1], parts[2]
         if ctype in ("wifi", "802-11-wireless") and state == "activated" \
                 and name != AP_CONNECTION_NAME:
-            display = (name[len(SAVED_PREFIX):].replace("_", " ")
-                       if name.startswith(SAVED_PREFIX) else name)
-            return name, display
+            return name, await _profile_ssid(name)
     return "", ""
 
 
 async def _list_saved_profiles() -> list:
-    _, out, _ = await _cmd("nmcli -t -f NAME con show")
-    names = [
-        line.strip() for line in out.splitlines()
-        if line.strip().startswith(SAVED_PREFIX) and line.strip() != TEMP_PROFILE
-    ]
+    """All known WiFi client profiles — not just ones the wizard added.
+
+    This includes networks configured outside the wizard (netplan, nmtui,
+    imaging-time setup) so the management page shows the full picture of
+    what the device can connect to, not only what it added itself.
+    """
+    _, out, _ = await _cmd("nmcli -t -f NAME,TYPE con show")
+    names = []
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) < 2:
+            continue
+        name, ctype = parts[0], parts[1]
+        if ctype not in ("wifi", "802-11-wireless"):
+            continue
+        if name in (AP_CONNECTION_NAME, TEMP_PROFILE):
+            continue
+        names.append(name)
     profiles = []
     for name in names:
         _, pout, _ = await _cmd(
@@ -1019,7 +1170,11 @@ async def _list_saved_profiles() -> list:
             priority = int(pout.split(":")[-1].strip())
         except (ValueError, IndexError):
             priority = 0
-        profiles.append({"name": name, "priority": priority})
+        profiles.append({
+            "name":     name,
+            "priority": priority,
+            "ssid":     await _profile_ssid(name),
+        })
     profiles.sort(key=lambda x: -x["priority"])
     return profiles
 
@@ -1031,7 +1186,7 @@ def _saved_networks_html(profiles: list, current_profile: str) -> str:
     for p in profiles:
         profile   = p["name"]
         priority  = p["priority"]
-        ssid      = profile[len(SAVED_PREFIX):].replace("_", " ")
+        ssid      = p["ssid"]
         is_active_js = "true" if profile == current_profile else "false"
         active_tag   = '<span class="net-active">● active</span>' if profile == current_profile else ""
         rows.append(
@@ -1071,10 +1226,17 @@ async def _scan_networks() -> list:
     return sorted(seen.values(), key=lambda x: -x["signal"])
 
 
-async def _setup_client_profile(ssid: str, password: str) -> tuple:
+async def _setup_client_profile(ssid: str, password: str, delete_committed: bool = True) -> tuple:
+    """Create a temp connection profile for `ssid`.
+
+    delete_committed=False leaves any existing saved profile for this SSID
+    in place (used by run_management_connect, which needs a working fallback
+    to restore if the new connection doesn't pan out — see that function).
+    """
     committed = _profile_name(ssid)
     await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
-    await _cmd(f'nmcli con delete "{committed}" 2>/dev/null; true')
+    if delete_committed:
+        await _cmd(f'nmcli con delete "{committed}" 2>/dev/null; true')
     if password:
         rc, _, err = await _cmd(
             f'nmcli con add type wifi ifname {AP_INTERFACE} '
@@ -1509,6 +1671,62 @@ async def run_management_update(sess_tok: str) -> None:
     asyncio.create_task(_delayed_management_shutdown())
 
 
+async def run_management_connect(ssid: str, password: str) -> None:
+    """Add + connect a new WiFi network from management mode.
+
+    The device is already on WiFi when this runs, so unlike run_step1/run_step2
+    there is no AP to fall back to on failure — instead we try to bring the
+    previously-active saved profile back up. netwatch.sh is the final safety
+    net: if the device ends up with no working uplink at all, it reverts to
+    the setup hotspot on its own after its grace period.
+    """
+    global _connection_in_progress
+    prev_profile, _ = await _current_wifi()
+
+    _set("connecting", f'Adding profile for "{ssid}"…')
+    # delete_committed=False: if ssid is the network we're already on (e.g. a
+    # resubmitted form, or refreshing a saved password), don't delete its
+    # profile until the replacement is confirmed working — otherwise the
+    # fallback-to-prev_profile below would have nothing left to restore.
+    ok, msg = await _setup_client_profile(ssid, password, delete_committed=False)
+    if not ok:
+        _set("error", msg)
+        _connection_in_progress = False
+        return
+
+    _set("connecting", f'Connecting to "{ssid}"…')
+    rc, _, err = await _cmd(f'nmcli con up "{TEMP_PROFILE}"')
+    if rc != 0:
+        detail = err or "Check SSID and password."
+        _set("error", f'Could not connect to "{ssid}": {detail}')
+        await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
+        if prev_profile:
+            await _cmd(f'nmcli con up "{prev_profile}" 2>/dev/null; true')
+        _connection_in_progress = False
+        return
+
+    _set("wifi_up", f'Joined "{ssid}". Waiting for IP address…')
+    if not await _wait_for_ip(timeout=30):
+        _set("error", f'Joined "{ssid}" but did not receive an IP within 30 s.')
+        await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
+        if prev_profile:
+            await _cmd(f'nmcli con up "{prev_profile}" 2>/dev/null; true')
+        _connection_in_progress = False
+        return
+
+    # New connection is confirmed working — now it's safe to drop any old
+    # profile of the same name and commit the temp one permanently in its place.
+    committed = _profile_name(ssid)
+    await _cmd(f'nmcli con delete "{committed}" 2>/dev/null; true')
+    await _cmd(f'nmcli con modify "{TEMP_PROFILE}" connection.id "{committed}"')
+    all_profiles = await _list_saved_profiles()
+    other_max = max((p["priority"] for p in all_profiles if p["name"] != committed), default=0)
+    await _cmd(f'nmcli con modify "{committed}" connection.autoconnect-priority {other_max + 1}')
+
+    _connection_in_progress = False
+    _set("success", f'Connected to "{ssid}" and saved.')
+
+
 async def _delayed_shutdown() -> None:
     """After successful setup registration: tear down AP, start ingest, stop wizard."""
     await asyncio.sleep(6)
@@ -1797,6 +2015,35 @@ async def management_update(request):
     return _json_response({"ok": True})
 
 
+@app.route("/management/connect", methods=["POST"])
+async def management_connect(request):
+    global _connection_in_progress
+    sess_tok, sess = _resolve_session(request)
+    if not sess or sess.get("mode") != "management" or sess.get("step", 0) < 1:
+        return Response("", status_code=302, headers={"Location": "/"})
+
+    f        = request.form or {}
+    ssid     = (f.get("ssid")     or "").strip()
+    password = (f.get("password") or "").strip()
+
+    back = Response("", status_code=302, headers={"Location": f"/management?s={sess_tok}"})
+    if not ssid or _connection_in_progress:
+        return back
+
+    _connection_in_progress = True
+    _set("connecting", "Starting connection…")
+    asyncio.create_task(run_management_connect(ssid, password))
+
+    quote, author = _RAINE_QUOTE
+    return _html_response(_render(CONNECTING_HTML, raw={
+        "retry_url":    f"/management?s={sess_tok}",
+        "step":         "'mgmt'",
+        "wizard_emoji": _wizard_emoji("n"),
+        "quote":        quote,
+        "quote_author": author,
+    }))
+
+
 @app.route("/wifi/scan", methods=["POST"])
 async def wifi_scan(request):
     # Allow scan from Step 1 form (no session yet) when the AP is active.
@@ -1816,7 +2063,8 @@ async def wifi_forget(request):
         return _json_response({"error": "Not authorized."}, 403)
     data    = request.json or {}
     profile = data.get("profile", "").strip()
-    if not profile.startswith(SAVED_PREFIX) or profile == TEMP_PROFILE:
+    known   = {p["name"] for p in await _list_saved_profiles()}
+    if not profile or profile not in known:
         return _json_response({"error": "Invalid profile name."}, 400)
     await _cmd(f'nmcli con delete "{profile}" 2>/dev/null; true')
     return _json_response({"ok": True})
@@ -1847,11 +2095,11 @@ async def wifi_prioritize(request):
     _, sess = _resolve_session(request)
     if not sess:
         return _json_response({"error": "Not authorized."}, 403)
-    data    = request.json or {}
-    profile = data.get("profile", "").strip()
-    if not profile.startswith(SAVED_PREFIX) or profile == TEMP_PROFILE:
-        return _json_response({"error": "Invalid profile."}, 400)
+    data      = request.json or {}
+    profile   = data.get("profile", "").strip()
     profiles  = await _list_saved_profiles()
+    if not profile or profile not in {p["name"] for p in profiles}:
+        return _json_response({"error": "Invalid profile."}, 400)
     other_max = max((p["priority"] for p in profiles if p["name"] != profile), default=0)
     new_priority = other_max + 1
     await _cmd(f'nmcli con modify "{profile}" connection.autoconnect-priority {new_priority}')
