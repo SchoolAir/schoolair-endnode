@@ -186,6 +186,12 @@ fi
 chown -R "${ADMIN_USER}:${ADMIN_USER}" "$SCHOOLAIR_DIR"
 rm -rf "$REPO_DIR"
 
+# Don't rely on git-tracked file modes surviving — explicitly re-assert the
+# executable bit on scripts systemd invokes directly. netwatch.sh was once
+# committed non-executable and every OTA silently reproduced the crash-loop
+# until this was added.
+chmod +x "${WIZARD_DIR}/launcher.sh" "${WIZARD_DIR}/netwatch.sh" 2>/dev/null || true
+
 # ── 4. Python dependencies ─────────────────────────────────────────────────────
 step "4 / Python dependencies"
 pip3 install --quiet --break-system-packages --root-user-action=ignore \
@@ -474,6 +480,7 @@ chk "swap disabled"                       bash -c "! systemctl is-enabled dphys-
 chk "microdot importable"                  python3 -c "import microdot"
 chk "httpx importable"                     python3 -c "import httpx"
 chk "launcher.sh executable"              test -x "${WIZARD_DIR}/launcher.sh"
+chk "netwatch.sh executable"              test -x "${WIZARD_DIR}/netwatch.sh"
 chk "main.py present"                      test -f "${SCHOOLAIR_DIR}/main.py"
 chk "first_boot.sh executable"            test -x "${ADMIN_HOME}/first_boot.sh"
 chk "schoolair command available"         test -L /usr/local/bin/schoolair

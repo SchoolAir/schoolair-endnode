@@ -1,8 +1,7 @@
 [Unit]
 Description=SchoolAir sensor ingest
 After=network-online.target sen6x.service
-Wants=network-online.target
-Requires=sen6x.service
+Wants=network-online.target sen6x.service
 
 [Service]
 Type=simple
