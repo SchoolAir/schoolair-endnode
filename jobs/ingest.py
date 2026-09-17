@@ -49,7 +49,7 @@ def _set_led_state(state: str) -> None:
         pass
 
 
-PENDING_UPDATE_FILE = "/var/lib/schoolair-update-pending.json"
+PENDING_UPDATE_FILE = "/var/lib/schoolair/update-pending.json"
 
 
 def _confirm_update_if_pending() -> None:

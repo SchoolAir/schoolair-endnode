@@ -587,12 +587,19 @@ if [[ "$MODE" == "--update" ]]; then
     # file itself the moment an upload actually succeeds.
     _NEW_VERSION="$(grep -m1 '^VERSION' "${SCHOOLAIR_DIR}/jobs/ingest.py" | sed -nE 's/.*"([^"]+)".*/\1/p')"
     if [ -n "$_PRE_UPDATE_VERSION" ] && [ "$_NEW_VERSION" != "$_PRE_UPDATE_VERSION" ]; then
-        mkdir -p /var/lib
+        # jobs/ingest.py (runs as ${ADMIN_USER}) needs to delete this file the
+        # moment a real upload confirms the update — deletion permission comes
+        # from the *directory*, not the file's own owner, so plain /var/lib
+        # (root-only-writable) would silently never let that happen. Own the
+        # directory as ${ADMIN_USER} so either side can freely create/remove
+        # files in it regardless of which one wrote it.
+        mkdir -p /var/lib/schoolair
+        chown "${ADMIN_USER}:${ADMIN_USER}" /var/lib/schoolair
         python3 -c "
 import json, time
 json.dump(
     {'from_version': '${_PRE_UPDATE_VERSION}', 'to_version': '${_NEW_VERSION}', 'deadline': time.time() + 2400},
-    open('/var/lib/schoolair-update-pending.json', 'w'),
+    open('/var/lib/schoolair/update-pending.json', 'w'),
 )
 "
         ok "Rollback watchdog armed — v${_PRE_UPDATE_VERSION} → v${_NEW_VERSION} must be confirmed by a successful upload within 40 min or it auto-reverts"
