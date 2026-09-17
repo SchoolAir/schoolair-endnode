@@ -78,6 +78,13 @@ def main() -> None:
 
     pi.set_PWM_frequency(GPIO_LED, PWM_FREQ_HZ)
     real_range = pi.get_PWM_real_range(GPIO_LED)
+    # set_PWM_dutycycle() validates against the *nominal* range from
+    # set_PWM_range() (default 255) — completely separate from real_range,
+    # which is just the DMA-tick count at the current frequency. Without
+    # this, every dutycycle value we compute against real_range gets
+    # rejected as out-of-range on any device that hasn't had this GPIO's
+    # nominal range touched before (i.e. every fresh device).
+    pi.set_PWM_range(GPIO_LED, real_range)
     peak = round(real_range * PEAK_FRAC)
     print(f"[led] pigpiod ready — GPIO{GPIO_LED}, real_range={real_range}, peak_duty={peak}")
 
