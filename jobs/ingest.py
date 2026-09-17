@@ -48,7 +48,25 @@ def _set_led_state(state: str) -> None:
     except OSError:
         pass
 
-VERSION = "2.3.2"
+
+PENDING_UPDATE_FILE = "/var/lib/schoolair-update-pending.json"
+
+
+def _confirm_update_if_pending() -> None:
+    """A successful upload is proof the just-applied OTA update actually
+    works end-to-end — clear schoolair-update-watchdog.timer's pending
+    marker so it doesn't auto-revert this version after its deadline. See
+    schoolair_setup.sh (writes the marker) and schoolair_rollback.sh (the
+    watchdog that reads it)."""
+    try:
+        os.remove(PENDING_UPDATE_FILE)
+        print("[OTA] Update confirmed working — rollback watchdog disarmed")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"[OTA] Warning: could not clear pending-update marker: {e}")
+
+VERSION = "2.3.3"
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
@@ -1025,6 +1043,7 @@ async def _upload_loop() -> None:
         await _handle_response(response)
         print(f"[upload] live reading sent (backlog: {backlog_count})")
         _set_led_state("ok")
+        _confirm_update_if_pending()
 
         if backlog_count > 0 and _credit_bytes > 0:
             await _drain_backlog()
