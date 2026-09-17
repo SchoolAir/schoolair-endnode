@@ -1,0 +1,20 @@
+[Unit]
+Description=SchoolAir: status LED (breathing/blink patterns via pigpiod)
+# Indoor units only — same GPIO/pigpiod infrastructure as the flower
+# actuator. pigpiod itself is installed by schoolair-pigpio-setup.service,
+# which needs network and can run well after this unit first starts —
+# Restart=on-failure just keeps retrying until pigpiod actually exists.
+ConditionPathExists=/etc/schoolair-unit-type
+After=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/admin/schoolair/led_status.py
+Restart=on-failure
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

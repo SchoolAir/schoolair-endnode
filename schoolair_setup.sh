@@ -422,7 +422,7 @@ ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update wit
 step "15 / systemd services"
 DEPLOY_DIR="${SCHOOLAIR_DIR}/deploy"
 
-for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-pigpio-setup.service; do
+for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-pigpio-setup.service schoolair-led.service; do
     if [ -f "${DEPLOY_DIR}/${svc}" ]; then
         cp "${DEPLOY_DIR}/${svc}" /etc/systemd/system/
         ok "${svc} installed"
@@ -442,6 +442,7 @@ systemctl enable schoolair.service
 systemctl enable sen6x.service
 systemctl enable schoolair-first-boot.service 2>/dev/null || true
 systemctl enable schoolair-pigpio-setup.service 2>/dev/null || true
+systemctl enable schoolair-led.service 2>/dev/null || true
 ok "Services enabled"
 
 if [[ "$MODE" == "--update" ]]; then
