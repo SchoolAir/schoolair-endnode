@@ -25,6 +25,9 @@ GPIO_LED = 24
 LED_STATE_FILE = "/run/schoolair-led-state"
 PWM_FREQ_HZ = 100      # well above flicker-fusion; low enough for a wide duty-cycle range
 PEAK_FRAC = 0.3        # cap max brightness at 0.3 — comfortable to look at continuously
+BLINK_FACTOR = 0.5     # blink states (ap/error) read as far more intense than a fade
+                        # reaching the same peak — hard on/off vs. a gamma-eased ramp —
+                        # so they get their own, dimmer peak: PEAK_FRAC * BLINK_FACTOR = 0.15
 GAMMA = 2.8            # perceptual correction so dimming looks linear to the eye
 TICK = 0.02            # render granularity
 
@@ -86,7 +89,9 @@ def main() -> None:
     # nominal range touched before (i.e. every fresh device).
     pi.set_PWM_range(GPIO_LED, real_range)
     peak = round(real_range * PEAK_FRAC)
-    print(f"[led] pigpiod ready — GPIO{GPIO_LED}, real_range={real_range}, peak_duty={peak}")
+    blink_peak = round(peak * BLINK_FACTOR)
+    print(f"[led] pigpiod ready — GPIO{GPIO_LED}, real_range={real_range}, "
+          f"peak_duty={peak}, blink_peak_duty={blink_peak}")
 
     last_state = None
     t0 = time.monotonic()
@@ -118,13 +123,13 @@ def main() -> None:
                 # then off until the next pair starts 2s later (2.35s cycle)
                 cycle = elapsed % 2.35
                 on = (0.0 <= cycle < 0.10) or (0.25 <= cycle < 0.35)
-                pi.set_PWM_dutycycle(GPIO_LED, peak if on else 0)
+                pi.set_PWM_dutycycle(GPIO_LED, blink_peak if on else 0)
 
             elif state == "error":
                 # single blink every 1s: on 100ms, off 900ms
                 cycle = elapsed % 1.0
                 on = cycle < 0.10
-                pi.set_PWM_dutycycle(GPIO_LED, peak if on else 0)
+                pi.set_PWM_dutycycle(GPIO_LED, blink_peak if on else 0)
 
             elif state == "no_sensor":
                 pi.set_PWM_dutycycle(GPIO_LED, peak)
