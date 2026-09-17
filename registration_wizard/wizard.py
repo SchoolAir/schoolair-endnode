@@ -2,8 +2,15 @@
 """SchoolAir Gatekeeper Registration Wizard — two-step setup flow.
 
 AP mode  (unregistered / fresh device):
-  Step 1 – WiFi credentials + registration token  → validate token with server.
-  Step 2 – Site name, asset name, environment     → full registration.
+  Step 1 – WiFi credentials (SSID + password)         → pure data entry,
+           no network activity, always available while on the AP.
+  Step 2 – Token, site name, asset name, environment  → submitting this is
+           the ONLY point that touches the network: connect to the given
+           WiFi, validate the token, then register. Any failure at any of
+           those three stages erases the WiFi credentials, reverts to AP,
+           and leaves a specific explanation of what went wrong on Step 1's
+           landing page — there is only ever one AP drop per attempt, not
+           two, since nothing is tested until both forms are filled in.
 
 WiFi mode (registered device, local-network access):
   Management – Token-first authentication         → update device identity.
@@ -55,11 +62,15 @@ app = Microdot()
 
 # Dict of active sessions: session_token → session data.
 # mode:  "setup" (AP flow) | "management" (WiFi-mode flow)
-# step:  0 = created/in-progress, 1 = WiFi+token validated, 2 = registered
+# step:  0 = created, 1 = SSID/password entered (unlocks Step 2's form) —
+#        nothing is tested over the network until Step 2 is submitted.
 wifi_sessions: dict = {}
 
-# Single status dict broadcast to all WebSocket clients.
-# "redirect" is populated on step1_success so the browser knows where to go.
+# Single status dict broadcast to all WebSocket clients. Also read directly
+# by index() to show a persistent "why did the last attempt fail" banner on
+# Step 1's landing page — the client device dropping the AP mid-attempt
+# means it may miss the live WebSocket update, so the explanation needs to
+# still be there whenever it reconnects, not just flash by once.
 reg_state: dict = {"state": "idle", "message": "", "redirect": ""}
 
 _last_activity: float = time.time()
@@ -296,14 +307,11 @@ input:focus{border-color:#1a56db}
 <div class="card">
   <div class="logo">
     <h1>[[wizard_emoji]] SchoolAir Setup</h1>
-    <p>Step 1 of 2 — Network &amp; Authorization</p>
+    <p>Step 1 of 2 — Wi-Fi Network</p>
   </div>
   <div class="notice-quote"><em>"[[quote]]"</em><span class="quote-author">— [[quote_author]]</span></div>
+  [[last_error_banner]]
   <div id="notice" class="notice notice-err" style="display:none"></div>
-
-  <div class="sect">Registration Token</div>
-  <input type="text" id="token" placeholder="8-character code, e.g. aB3xQr7Z"
-         autocomplete="on" value="[[prefill_token]]">
 
   <div class="sect">Wi-Fi Network</div>
   <button type="button" id="scan-btn" class="btn-scan" onclick="doScan()">🔍 Scan for Networks</button>
@@ -317,10 +325,9 @@ input:focus{border-color:#1a56db}
     <button type="button" onclick="tpw()">Show</button>
   </div>
 
-  <button type="button" class="btn btn-blue" onclick="doConnect()">Connect &amp; Verify →</button>
+  <button type="button" class="btn btn-blue" onclick="doContinue()">Continue →</button>
 
   <form id="sf" method="POST" action="/step1/connect" style="display:none">
-    <input type="hidden" name="token"    id="f-token">
     <input type="hidden" name="ssid"     id="f-ssid">
     <input type="hidden" name="password" id="f-password">
   </form>
@@ -365,12 +372,9 @@ async function doScan(){
   }catch{showErr('Scan failed — try again.');}
   btn.disabled=false;btn.textContent='🔍 Scan for Networks';
 }
-function doConnect(){
-  const token=document.getElementById('token').value.trim();
+function doContinue(){
   const ssid=document.getElementById('ssid').value.trim();
-  if(!token){showErr('Registration token is required.');return;}
   if(!ssid){showErr('Network name (SSID) is required.');return;}
-  document.getElementById('f-token').value=token;
   document.getElementById('f-ssid').value=ssid;
   document.getElementById('f-password').value=document.getElementById('password').value;
   document.getElementById('sf').submit();
@@ -456,6 +460,10 @@ input:disabled{background:#f3f4f6;color:#374151;cursor:default}
   <div class="notice-quote"><em>"[[quote]]"</em><span class="quote-author">— [[quote_author]]</span></div>
   <div id="notice" class="notice notice-err" style="display:none"></div>
 
+  <div class="sect">Registration Token</div>
+  <label for="token">Token</label>
+  <input type="text" id="token" placeholder="8-character code, e.g. aB3xQr7Z" autocomplete="on" oninput="update()">
+
   <div class="sect">Location</div>
   <label for="site">Site Name</label>
   <div class="field-row">
@@ -491,6 +499,7 @@ input:disabled{background:#f3f4f6;color:#374151;cursor:default}
 
   <form id="sf" method="POST" action="/step2/register" style="display:none">
     <input type="hidden" name="session"     value="[[session_token]]">
+    <input type="hidden" name="token"       id="f-token">
     <input type="hidden" name="site"        id="f-site">
     <input type="hidden" name="asset_name"  id="f-asset">
     <input type="hidden" name="environment" id="f-env">
@@ -529,19 +538,23 @@ function toggleLock(field){
   update();
 }
 function update(){
+  const token=document.getElementById('token').value.trim();
   const site=document.getElementById('site').value.trim();
   const asset=document.getElementById('asset').value.trim();
-  document.getElementById('reg-btn').disabled=!(site&&asset);
+  document.getElementById('reg-btn').disabled=!(token&&site&&asset);
 }
 function showErr(msg){
   const el=document.getElementById('notice');el.textContent=msg;el.style.display='';
 }
 function doRegister(){
+  const token=document.getElementById('token').value.trim();
   const site=document.getElementById('site').value.trim();
   const asset=document.getElementById('asset').value.trim();
+  if(!token){showErr('Registration token is required.');return;}
   if(!site||!asset){showErr('Site and Asset are required.');return;}
   const env=document.querySelector('input[name="environment"]:checked')?.value||'indoor';
   const migrate=document.getElementById('migrate').checked;
+  document.getElementById('f-token').value=token;
   document.getElementById('f-site').value=site;
   document.getElementById('f-asset').value=asset;
   document.getElementById('f-env').value=env;
@@ -599,7 +612,6 @@ h1{font-size:1.4rem;color:#1a56db;margin-bottom:.5rem}
 </div>
 <script>
 const STEP=[[step]];
-const AP_DROP_1="Testing your Wi-Fi — the setup hotspot briefly dropped. This is normal.";
 const AP_DROP_2="The setup hotspot dropped — the device is connecting to the school Wi-Fi. "+
   "If successful, registration is complete. If the hotspot reappears within 60 seconds, "+
   "tap Try Again.";
@@ -619,10 +631,7 @@ function connect(){
     const d=JSON.parse(e.data);
     if(d.state==='ping')return;
     msg(d.message);
-    if(d.state==='step1_success'){
-      icon('✅');hint('Token verified! Opening the device details form…');
-      showQuote();setTimeout(()=>{window.location.href=d.redirect;},2000);
-    } else if(d.state==='success'){
+    if(d.state==='success'){
       icon('✅');
       if(STEP==='mgmt'){
         hint('Connected and saved.');
@@ -640,7 +649,7 @@ function connect(){
     clearTimeout(reconnTimer);
     if(!dropped){
       dropped=true;icon('📶');
-      msg(STEP===1?AP_DROP_1:(STEP==='mgmt'?MGMT_DROP:AP_DROP_2));
+      msg(STEP==='mgmt'?MGMT_DROP:AP_DROP_2);
       hint(STEP==='mgmt'?'':'On Pi Zero hardware the hotspot may drop during connection — this is normal.');
     }
     reconnTimer=setTimeout(connect,3000);
@@ -1438,66 +1447,17 @@ async def _ap_is_active() -> bool:
 
 # ── Registration background tasks ─────────────────────────────────────────────
 
-async def run_step1(sess_tok: str) -> None:
-    """Connect to WiFi and validate the registration token. Always reverts to AP."""
-    global _connection_in_progress
-    sess = wifi_sessions.get(sess_tok)
-    if not sess:
-        _set("error", "Session expired.")
-        _connection_in_progress = False
-        return
+async def run_registration(sess_tok: str) -> None:
+    """Connect to WiFi, validate the token, then register — one shot.
 
-    ssid     = sess["ssid"]
-    password = sess["password"]
-    token    = sess["token"]
-
-    _set("connecting", f'Adding profile for "{ssid}"…')
-    ok, msg = await _setup_client_profile(ssid, password)
-    if not ok:
-        _set("error", msg)
-        wifi_sessions.pop(sess_tok, None)
-        _connection_in_progress = False
-        await _revert_to_ap()
-        return
-
-    _set("connecting", f'Connecting to "{ssid}"…')
-    rc, _, err = await _cmd(f'nmcli con up "{TEMP_PROFILE}"')
-    if rc != 0:
-        detail = err or "Check SSID and password."
-        _set("error", f'Could not connect to "{ssid}": {detail}')
-        wifi_sessions.pop(sess_tok, None)
-        _connection_in_progress = False
-        await _revert_to_ap()
-        return
-
-    _set("wifi_up", f'Joined "{ssid}". Waiting for IP address…')
-    if not await _wait_for_ip(timeout=30):
-        _set("error", f'Joined "{ssid}" but did not receive an IP within 30 s.')
-        wifi_sessions.pop(sess_tok, None)
-        _connection_in_progress = False
-        await _revert_to_ap()
-        return
-
-    _set("validating", "Validating registration token…")
-    valid, vmsg = await _validate_token(token)
-
-    # Always revert to AP after step 1, regardless of result.
-    await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
-    await _revert_to_ap()
-    _connection_in_progress = False
-
-    if valid:
-        sess["step"] = 1
-        _set("step1_success",
-             f'"{ssid}" and token verified. Opening device details form…',
-             redirect=f"/step2?s={sess_tok}")
-    else:
-        wifi_sessions.pop(sess_tok, None)
-        _set("error", _friendly_error(vmsg))
-
-
-async def run_step2(sess_tok: str) -> None:
-    """Reconnect to WiFi and complete full registration. Commits WiFi on success."""
+    Unlike the old run_step1/run_step2 split, nothing is tested until both
+    forms (SSID+password, then token+site+asset+environment) are already
+    filled in — so there's exactly one AP drop per attempt instead of two,
+    and on any failure the specific stage that failed gets a distinct,
+    persistent explanation on Step 1's landing page (see index()) rather
+    than a generic error the client device might not even be connected
+    long enough to see live.
+    """
     global _connection_in_progress
     sess = wifi_sessions.get(sess_tok)
     if not sess:
@@ -1513,10 +1473,10 @@ async def run_step2(sess_tok: str) -> None:
     environment = sess["environment"]
     migrate     = sess["migrate"]
 
-    _set("connecting", f'Reconnecting to "{ssid}"…')
+    _set("connecting", f'Connecting to "{ssid}"…')
     ok, msg = await _setup_client_profile(ssid, password)
     if not ok:
-        _set("error", msg)
+        _set("error", f'Could not set up "{ssid}": {msg}')
         wifi_sessions.pop(sess_tok, None)
         _connection_in_progress = False
         await _revert_to_ap()
@@ -1524,16 +1484,30 @@ async def run_step2(sess_tok: str) -> None:
 
     rc, _, err = await _cmd(f'nmcli con up "{TEMP_PROFILE}"')
     if rc != 0:
-        detail = err or "Check SSID and password."
-        _set("error", f'Could not reconnect to "{ssid}": {detail}')
+        detail = err or "check the network name and password."
+        _set("error", f'Could not connect to "{ssid}": {detail}')
+        await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
         wifi_sessions.pop(sess_tok, None)
         _connection_in_progress = False
         await _revert_to_ap()
         return
 
-    _set("wifi_up", f'Joined "{ssid}". Waiting for IP…')
+    _set("wifi_up", f'Joined "{ssid}". Waiting for IP address…')
     if not await _wait_for_ip(timeout=30):
-        _set("error", f'Got IP timeout on "{ssid}".')
+        _set("error", f'Joined "{ssid}" but never received an IP address — '
+                       "the network may have no DHCP, or the device is out of range.")
+        await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
+        wifi_sessions.pop(sess_tok, None)
+        _connection_in_progress = False
+        await _revert_to_ap()
+        return
+
+    _set("validating", "Validating registration token…")
+    valid, vmsg = await _validate_token(token)
+    if not valid:
+        _set("error", f"Wi-Fi connected, but the registration token was rejected: "
+                       f"{_friendly_error(vmsg)}")
+        await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
         wifi_sessions.pop(sess_tok, None)
         _connection_in_progress = False
         await _revert_to_ap()
@@ -1561,11 +1535,12 @@ async def run_step2(sess_tok: str) -> None:
         success, hb_msg, device_auth_token = await _post_heartbeat(payload)
 
     if not success:
+        _set("error", f"Wi-Fi and token were both fine, but device registration failed: "
+                       f"{_friendly_error(hb_msg)}")
+        write_error(hb_msg)
         await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
         wifi_sessions.pop(sess_tok, None)
         _connection_in_progress = False
-        _set("error", f"Connected, but registration failed: {_friendly_error(hb_msg)}")
-        write_error(hb_msg)
         await _revert_to_ap()
         return
 
@@ -1674,7 +1649,7 @@ async def run_management_update(sess_tok: str) -> None:
 async def run_management_connect(ssid: str, password: str) -> None:
     """Add + connect a new WiFi network from management mode.
 
-    The device is already on WiFi when this runs, so unlike run_step1/run_step2
+    The device is already on WiFi when this runs, so unlike run_registration
     there is no AP to fall back to on failure — instead we try to bring the
     previously-active saved profile back up. netwatch.sh is the final safety
     net: if the device ends up with no working uplink at all, it reverts to
@@ -1802,14 +1777,24 @@ async def index(request):
     quote, author = _GANDALF_QUOTE
 
     if await _ap_is_active():
-        # Setup mode: show Step 1 form.
+        # Setup mode: show Step 1 form. If the last attempt failed, surface
+        # why — the client device dropped the AP mid-attempt to reach this
+        # page again, so a live WebSocket message alone isn't reliable;
+        # this banner is what's actually there when it reconnects.
         prefill = read_staging()
+        last_error_banner = ""
+        if reg_state.get("state") == "error" and reg_state.get("message"):
+            last_error_banner = (
+                '<div class="notice notice-err">'
+                '<strong>Last attempt failed:</strong> '
+                f'{_html.escape(reg_state["message"])}</div>'
+            )
         body = _render(STEP1_HTML, raw={
-            "wizard_emoji":   _wizard_emoji("m"),
-            "quote":          quote,
-            "quote_author":   author,
-            "prefill_token":  "",
-            "prefill_ssid":   prefill.get("ssid", ""),
+            "wizard_emoji":       _wizard_emoji("m"),
+            "quote":              quote,
+            "quote_author":       author,
+            "prefill_ssid":       prefill.get("ssid", ""),
+            "last_error_banner":  last_error_banner,
         })
         return _html_response(body)
 
@@ -1836,49 +1821,32 @@ async def index(request):
 
 @app.route("/step1/connect", methods=["POST"])
 async def step1_connect(request):
-    global _connection_in_progress
+    # Pure data entry — no network activity here at all. The actual connect
+    # attempt only happens once Step 2 is submitted too (see step2_register
+    # / run_registration), so nothing is tested — and the AP can't drop —
+    # until both forms are filled in.
     f        = request.form or {}
-    token    = (f.get("token")    or "").strip()
     ssid     = (f.get("ssid")     or "").strip()
     password = (f.get("password") or "").strip()
 
-    quote, author = _GANDALF_QUOTE
-
-    def _err_page(msg: str) -> Response:
+    if not ssid:
+        quote, author = _GANDALF_QUOTE
         body = _render(STEP1_HTML, raw={
-            "wizard_emoji":   _wizard_emoji("m"),
-            "quote":          quote,
-            "quote_author":   author,
-            "prefill_token":  _html.escape(token),
-            "prefill_ssid":   _html.escape(ssid),
+            "wizard_emoji":      _wizard_emoji("m"),
+            "quote":             quote,
+            "quote_author":      author,
+            "prefill_ssid":      "",
+            "last_error_banner": "",
         })
-        # Inject the error notice inline via a minimal JS snippet
         inject = (f'<script>document.addEventListener("DOMContentLoaded",()=>'
                   f'{{const n=document.getElementById("notice");'
-                  f'n.textContent={json.dumps(msg)};n.style.display="";}})'
-                  f'</script></body>')
+                  f'n.textContent={json.dumps("Network name (SSID) is required.")};'
+                  f'n.style.display="";}})</script></body>')
         return _html_response(body.replace("</body>", inject))
 
-    if not token:
-        return _err_page("Registration token is required.")
-    if not ssid:
-        return _err_page("Network name (SSID) is required.")
-    if _connection_in_progress:
-        return _err_page("A connection attempt is already in progress. Please wait.")
-
-    sess_tok = _new_session("setup", token=token, ssid=ssid, password=password)
-    _connection_in_progress = True
-    _set("connecting", "Starting connection…")
-    asyncio.create_task(run_step1(sess_tok))
-
-    quote2, author2 = _RAINE_QUOTE
-    return _html_response(_render(CONNECTING_HTML, raw={
-        "retry_url":    "/",
-        "step":         "1",
-        "wizard_emoji": _wizard_emoji("n"),
-        "quote":        quote2,
-        "quote_author": author2,
-    }))
+    sess_tok = _new_session("setup", ssid=ssid, password=password)
+    wifi_sessions[sess_tok]["step"] = 1  # unlocks Step 2 — nothing tested yet
+    return Response("", status_code=302, headers={"Location": f"/step2?s={sess_tok}"})
 
 
 @app.route("/step2", methods=["GET"])
@@ -1920,18 +1888,20 @@ async def step2_register(request):
         return Response("", status_code=302, headers={"Location": "/"})
 
     f           = request.form or {}
+    token       = (f.get("token")       or "").strip()
     site        = (f.get("site")        or "").strip()
     asset       = (f.get("asset_name")  or "").strip()
     environment = (f.get("environment") or "indoor").strip()
     migrate     = bool(f.get("migrate"))
 
-    if not site or not asset:
+    if not token or not site or not asset:
         return Response("", status_code=302,
                         headers={"Location": f"/step2?s={sess_tok}"})
     if _connection_in_progress:
         return Response("", status_code=302,
                         headers={"Location": f"/step2?s={sess_tok}"})
 
+    sess["token"]       = token
     sess["site"]        = site
     sess["asset"]       = asset
     sess["environment"] = environment
@@ -1939,12 +1909,15 @@ async def step2_register(request):
 
     _connection_in_progress = True
     write_staging({"ssid": sess["ssid"], "environment": environment})
-    _set("connecting", "Preparing to register…")
-    asyncio.create_task(run_step2(sess_tok))
+    _set("connecting", "Preparing to connect…")
+    asyncio.create_task(run_registration(sess_tok))
 
     quote, author = _RAINE_QUOTE
+    # retry_url goes to "/", not back to step2: on any failure the session
+    # is discarded and the AP has already reverted, so "/" is where the
+    # explanation banner (and a working Step 1 form) actually is.
     return _html_response(_render(CONNECTING_HTML, raw={
-        "retry_url":    f"/step2?s={sess_tok}",
+        "retry_url":    "/",
         "step":         "2",
         "wizard_emoji": _wizard_emoji("n"),
         "quote":        quote,
@@ -2115,7 +2088,7 @@ async def ws_status(request, ws):
         if current != last:
             await ws.send(json.dumps(current))
             last = dict(current)
-            if current["state"] in ("success", "error", "step1_success"):
+            if current["state"] in ("success", "error"):
                 await asyncio.sleep(1)
                 break
         await asyncio.sleep(0.4)
