@@ -37,6 +37,8 @@ PWM_FREQ_HZ = 100      # well above flicker-fusion; low enough for a wide duty-c
 PEAK_FRAC = 0.1        # single global brightness cap for every state
 GAMMA = 2.8            # perceptual correction so dimming looks linear to the eye
 TICK = 0.02            # render granularity
+OK_PERIOD_S = 8.0        # breathe: 4s up, 4s down
+THINKING_PERIOD_S = 1.2  # pulse: 0.6s up, 0.6s down
 
 _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 
@@ -88,6 +90,50 @@ def _ease(elapsed: float, period: float) -> float:
 def _curve(frac: float, peak: int) -> int:
     frac = max(0.0, min(1.0, frac))
     return round(peak * (frac ** GAMMA))
+
+
+def _build_breath_table(peak: int, period: float) -> list:
+    """Precomputed once at startup per (peak, period) pair — not per-tick.
+
+    Near the extremes, gamma-corrected brightness changes so little per
+    unit time that many consecutive fine-grained time samples round to
+    the identical integer duty value before it can tick down/up again —
+    a real, unavoidable consequence of only having ~peak distinct levels
+    to work with (peak=200 here) spread across a curve shaped to
+    compress hard near zero. Sampled every 1ms and rounded, that showed
+    up as visibly held plateaus (e.g. "5,5,4,4,3,3,3,2,2,2,1,1,1,0,0,0,0,0")
+    especially on the way down.
+
+    Deduplicating consecutive identical samples into a single table entry
+    fixes it directly: the render loop walks this table at a constant
+    rate (one entry per period/len(table) seconds), so every entry — one
+    per *achievable distinct value*, not per raw time-sample — gets an
+    equal, short slice of the total period. A plateau that used to hold
+    for hundreds of milliseconds collapses to a single slice, exactly as
+    fast as any other transition. A region that already produces a new
+    distinct value on every fine-grained sample doesn't get deduplicated
+    at all — nothing changes structurally for it; it just ends up
+    spanning a proportionally larger, and typically slightly longer than
+    one raw render tick, share of the walked period once the coarse
+    region's redundant duplicates are gone. That's the intended trade:
+    faster through the parts with nothing new to show, correspondingly
+    a little more time on parts that actually have somewhere to go."""
+    SAMPLE_S = 0.001  # fine enough to catch every achievable integer transition
+    n_samples = max(2, round(period / SAMPLE_S))
+    table = []
+    last = None
+    for i in range(n_samples + 1):
+        t = (i / n_samples) * period
+        v = _curve(_ease(t, period), peak)
+        if v != last:
+            table.append(v)
+            last = v
+    return table
+
+
+def _table_lookup(table: list, elapsed: float, period: float) -> int:
+    idx = int((elapsed % period) / period * len(table))
+    return table[min(idx, len(table) - 1)]
 
 
 def _service_is_active(svc: str) -> bool:
@@ -188,6 +234,11 @@ def main() -> None:
     peak = round(real_range * PEAK_FRAC)
     print(f"[led] pigpiod ready — GPIO{GPIO_LED}, real_range={real_range}, peak_duty={peak}")
 
+    ok_table = _build_breath_table(peak, OK_PERIOD_S)
+    thinking_table = _build_breath_table(peak, THINKING_PERIOD_S)
+    print(f"[led] breathe table: {len(ok_table)} distinct steps over {OK_PERIOD_S}s, "
+          f"pulse table: {len(thinking_table)} steps over {THINKING_PERIOD_S}s")
+
     health = {"unhealthy_until": 0.0}
     threading.Thread(target=_health_monitor_loop, args=(health,), daemon=True).start()
 
@@ -205,11 +256,11 @@ def main() -> None:
 
             if state == "ok":
                 # slow breathe: 4s up, 4s down
-                pi.set_PWM_dutycycle(GPIO_LED, _curve(_ease(elapsed, 8.0), peak))
+                pi.set_PWM_dutycycle(GPIO_LED, _table_lookup(ok_table, elapsed, OK_PERIOD_S))
 
             elif state == "thinking":
                 # sharp, fast pulse: 0.6s up, 0.6s down
-                pi.set_PWM_dutycycle(GPIO_LED, _curve(_ease(elapsed, 1.2), peak))
+                pi.set_PWM_dutycycle(GPIO_LED, _table_lookup(thinking_table, elapsed, THINKING_PERIOD_S))
 
             elif state == "ap":
                 # double blink: on 0-100ms, off 100-250ms, on 250-350ms,
