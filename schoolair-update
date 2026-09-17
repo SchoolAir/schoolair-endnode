@@ -16,7 +16,7 @@
 #
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/SchoolAir/schoolair-ex-RMIT-pi/main/schoolair_setup.sh"
+REPO_RAW="https://raw.githubusercontent.com/SchoolAir/schoolair-endnode/main/schoolair_setup.sh"
 
 echo "━━━ SchoolAir OTA update: $(date) ━━━"
 echo "Fetching setup script from ${REPO_RAW} …"

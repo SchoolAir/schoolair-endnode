@@ -3,7 +3,7 @@
 #
 # Run on a fresh Raspberry Pi OS Lite (Bookworm or later):
 #
-#   curl -sSL https://raw.githubusercontent.com/SchoolAir/schoolair-ex-RMIT-pi/main/schoolair_setup.sh | sudo bash
+#   curl -sSL https://raw.githubusercontent.com/SchoolAir/schoolair-endnode/main/schoolair_setup.sh | sudo bash
 #
 # To override the Pi username (default: admin):
 #   curl ... | sudo ADMIN_USER=pi bash
@@ -47,7 +47,7 @@ MODE="${1:-setup}"
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_HOME="/home/${ADMIN_USER}"
 
-REPO_URL="https://github.com/SchoolAir/schoolair-ex-RMIT-pi.git"
+REPO_URL="https://github.com/SchoolAir/schoolair-endnode.git"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 REPO_DIR="/tmp/schoolair-repo"
 
