@@ -25,6 +25,7 @@ from before the crash would otherwise just sit there being rendered
 forever. See _check_watched_services().
 """
 
+import math
 import os
 import subprocess
 import time
@@ -64,6 +65,20 @@ def _read_state() -> str:
     except OSError:
         pass
     return "thinking"
+
+
+def _ease(elapsed: float, period: float) -> float:
+    """Smooth 0->1->0 breathing envelope over `period` seconds — a raised
+    cosine, not a triangle wave. This matters specifically at the peak: a
+    linear triangle wave has a sharp corner there (slope flips sign
+    instantly), and gamma correction's own slope is steepest right at
+    frac=1 — stacking those two produces the fastest-changing point of
+    the whole cycle exactly at the peak, which reads as a visible "step"
+    right around the top of the breath. A cosine has zero slope exactly
+    at both the peak and trough, so there's no corner for gamma to make
+    worse — this is what was actually producing the visible step reported
+    near the peak of the breathe/pulse patterns."""
+    return (1 - math.cos(2 * math.pi * elapsed / period)) / 2
 
 
 def _curve(frac: float, peak: int) -> int:
@@ -173,17 +188,11 @@ def main() -> None:
 
             if state == "ok":
                 # slow breathe: 4s up, 4s down
-                period = 8.0
-                phase = (elapsed % period) / period
-                frac = phase * 2 if phase < 0.5 else (1 - phase) * 2
-                pi.set_PWM_dutycycle(GPIO_LED, _curve(frac, peak))
+                pi.set_PWM_dutycycle(GPIO_LED, _curve(_ease(elapsed, 8.0), peak))
 
             elif state == "thinking":
                 # sharp, fast pulse: 0.6s up, 0.6s down
-                period = 1.2
-                phase = (elapsed % period) / period
-                frac = phase * 2 if phase < 0.5 else (1 - phase) * 2
-                pi.set_PWM_dutycycle(GPIO_LED, _curve(frac, peak))
+                pi.set_PWM_dutycycle(GPIO_LED, _curve(_ease(elapsed, 1.2), peak))
 
             elif state == "ap":
                 # double blink: on 0-100ms, off 100-250ms, on 250-350ms,
