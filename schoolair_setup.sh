@@ -461,8 +461,21 @@ if [[ "$MODE" == "--update" ]]; then
     fi
 
     if systemctl is-active --quiet nginx; then systemctl restart nginx; fi
-    systemctl restart sen6x.service     || warn "sen6x.service restart failed"
-    systemctl restart schoolair.service || warn "schoolair.service restart failed"
+    systemctl restart sen6x.service           || warn "sen6x.service restart failed"
+    systemctl restart schoolair.service       || warn "schoolair.service restart failed"
+    # schoolair-netwatch.service is a long-running bash process — cp'ing a new
+    # netwatch.sh to disk does NOT make its already-running interpreter pick up
+    # the change; it keeps executing the old in-memory script until restarted.
+    # This bit us for real: the netwatch/wizard race-condition fix landed on
+    # disk via a previous OTA run but stayed inactive on any device that
+    # didn't happen to reboot afterward, silently defeating the whole point
+    # of shipping it as an update.
+    systemctl restart schoolair-netwatch.service || warn "schoolair-netwatch.service restart failed"
+    # schoolair-led.service is brand new on any device updating from before it
+    # existed — "systemctl enable" above only arms it for the *next* boot, it
+    # does not start it now. restart (not start) also correctly picks up new
+    # led_status.py code on devices where it was already running.
+    systemctl restart schoolair-led.service      || warn "schoolair-led.service restart failed"
     ok "Services restarted with updated code"
 fi
 
