@@ -563,6 +563,24 @@ if [[ "$MODE" == "--update" ]]; then
     systemctl restart schoolair-led.service      || warn "schoolair-led.service restart failed"
     ok "Services restarted with updated code"
 
+    # Active health check (adapted from deploy/canary_ota_test.sh's own
+    # post-update verification) — don't wait for the watchdog's next tick,
+    # let alone a real upload, to catch a service that won't even stay up.
+    # A dead/crash-looped service is the single most common way an update
+    # breaks, and this catches it in under a minute instead of up to 40.
+    step "15c / Post-restart health check"
+    sleep 20
+    _UNHEALTHY=""
+    for svc in sen6x.service schoolair.service schoolair-netwatch.service; do
+        if ! systemctl is-active --quiet "$svc"; then
+            _UNHEALTHY="${_UNHEALTHY} ${svc}"
+        fi
+    done
+    if [ -n "$_UNHEALTHY" ]; then
+        die "Service(s) not active after update:${_UNHEALTHY} — rolling back."
+    fi
+    ok "sen6x, schoolair, schoolair-netwatch all active post-update"
+
     # Arm the rollback watchdog: if a real successful upload doesn't confirm
     # this version works within the deadline, schoolair-update-watchdog.timer
     # restores the pre-update backup automatically. jobs/ingest.py clears this

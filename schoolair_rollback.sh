@@ -72,12 +72,27 @@ do_check() {
     if [ ! -f "$PENDING_FILE" ]; then
         return 0   # no update pending confirmation — nothing to do
     fi
+
+    # Active health check, every tick — not just at deadline. Catches a
+    # service that crashes later (after the initial post-restart check in
+    # schoolair_setup.sh passed), instead of waiting up to the full
+    # deadline for a problem that's already visible right now.
+    local svc unhealthy=""
+    for svc in sen6x.service schoolair.service schoolair-netwatch.service; do
+        systemctl is-active --quiet "$svc" || unhealthy="${unhealthy} ${svc}"
+    done
+    if [ -n "$unhealthy" ]; then
+        log "Service(s) not active:${unhealthy} — rolling back now, not waiting for the deadline."
+        do_restore_now
+        return 0
+    fi
+
     local deadline
     deadline="$(python3 -c "import json; print(json.load(open('${PENDING_FILE}')).get('deadline', 0))" 2>/dev/null || echo 0)"
     local now
     now="$(date +%s)"
     if [ "${deadline%.*}" -gt "$now" ] 2>/dev/null; then
-        return 0   # still within the confirmation window — keep waiting
+        return 0   # services look healthy and still within the confirmation window
     fi
     log "Update was never confirmed by a successful upload within its deadline — rolling back."
     do_restore_now
