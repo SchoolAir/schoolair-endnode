@@ -51,6 +51,11 @@ from config import (
 
 LEGACY_URL   = "https://data.schoolair.org/node/aqc/register"
 TEMP_PROFILE = "school-air-temp"
+# Held (as a plain marker file, tmpfs so it can never survive a reboot stale)
+# for the duration of run_registration()'s connect→register attempt, so
+# netwatch.sh's independent "uplink appeared, close the AP" poll doesn't
+# race in and stop this service mid-attempt. See run_registration().
+WIZARD_BUSY_FILE = "/run/schoolair-wizard-busy"
 SAVED_PREFIX = "schoolair-"
 IDLE_TIMEOUT = 15 * 60  # seconds idle before auto-shutdown (management mode only)
 SESSION_TTL  = 30 * 60  # seconds before an incomplete session expires
@@ -1507,153 +1512,173 @@ async def run_registration(sess_tok: str) -> None:
     migrate       = sess["migrate"]
     retry_profile = sess.get("retry_profile")
 
-    if retry_profile:
-        _set("connecting", f'Reconnecting to "{ssid}"…')
-        rc, _, err = await _cmd(f'nmcli con up "{retry_profile}"')
-        if rc != 0:
-            detail = err or "the saved network no longer works."
-            _set("error", f'Could not reconnect to "{ssid}": {detail} '
-                           "Please re-enter your Wi-Fi details.")
-            await _cmd(f'nmcli con delete "{retry_profile}" 2>/dev/null; true')
-            _last_good_wifi.clear()
-            wifi_sessions.pop(sess_tok, None)
-            _connection_in_progress = False
-            await _revert_to_ap()
-            return
-    else:
-        _set("connecting", f'Connecting to "{ssid}"…')
-        ok, msg = await _setup_client_profile(ssid, password)
-        if not ok:
-            _set("error", f'Could not set up "{ssid}": {msg}')
-            wifi_sessions.pop(sess_tok, None)
-            _connection_in_progress = False
-            await _revert_to_ap()
-            return
-
-        rc, _, err = await _cmd(f'nmcli con up "{TEMP_PROFILE}"')
-        if rc != 0:
-            detail = err or "check the network name and password."
-            _set("error", f'Could not connect to "{ssid}": {detail}')
-            await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
-            wifi_sessions.pop(sess_tok, None)
-            _connection_in_progress = False
-            await _revert_to_ap()
-            return
-
-    _set("wifi_up", f'Joined "{ssid}". Waiting for IP address…')
-    if not await _wait_for_ip(timeout=30):
-        _set("error", f'Joined "{ssid}" but never received an IP address — '
-                       "the network may have no DHCP, or the device is out of range.")
-        if retry_profile:
-            await _cmd(f'nmcli con delete "{retry_profile}" 2>/dev/null; true')
-            _last_good_wifi.clear()
-        else:
-            await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
-        wifi_sessions.pop(sess_tok, None)
-        _connection_in_progress = False
-        await _revert_to_ap()
-        return
-
-    _set("validating", "Validating registration token…")
-    valid, vmsg = await _validate_token(token)
-    if not valid:
-        _set("error", f"Wi-Fi connected, but the registration token was rejected: "
-                       f"{_friendly_error(vmsg)}")
-        if retry_profile:
-            await _cmd(f'nmcli con delete "{retry_profile}" 2>/dev/null; true')
-            _last_good_wifi.clear()
-        else:
-            await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
-        wifi_sessions.pop(sess_tok, None)
-        _connection_in_progress = False
-        await _revert_to_ap()
-        return
-
-    success = True
-    hb_msg  = ""
-    device_auth_token = ""
-    legacy_resp: dict = {}
-
-    if site == "LEGACY":
-        _set("heartbeat", "Registering with legacy server…")
-        success, hb_msg, legacy_resp = await _post_legacy_registration(token, asset)
-    else:
-        _set("heartbeat", "Completing registration with SchoolAir Cloud…")
-        payload = {
-            "token":       token,
-            "mac_address": _get_mac_address(),
-            "cpu_serial":  _get_cpu_serial(),
-            "nickname":    asset,
-            "migrate":     migrate,
-            "new_asset":   {"nickname": asset, "type": environment,
-                            "site_name": site or None},
-        }
-        success, hb_msg, device_auth_token = await _post_heartbeat(payload)
-
-    if not success:
-        # Wi-Fi and the token were both good — this is not a credentials
-        # problem, so keep the network instead of erasing it. Commit the
-        # profile permanently (if it isn't already) and remember it so the
-        # next attempt can skip straight back to Step 2.
-        committed = retry_profile or await _commit_wifi_profile(ssid)
-        _last_good_wifi.clear()
-        _last_good_wifi.update({"ssid": ssid, "profile": committed})
-        _set("error", f"Wi-Fi and token were both fine, but device registration failed: "
-                       f"{_friendly_error(hb_msg)} Your Wi-Fi network was kept — "
-                       f"just re-enter the token, site, and asset name.")
-        write_error(hb_msg)
-        wifi_sessions.pop(sess_tok, None)
-        _connection_in_progress = False
-        await _revert_to_ap()
-        return
-
-    # Commit WiFi profile permanently with incremental priority (unless a
-    # Step-2-only retry already had it committed).
-    committed = retry_profile or await _commit_wifi_profile(ssid)
-    _last_good_wifi.clear()
-
-    if site != "LEGACY":
-        write_status({
-            "token":         token,
-            "site":          site,
-            "asset_name":    asset,
-            "environment":   environment,
-            "ssid":          ssid,
-            "registered_at": datetime.now(timezone.utc).isoformat(),
-        })
-        try:
-            _write_auth_token(token)
-        except Exception as e:
-            print(f"[wizard] Warning: could not write AUTH_TOKEN: {e}")
-        if device_auth_token:
-            try:
-                _write_new_auth_token(device_auth_token)
-            except Exception as e:
-                print(f"[wizard] Warning: could not write NEW_AUTH_TOKEN: {e}")
-    else:
-        device_token_value = legacy_resp.get("token", token)
-        device_token = {
-            "token":     device_token_value,
-            "device_id": legacy_resp.get("device_id", ""),
-            "nickname":  asset,
-        }
-        with open(NODE_RED_TOKEN_FILE, "w") as _f:
-            json.dump(device_token, _f)
-        _fix_owner(NODE_RED_TOKEN_FILE)
-        try:
-            _write_auth_token(device_token_value)
-        except Exception as e:
-            print(f"[wizard] Warning: could not write AUTH_TOKEN: {e}")
-
+    # Held for the whole connect→register attempt. netwatch.sh polls every
+    # ~30s and closes the AP + stops this service the moment it sees a real
+    # uplink appear — which now happens mid-attempt, since (unlike the old
+    # two-drop flow) Wi-Fi stays up continuously through token validation
+    # and registration. Without this file, netwatch can — and did, on a
+    # real device — kill this process between the heartbeat succeeding and
+    # the token actually getting written to disk. netwatch.sh checks for
+    # this file before acting; see its `ap` state handler.
     try:
-        os.remove(STAGING_FILE)
-    except FileNotFoundError:
+        with open(WIZARD_BUSY_FILE, "w") as _f:
+            _f.write(str(os.getpid()))
+    except OSError:
         pass
 
-    wifi_sessions.pop(sess_tok, None)
-    _connection_in_progress = False
-    _set("success", "Registration complete! This hotspot will shut down shortly.")
-    asyncio.create_task(_delayed_shutdown())
+    try:
+        if retry_profile:
+            _set("connecting", f'Reconnecting to "{ssid}"…')
+            rc, _, err = await _cmd(f'nmcli con up "{retry_profile}"')
+            if rc != 0:
+                detail = err or "the saved network no longer works."
+                _set("error", f'Could not reconnect to "{ssid}": {detail} '
+                               "Please re-enter your Wi-Fi details.")
+                await _cmd(f'nmcli con delete "{retry_profile}" 2>/dev/null; true')
+                _last_good_wifi.clear()
+                wifi_sessions.pop(sess_tok, None)
+                _connection_in_progress = False
+                await _revert_to_ap()
+                return
+        else:
+            _set("connecting", f'Connecting to "{ssid}"…')
+            ok, msg = await _setup_client_profile(ssid, password)
+            if not ok:
+                _set("error", f'Could not set up "{ssid}": {msg}')
+                wifi_sessions.pop(sess_tok, None)
+                _connection_in_progress = False
+                await _revert_to_ap()
+                return
+
+            rc, _, err = await _cmd(f'nmcli con up "{TEMP_PROFILE}"')
+            if rc != 0:
+                detail = err or "check the network name and password."
+                _set("error", f'Could not connect to "{ssid}": {detail}')
+                await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
+                wifi_sessions.pop(sess_tok, None)
+                _connection_in_progress = False
+                await _revert_to_ap()
+                return
+
+        _set("wifi_up", f'Joined "{ssid}". Waiting for IP address…')
+        if not await _wait_for_ip(timeout=30):
+            _set("error", f'Joined "{ssid}" but never received an IP address — '
+                           "the network may have no DHCP, or the device is out of range.")
+            if retry_profile:
+                await _cmd(f'nmcli con delete "{retry_profile}" 2>/dev/null; true')
+                _last_good_wifi.clear()
+            else:
+                await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
+            wifi_sessions.pop(sess_tok, None)
+            _connection_in_progress = False
+            await _revert_to_ap()
+            return
+
+        _set("validating", "Validating registration token…")
+        valid, vmsg = await _validate_token(token)
+        if not valid:
+            _set("error", f"Wi-Fi connected, but the registration token was rejected: "
+                           f"{_friendly_error(vmsg)}")
+            if retry_profile:
+                await _cmd(f'nmcli con delete "{retry_profile}" 2>/dev/null; true')
+                _last_good_wifi.clear()
+            else:
+                await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
+            wifi_sessions.pop(sess_tok, None)
+            _connection_in_progress = False
+            await _revert_to_ap()
+            return
+
+        success = True
+        hb_msg  = ""
+        device_auth_token = ""
+        legacy_resp: dict = {}
+
+        if site == "LEGACY":
+            _set("heartbeat", "Registering with legacy server…")
+            success, hb_msg, legacy_resp = await _post_legacy_registration(token, asset)
+        else:
+            _set("heartbeat", "Completing registration with SchoolAir Cloud…")
+            payload = {
+                "token":       token,
+                "mac_address": _get_mac_address(),
+                "cpu_serial":  _get_cpu_serial(),
+                "nickname":    asset,
+                "migrate":     migrate,
+                "new_asset":   {"nickname": asset, "type": environment,
+                                "site_name": site or None},
+            }
+            success, hb_msg, device_auth_token = await _post_heartbeat(payload)
+
+        if not success:
+            # Wi-Fi and the token were both good — this is not a credentials
+            # problem, so keep the network instead of erasing it. Commit the
+            # profile permanently (if it isn't already) and remember it so the
+            # next attempt can skip straight back to Step 2.
+            committed = retry_profile or await _commit_wifi_profile(ssid)
+            _last_good_wifi.clear()
+            _last_good_wifi.update({"ssid": ssid, "profile": committed})
+            _set("error", f"Wi-Fi and token were both fine, but device registration failed: "
+                           f"{_friendly_error(hb_msg)} Your Wi-Fi network was kept — "
+                           f"just re-enter the token, site, and asset name.")
+            write_error(hb_msg)
+            wifi_sessions.pop(sess_tok, None)
+            _connection_in_progress = False
+            await _revert_to_ap()
+            return
+
+        # Commit WiFi profile permanently with incremental priority (unless a
+        # Step-2-only retry already had it committed).
+        committed = retry_profile or await _commit_wifi_profile(ssid)
+        _last_good_wifi.clear()
+
+        if site != "LEGACY":
+            write_status({
+                "token":         token,
+                "site":          site,
+                "asset_name":    asset,
+                "environment":   environment,
+                "ssid":          ssid,
+                "registered_at": datetime.now(timezone.utc).isoformat(),
+            })
+            try:
+                _write_auth_token(token)
+            except Exception as e:
+                print(f"[wizard] Warning: could not write AUTH_TOKEN: {e}")
+            if device_auth_token:
+                try:
+                    _write_new_auth_token(device_auth_token)
+                except Exception as e:
+                    print(f"[wizard] Warning: could not write NEW_AUTH_TOKEN: {e}")
+        else:
+            device_token_value = legacy_resp.get("token", token)
+            device_token = {
+                "token":     device_token_value,
+                "device_id": legacy_resp.get("device_id", ""),
+                "nickname":  asset,
+            }
+            with open(NODE_RED_TOKEN_FILE, "w") as _f:
+                json.dump(device_token, _f)
+            _fix_owner(NODE_RED_TOKEN_FILE)
+            try:
+                _write_auth_token(device_token_value)
+            except Exception as e:
+                print(f"[wizard] Warning: could not write AUTH_TOKEN: {e}")
+
+        try:
+            os.remove(STAGING_FILE)
+        except FileNotFoundError:
+            pass
+
+        wifi_sessions.pop(sess_tok, None)
+        _connection_in_progress = False
+        _set("success", "Registration complete! This hotspot will shut down shortly.")
+        asyncio.create_task(_delayed_shutdown())
+    finally:
+        try:
+            os.remove(WIZARD_BUSY_FILE)
+        except FileNotFoundError:
+            pass
 
 
 async def run_management_update(sess_tok: str) -> None:
