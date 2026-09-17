@@ -79,12 +79,26 @@ do_check() {
     # service that crashes later (after the initial post-restart check in
     # schoolair_setup.sh passed), instead of waiting up to the full
     # deadline for a problem that's already visible right now.
-    local svc unhealthy=""
+    #
+    # is-active alone isn't enough — proven live: Type=simple marks a
+    # service "active" the instant its process is spawned, even if it
+    # crashes moments later, so a genuinely crash-looping service can
+    # still read as "active" at any single sampled instant. Compare each
+    # service's current restart count against the baseline schoolair_setup.sh
+    # recorded in the pending file at update time — any increase since then
+    # means it crashed at least once after the update, regardless of
+    # whether it happens to be up again right this moment.
+    local svc unhealthy="" baseline now_restarts
     for svc in sen6x.service schoolair.service schoolair-netwatch.service; do
-        systemctl is-active --quiet "$svc" || unhealthy="${unhealthy} ${svc}"
+        systemctl is-active --quiet "$svc" || unhealthy="${unhealthy} ${svc}(inactive)"
+        baseline="$(python3 -c "import json; print(json.load(open('${PENDING_FILE}')).get('restart_baseline', {}).get('${svc}', 0))" 2>/dev/null || echo 0)"
+        now_restarts="$(systemctl show "$svc" -p NRestarts --value 2>/dev/null || echo 0)"
+        if [ "${now_restarts:-0}" -gt "${baseline:-0}" ] 2>/dev/null; then
+            unhealthy="${unhealthy} ${svc}(crash-looping)"
+        fi
     done
     if [ -n "$unhealthy" ]; then
-        log "Service(s) not active:${unhealthy} — rolling back now, not waiting for the deadline."
+        log "Service(s) unhealthy:${unhealthy} — rolling back now, not waiting for the deadline."
         do_restore_now
         return 0
     fi

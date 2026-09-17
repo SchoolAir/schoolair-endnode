@@ -30,13 +30,28 @@ ROLLBACK_SCRIPT = Path(__file__).parents[1] / "schoolair_rollback.sh"
 WATCHED_SERVICES = ("sen6x.service", "schoolair.service", "schoolair-netwatch.service")
 
 
-def _make_fake_systemctl(bin_dir: Path, unhealthy: tuple[str, ...] = ()) -> None:
-    """A systemctl stand-in: `is-active --quiet <svc>` fails for anything
-    listed in `unhealthy`, succeeds for everything else; every other
-    subcommand (daemon-reload, restart, ...) always succeeds."""
+def _make_fake_systemctl(
+    bin_dir: Path,
+    unhealthy: tuple[str, ...] = (),
+    restarts: dict[str, int] | None = None,
+) -> None:
+    """A systemctl stand-in:
+      - `is-active --quiet <svc>` fails for anything listed in `unhealthy`,
+        succeeds for everything else.
+      - `show <svc> -p NRestarts --value` prints `restarts[<svc>]` (0 if
+        unlisted) — this is what caught the real bug: a service can be
+        "active" (is-active succeeds) while its restart count has still
+        climbed past the baseline, meaning it crash-looped and only
+        happens to be up again at the moment it's checked.
+      - every other subcommand (daemon-reload, restart, ...) always succeeds.
+    """
     bin_dir.mkdir(parents=True, exist_ok=True)
     script = bin_dir / "systemctl"
     unhealthy_list = " ".join(unhealthy)
+    restarts = restarts or {}
+    restart_cases = "\n".join(
+        f'    "{svc}") echo {count}; exit 0 ;;' for svc, count in restarts.items()
+    )
     script.write_text(f"""#!/usr/bin/env bash
 if [ "$1" = "is-active" ]; then
     svc="${{@: -1}}"
@@ -44,6 +59,13 @@ if [ "$1" = "is-active" ]; then
         [ "$svc" = "$bad" ] && exit 1
     done
     exit 0
+fi
+if [ "$1" = "show" ] && [ "$3" = "-p" ] && [ "$4" = "NRestarts" ]; then
+    svc="$2"
+    case "$svc" in
+{restart_cases}
+    *) echo 0; exit 0 ;;
+    esac
 fi
 exit 0
 """)
@@ -74,7 +96,14 @@ def sandbox(tmp_path, monkeypatch):
             self.env = env
 
         def set_unhealthy(self, *services):
-            _make_fake_systemctl(bin_dir, services)
+            _make_fake_systemctl(bin_dir, unhealthy=services)
+
+        def set_restarts(self, **counts):
+            """e.g. set_restarts(**{"schoolair.service": 3}) — simulates a
+            service that's currently is-active (crashed, auto-restarted,
+            and happens to be up again) but has restarted since the
+            baseline was recorded."""
+            _make_fake_systemctl(bin_dir, restarts=counts)
 
         def back_up(self, real_path: Path, content: str):
             """Simulates what install_with_backup() in schoolair_setup.sh
@@ -88,12 +117,13 @@ def sandbox(tmp_path, monkeypatch):
             with self.manifest.open("a") as f:
                 f.write(f"{real_path}\n")
 
-        def write_pending(self, deadline_offset_seconds: float):
+        def write_pending(self, deadline_offset_seconds: float, restart_baseline: dict | None = None):
             self.pending_file.parent.mkdir(parents=True, exist_ok=True)
             self.pending_file.write_text(json.dumps({
                 "from_version": "1.0.0",
                 "to_version": "1.0.1",
                 "deadline": time.time() + deadline_offset_seconds,
+                "restart_baseline": restart_baseline or {},
             }))
 
         def run(self, *args) -> subprocess.CompletedProcess:
@@ -182,6 +212,56 @@ def test_check_waits_when_healthy_and_within_deadline(sandbox):
 
     assert result.returncode == 0, result.stderr
     assert sandbox.pending_file.exists(), "should still be waiting for confirmation"
+    assert target.read_text() == "CURRENT"
+
+
+def test_check_rolls_back_when_restart_count_exceeds_baseline_even_if_active(sandbox):
+    """The exact bug found in a real live-fire test on .169: a Type=simple
+    service reports "active" the instant its process is spawned, even if
+    it crashes moments later (e.g. partway through imports). A service
+    crash-looping on a ~10s Restart= cycle can land squarely in that
+    "active" window at the exact instant a single is-active check samples
+    it — is-active alone said everything was fine while the service was
+    actually crash-looping for real. Comparing against the restart-count
+    baseline recorded at update time is what actually catches it."""
+    target = sandbox.tmp_path / "app" / "version.txt"
+    target.parent.mkdir(parents=True)
+    sandbox.back_up(target, "GOOD")
+    target.write_text("CURRENT")
+    sandbox.write_pending(
+        deadline_offset_seconds=3600,
+        restart_baseline={"schoolair.service": 0},
+    )
+    # systemctl reports it as active (no service listed in set_unhealthy)
+    # AND with a restart count that has climbed past the baseline —
+    # exactly what a crash-looping-but-currently-up service looks like.
+    sandbox.set_restarts(**{"schoolair.service": 3})
+
+    result = sandbox.run("--check")
+
+    assert result.returncode == 0, result.stderr
+    assert target.read_text() == "GOOD", "restart-count regression should have triggered rollback"
+    assert not sandbox.pending_file.exists()
+
+
+def test_check_waits_when_restart_count_matches_baseline(sandbox):
+    """No false positive: a service that legitimately had prior restarts
+    before the update (reflected in its own baseline) shouldn't trigger a
+    rollback just for staying at that same count."""
+    target = sandbox.tmp_path / "app" / "version.txt"
+    target.parent.mkdir(parents=True)
+    sandbox.back_up(target, "GOOD")
+    target.write_text("CURRENT")
+    sandbox.write_pending(
+        deadline_offset_seconds=3600,
+        restart_baseline={"schoolair.service": 2},
+    )
+    sandbox.set_restarts(**{"schoolair.service": 2})  # unchanged since baseline
+
+    result = sandbox.run("--check")
+
+    assert result.returncode == 0, result.stderr
+    assert sandbox.pending_file.exists(), "should still be waiting — nothing actually changed"
     assert target.read_text() == "CURRENT"
 
 
