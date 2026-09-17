@@ -128,6 +128,22 @@ sudo rm -f /etc/ssh/ssh_host_*
 sudo systemctl enable regenerate_ssh_host_keys.service 2>/dev/null || true
 ok "Keys removed — regenerate_ssh_host_keys.service re-enabled for next boot"
 
+# ── 9b. Machine ID + filesystem-grow first-boot unit ───────────────────────────
+# systemd's ConditionFirstBoot= (used by regenerate_ssh_host_keys.service above,
+# AND by rpi-resize.service — the unit that grows the root filesystem to fill
+# whatever card a clone gets flashed onto) is derived from /etc/machine-id being
+# empty. Leaving a real machine-id in the golden image means systemd never
+# considers a clone's boot a "first boot", every clone silently shares the same
+# machine-id (breaks DHCP client-id/journald per-device identity), AND the
+# filesystem-grow step never fires. rpi-resize.service also self-disables after
+# its first run (same pattern as the SSH key service above) — it already fired
+# once during this device's own original setup, so it must be re-enabled here
+# too, not just have its condition fixed.
+step "Resetting machine-id and re-enabling filesystem-grow for clones"
+sudo truncate -s 0 /etc/machine-id
+sudo systemctl enable rpi-resize.service 2>/dev/null || true
+ok "machine-id cleared, rpi-resize.service re-enabled — clones will grow to fill their card on first boot"
+
 # ── 10. Logs, journald, and shell history ─────────────────────────────────────
 step "Wiping logs and shell history"
 sudo find /var/log -type f -exec truncate -s 0 {} \; 2>/dev/null || true
