@@ -48,7 +48,7 @@ def _set_led_state(state: str) -> None:
     except OSError:
         pass
 
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
