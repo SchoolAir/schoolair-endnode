@@ -568,18 +568,49 @@ if [[ "$MODE" == "--update" ]]; then
     # let alone a real upload, to catch a service that won't even stay up.
     # A dead/crash-looped service is the single most common way an update
     # breaks, and this catches it in under a minute instead of up to 40.
+    #
+    # A single is-active snapshot is NOT enough on its own — proven for
+    # real in a live-fire test: Type=simple marks a service "active" the
+    # instant its process is spawned, even if that process crashes moments
+    # later (e.g. partway through Python imports, before it ever reaches
+    # the bug). A crash-looping service can land squarely in that "active"
+    # window at the exact moment a single check happens to sample it. So:
+    # capture each service's restart count as a baseline right after our
+    # own explicit restart, then — after the is-active check passes —
+    # look again later for whether it has restarted *again* since. Any
+    # increase means a crash happened, regardless of what is-active says
+    # right now.
     step "15c / Post-restart health check"
+    _BASE_SEN6X="$(systemctl show sen6x.service              -p NRestarts --value 2>/dev/null || echo 0)"
+    _BASE_SCHOOLAIR="$(systemctl show schoolair.service       -p NRestarts --value 2>/dev/null || echo 0)"
+    _BASE_NETWATCH="$(systemctl show schoolair-netwatch.service -p NRestarts --value 2>/dev/null || echo 0)"
+
     sleep 20
     _UNHEALTHY=""
     for svc in sen6x.service schoolair.service schoolair-netwatch.service; do
         if ! systemctl is-active --quiet "$svc"; then
-            _UNHEALTHY="${_UNHEALTHY} ${svc}"
+            _UNHEALTHY="${_UNHEALTHY} ${svc}(inactive)"
         fi
     done
     if [ -n "$_UNHEALTHY" ]; then
         die "Service(s) not active after update:${_UNHEALTHY} — rolling back."
     fi
-    ok "sen6x, schoolair, schoolair-netwatch all active post-update"
+
+    sleep 15
+    _UNHEALTHY=""
+    _NOW_SEN6X="$(systemctl show sen6x.service              -p NRestarts --value 2>/dev/null || echo 0)"
+    _NOW_SCHOOLAIR="$(systemctl show schoolair.service       -p NRestarts --value 2>/dev/null || echo 0)"
+    _NOW_NETWATCH="$(systemctl show schoolair-netwatch.service -p NRestarts --value 2>/dev/null || echo 0)"
+    [ "$_NOW_SEN6X"     -gt "$_BASE_SEN6X" ]     && _UNHEALTHY="${_UNHEALTHY} sen6x.service(crash-looping)"
+    [ "$_NOW_SCHOOLAIR" -gt "$_BASE_SCHOOLAIR" ] && _UNHEALTHY="${_UNHEALTHY} schoolair.service(crash-looping)"
+    [ "$_NOW_NETWATCH"  -gt "$_BASE_NETWATCH" ]  && _UNHEALTHY="${_UNHEALTHY} schoolair-netwatch.service(crash-looping)"
+    for svc in sen6x.service schoolair.service schoolair-netwatch.service; do
+        systemctl is-active --quiet "$svc" || _UNHEALTHY="${_UNHEALTHY} ${svc}(inactive)"
+    done
+    if [ -n "$_UNHEALTHY" ]; then
+        die "Service(s) crash-looping or inactive after update:${_UNHEALTHY} — rolling back."
+    fi
+    ok "sen6x, schoolair, schoolair-netwatch all active post-update, no restarts since"
 
     # Arm the rollback watchdog: if a real successful upload doesn't confirm
     # this version works within the deadline, schoolair-update-watchdog.timer
@@ -598,7 +629,16 @@ if [[ "$MODE" == "--update" ]]; then
         python3 -c "
 import json, time
 json.dump(
-    {'from_version': '${_PRE_UPDATE_VERSION}', 'to_version': '${_NEW_VERSION}', 'deadline': time.time() + 2400},
+    {
+        'from_version': '${_PRE_UPDATE_VERSION}',
+        'to_version': '${_NEW_VERSION}',
+        'deadline': time.time() + 2400,
+        'restart_baseline': {
+            'sen6x.service': ${_NOW_SEN6X},
+            'schoolair.service': ${_NOW_SCHOOLAIR},
+            'schoolair-netwatch.service': ${_NOW_NETWATCH},
+        },
+    },
     open('/var/lib/schoolair/update-pending.json', 'w'),
 )
 "
