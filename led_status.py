@@ -14,12 +14,20 @@ States (unrecognized/missing file content falls back to "thinking"):
   error     — registration/upload error                → single blink every 1s
   no_sensor — sensor read is failing                   → solid on
   (device has no power)                                → off — never written by us
+
+On top of that, this process independently polls sen6x/schoolair/
+schoolair-netwatch every few seconds and forces "error" regardless of
+LED_STATE_FILE if any of them are down or have restarted since the last
+check. This matters specifically when the process that would normally
+write "error" itself is what's broken — e.g. a crashed main.py never
+reaches the code that writes to LED_STATE_FILE at all, so a stale "ok"
+from before the crash would otherwise just sit there being rendered
+forever. See _check_watched_services().
 """
 
 import os
+import subprocess
 import time
-
-import pigpio
 
 GPIO_LED = 24
 LED_STATE_FILE = "/run/schoolair-led-state"
@@ -29,6 +37,22 @@ GAMMA = 2.8            # perceptual correction so dimming looks linear to the ey
 TICK = 0.02            # render granularity
 
 _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
+
+# Independent health check — don't depend on schoolair.service itself to
+# report its own breakage. A real live-fire OTA rollback test found this
+# exact gap: a crashed main.py never even reaches the code that would
+# write "error" to LED_STATE_FILE, so a stale "ok" from before the crash
+# just sits there being rendered forever. Checked every HEALTH_CHECK_S
+# (not every render tick — these shell out to systemctl, too slow for a
+# 20ms loop). A single is-active snapshot isn't enough either — the same
+# rollback test showed Type=simple marks a service "active" the instant
+# its process is spawned, even if it crashes moments later — so this also
+# tracks each service's restart count between checks and treats an
+# increase as evidence of a crash within that window, even if the service
+# happens to be up again by the time it's sampled.
+WATCHED_SERVICES = ("sen6x.service", "schoolair.service", "schoolair-netwatch.service")
+HEALTH_CHECK_INTERVAL_S = 5.0
+UNHEALTHY_HOLD_S = 30.0    # once flagged, hold the "error" override at least this long
 
 
 def _read_state() -> str:
@@ -47,7 +71,46 @@ def _curve(frac: float, peak: int) -> int:
     return round(peak * (frac ** GAMMA))
 
 
+def _service_is_active(svc: str) -> bool:
+    try:
+        return subprocess.run(
+            ["systemctl", "is-active", "--quiet", svc], timeout=2,
+        ).returncode == 0
+    except subprocess.SubprocessError:
+        return True  # don't flag unhealthy just because the check itself hiccuped
+
+
+def _service_restarts(svc: str) -> int:
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", svc, "-p", "NRestarts", "--value"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        return int(out)
+    except (ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def _check_watched_services(last_restarts: dict) -> bool:
+    """Returns True if anything looks unhealthy right now. Mutates
+    last_restarts in place with the freshly observed counts — the first
+    call for any given service just seeds its baseline (no prior value to
+    compare against yet), so it never flags unhealthy purely for having
+    restarted at some point before this process started."""
+    unhealthy = False
+    for svc in WATCHED_SERVICES:
+        if not _service_is_active(svc):
+            unhealthy = True
+        now_restarts = _service_restarts(svc)
+        if svc in last_restarts and now_restarts > last_restarts[svc]:
+            unhealthy = True
+        last_restarts[svc] = now_restarts
+    return unhealthy
+
+
 def main() -> None:
+    import pigpio  # deferred: Pi-only, keeps this module importable/testable elsewhere
+
     # Outdoor units never get pigpiod installed (see schoolair-pigpio-setup.service)
     # — bail out quietly rather than spinning on failed pigpiod connections.
     try:
@@ -90,10 +153,19 @@ def main() -> None:
 
     last_state = None
     t0 = time.monotonic()
+    last_restarts: dict = {}
+    next_health_check = 0.0
+    unhealthy_until = 0.0
 
     try:
         while True:
-            state = _read_state()
+            now_mono = time.monotonic()
+            if now_mono >= next_health_check:
+                if _check_watched_services(last_restarts):
+                    unhealthy_until = now_mono + UNHEALTHY_HOLD_S
+                next_health_check = now_mono + HEALTH_CHECK_INTERVAL_S
+
+            state = "error" if now_mono < unhealthy_until else _read_state()
             if state != last_state:
                 t0 = time.monotonic()  # restart the pattern cleanly at each state change
                 last_state = state
