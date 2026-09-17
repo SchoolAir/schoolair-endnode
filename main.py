@@ -155,6 +155,11 @@ async def main():
 
 
 if __name__ == "__main__":
+    raise RuntimeError(
+        "DELIBERATE TEST BREAK — schoolair-endnode OTA rollback live-fire test, "
+        "2026-09-18. This must never reach a real deploy; if you're reading this "
+        "in production, revert this commit immediately."
+    )
     check_registration()  # logs if no token; does not exit
     try:
         asyncio.run(main())
