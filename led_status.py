@@ -24,7 +24,7 @@ import pigpio
 GPIO_LED = 24
 LED_STATE_FILE = "/run/schoolair-led-state"
 PWM_FREQ_HZ = 100      # well above flicker-fusion; low enough for a wide duty-cycle range
-PEAK_FRAC = 0.5        # cap max brightness at half — comfortable to look at continuously
+PEAK_FRAC = 0.3        # cap max brightness at 0.3 — comfortable to look at continuously
 GAMMA = 2.8            # perceptual correction so dimming looks linear to the eye
 TICK = 0.02            # render granularity
 
