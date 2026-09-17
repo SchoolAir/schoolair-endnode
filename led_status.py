@@ -28,6 +28,7 @@ forever. See _check_watched_services().
 import math
 import os
 import subprocess
+import threading
 import time
 
 GPIO_LED = 24
@@ -43,9 +44,12 @@ _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 # report its own breakage. A real live-fire OTA rollback test found this
 # exact gap: a crashed main.py never even reaches the code that would
 # write "error" to LED_STATE_FILE, so a stale "ok" from before the crash
-# just sits there being rendered forever. Checked every HEALTH_CHECK_S
-# (not every render tick — these shell out to systemctl, too slow for a
-# 20ms loop). A single is-active snapshot isn't enough either — the same
+# just sits there being rendered forever. Runs in its own thread
+# (_health_monitor_loop), not the render loop — these shell out to
+# systemctl, measured at 1.365s combined real time on this hardware, and
+# that much blocking time every HEALTH_CHECK_INTERVAL_S in a 20ms render
+# loop was a very real, very visible freeze (found live, on a real
+# device). A single is-active snapshot isn't enough either — the same
 # rollback test showed Type=simple marks a service "active" the instant
 # its process is spawned, even if it crashes moments later — so this also
 # tracks each service's restart count between checks and treats an
@@ -123,6 +127,24 @@ def _check_watched_services(last_restarts: dict) -> bool:
     return unhealthy
 
 
+def _health_monitor_loop(shared: dict) -> None:
+    """Runs in its own daemon thread — deliberately NOT in the render loop.
+    Each of the 6 systemctl calls in _check_watched_services() spawns a
+    real process; measured at 1.365s combined, real, on this hardware. That
+    much blocking time inline in a 20ms render loop is a full-second-plus
+    freeze of the LED every ~5s, landing at a different phase of the
+    breathe/pulse cycle each time (5s and 8s share no common short cycle)
+    — which is exactly what "irregular steps, otherwise smooth" turned out
+    to be. The render loop only ever reads shared["unhealthy_until"], a
+    single float — cheap, and safe without an explicit lock under
+    CPython's GIL for a single plain assignment/read like this."""
+    last_restarts: dict = {}
+    while True:
+        if _check_watched_services(last_restarts):
+            shared["unhealthy_until"] = time.monotonic() + UNHEALTHY_HOLD_S
+        time.sleep(HEALTH_CHECK_INTERVAL_S)
+
+
 def main() -> None:
     import pigpio  # deferred: Pi-only, keeps this module importable/testable elsewhere
 
@@ -166,21 +188,16 @@ def main() -> None:
     peak = round(real_range * PEAK_FRAC)
     print(f"[led] pigpiod ready — GPIO{GPIO_LED}, real_range={real_range}, peak_duty={peak}")
 
+    health = {"unhealthy_until": 0.0}
+    threading.Thread(target=_health_monitor_loop, args=(health,), daemon=True).start()
+
     last_state = None
     t0 = time.monotonic()
-    last_restarts: dict = {}
-    next_health_check = 0.0
-    unhealthy_until = 0.0
 
     try:
         while True:
             now_mono = time.monotonic()
-            if now_mono >= next_health_check:
-                if _check_watched_services(last_restarts):
-                    unhealthy_until = now_mono + UNHEALTHY_HOLD_S
-                next_health_check = now_mono + HEALTH_CHECK_INTERVAL_S
-
-            state = "error" if now_mono < unhealthy_until else _read_state()
+            state = "error" if now_mono < health["unhealthy_until"] else _read_state()
             if state != last_state:
                 t0 = time.monotonic()  # restart the pattern cleanly at each state change
                 last_state = state
