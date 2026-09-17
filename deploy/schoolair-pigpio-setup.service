@@ -1,0 +1,25 @@
+[Unit]
+Description=SchoolAir: install pigpiod for indoor (flower actuator) units
+# Deliberately independent of schoolair-first-boot.service / ssh.service /
+# schoolair-launcher.service — must never block the AP from coming up on a
+# fresh clone. Only runs once network-online.target is genuinely met,
+# whenever that happens (could be well after registration, on a device
+# that starts out in AP mode with no network at all).
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/schoolair-unit-type
+ConditionPathExists=!/var/lib/schoolair-pigpio-installed
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '\
+    grep -q indoor /etc/schoolair-unit-type || exit 0; \
+    apt-get update -qq && apt-get install -y -qq pigpio python3-pigpio || exit 1; \
+    systemctl enable --now pigpiod; \
+    mkdir -p /var/lib && touch /var/lib/schoolair-pigpio-installed'
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
