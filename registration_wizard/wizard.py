@@ -73,6 +73,13 @@ wifi_sessions: dict = {}
 # still be there whenever it reconnects, not just flash by once.
 reg_state: dict = {"state": "idle", "message": "", "redirect": ""}
 
+# Set when Wi-Fi + token were both validated but the registration call itself
+# failed. The credentials are trustworthy at that point, so instead of wiping
+# them we keep the committed nmcli profile and let the next attempt skip
+# straight to Step 2 (see index()/run_registration) instead of re-asking for
+# Wi-Fi details.
+_last_good_wifi: dict = {}
+
 _last_activity: float = time.time()
 _connection_in_progress: bool = False  # guards single wlan0 against concurrent ops
 
@@ -458,6 +465,7 @@ input:disabled{background:#f3f4f6;color:#374151;cursor:default}
     <div class="badge">Wi-Fi: [[ssid]]</div>
   </div>
   <div class="notice-quote"><em>"[[quote]]"</em><span class="quote-author">— [[quote_author]]</span></div>
+  [[last_error_banner]]
   <div id="notice" class="notice notice-err" style="display:none"></div>
 
   <div class="sect">Registration Token</div>
@@ -509,7 +517,7 @@ input:disabled{background:#f3f4f6;color:#374151;cursor:default}
   <button type="button" id="reg-btn" class="btn btn-blue" onclick="doRegister()" disabled>
     Complete Registration
   </button>
-  <button type="button" class="btn btn-ghost" onclick="location.href='/'">← Start Over</button>
+  <button type="button" class="btn btn-ghost" onclick="location.href='/?reset=1'">← Start Over</button>
 </div>
 <script>
 const INIT = [[init_json]];
@@ -1188,6 +1196,16 @@ async def _list_saved_profiles() -> list:
     return profiles
 
 
+async def _commit_wifi_profile(ssid: str) -> str:
+    """Rename TEMP_PROFILE to a permanent, prioritized saved connection."""
+    committed = _profile_name(ssid)
+    await _cmd(f'nmcli con modify "{TEMP_PROFILE}" connection.id "{committed}"')
+    all_profiles = await _list_saved_profiles()
+    other_max = max((p["priority"] for p in all_profiles if p["name"] != committed), default=0)
+    await _cmd(f'nmcli con modify "{committed}" connection.autoconnect-priority {other_max + 1}')
+    return committed
+
+
 def _saved_networks_html(profiles: list, current_profile: str) -> str:
     if not profiles:
         return '<div class="sect">Saved Networks</div><p class="empty-msg">No saved networks.</p>'
@@ -1457,6 +1475,13 @@ async def run_registration(sess_tok: str) -> None:
     persistent explanation on Step 1's landing page (see index()) rather
     than a generic error the client device might not even be connected
     long enough to see live.
+
+    If sess["retry_profile"] is set, Wi-Fi was already proven good on a
+    previous attempt and only the registration call failed — see
+    _last_good_wifi. That profile is reused directly instead of redoing
+    the whole TEMP_PROFILE setup/connect dance, and it's never deleted on
+    a token/registration failure here (only a real connect failure means
+    the saved credentials themselves are bad).
     """
     global _connection_in_progress
     sess = wifi_sessions.get(sess_tok)
@@ -1465,38 +1490,57 @@ async def run_registration(sess_tok: str) -> None:
         _connection_in_progress = False
         return
 
-    ssid        = sess["ssid"]
-    password    = sess["password"]
-    token       = sess["token"]
-    site        = sess["site"]
-    asset       = sess["asset"]
-    environment = sess["environment"]
-    migrate     = sess["migrate"]
+    ssid          = sess["ssid"]
+    password      = sess["password"]
+    token         = sess["token"]
+    site          = sess["site"]
+    asset         = sess["asset"]
+    environment   = sess["environment"]
+    migrate       = sess["migrate"]
+    retry_profile = sess.get("retry_profile")
 
-    _set("connecting", f'Connecting to "{ssid}"…')
-    ok, msg = await _setup_client_profile(ssid, password)
-    if not ok:
-        _set("error", f'Could not set up "{ssid}": {msg}')
-        wifi_sessions.pop(sess_tok, None)
-        _connection_in_progress = False
-        await _revert_to_ap()
-        return
+    if retry_profile:
+        _set("connecting", f'Reconnecting to "{ssid}"…')
+        rc, _, err = await _cmd(f'nmcli con up "{retry_profile}"')
+        if rc != 0:
+            detail = err or "the saved network no longer works."
+            _set("error", f'Could not reconnect to "{ssid}": {detail} '
+                           "Please re-enter your Wi-Fi details.")
+            await _cmd(f'nmcli con delete "{retry_profile}" 2>/dev/null; true')
+            _last_good_wifi.clear()
+            wifi_sessions.pop(sess_tok, None)
+            _connection_in_progress = False
+            await _revert_to_ap()
+            return
+    else:
+        _set("connecting", f'Connecting to "{ssid}"…')
+        ok, msg = await _setup_client_profile(ssid, password)
+        if not ok:
+            _set("error", f'Could not set up "{ssid}": {msg}')
+            wifi_sessions.pop(sess_tok, None)
+            _connection_in_progress = False
+            await _revert_to_ap()
+            return
 
-    rc, _, err = await _cmd(f'nmcli con up "{TEMP_PROFILE}"')
-    if rc != 0:
-        detail = err or "check the network name and password."
-        _set("error", f'Could not connect to "{ssid}": {detail}')
-        await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
-        wifi_sessions.pop(sess_tok, None)
-        _connection_in_progress = False
-        await _revert_to_ap()
-        return
+        rc, _, err = await _cmd(f'nmcli con up "{TEMP_PROFILE}"')
+        if rc != 0:
+            detail = err or "check the network name and password."
+            _set("error", f'Could not connect to "{ssid}": {detail}')
+            await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
+            wifi_sessions.pop(sess_tok, None)
+            _connection_in_progress = False
+            await _revert_to_ap()
+            return
 
     _set("wifi_up", f'Joined "{ssid}". Waiting for IP address…')
     if not await _wait_for_ip(timeout=30):
         _set("error", f'Joined "{ssid}" but never received an IP address — '
                        "the network may have no DHCP, or the device is out of range.")
-        await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
+        if retry_profile:
+            await _cmd(f'nmcli con delete "{retry_profile}" 2>/dev/null; true')
+            _last_good_wifi.clear()
+        else:
+            await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
         wifi_sessions.pop(sess_tok, None)
         _connection_in_progress = False
         await _revert_to_ap()
@@ -1507,7 +1551,11 @@ async def run_registration(sess_tok: str) -> None:
     if not valid:
         _set("error", f"Wi-Fi connected, but the registration token was rejected: "
                        f"{_friendly_error(vmsg)}")
-        await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
+        if retry_profile:
+            await _cmd(f'nmcli con delete "{retry_profile}" 2>/dev/null; true')
+            _last_good_wifi.clear()
+        else:
+            await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
         wifi_sessions.pop(sess_tok, None)
         _connection_in_progress = False
         await _revert_to_ap()
@@ -1535,21 +1583,26 @@ async def run_registration(sess_tok: str) -> None:
         success, hb_msg, device_auth_token = await _post_heartbeat(payload)
 
     if not success:
+        # Wi-Fi and the token were both good — this is not a credentials
+        # problem, so keep the network instead of erasing it. Commit the
+        # profile permanently (if it isn't already) and remember it so the
+        # next attempt can skip straight back to Step 2.
+        committed = retry_profile or await _commit_wifi_profile(ssid)
+        _last_good_wifi.clear()
+        _last_good_wifi.update({"ssid": ssid, "profile": committed})
         _set("error", f"Wi-Fi and token were both fine, but device registration failed: "
-                       f"{_friendly_error(hb_msg)}")
+                       f"{_friendly_error(hb_msg)} Your Wi-Fi network was kept — "
+                       f"just re-enter the token, site, and asset name.")
         write_error(hb_msg)
-        await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
         wifi_sessions.pop(sess_tok, None)
         _connection_in_progress = False
         await _revert_to_ap()
         return
 
-    # Commit WiFi profile permanently with incremental priority.
-    committed = _profile_name(ssid)
-    await _cmd(f'nmcli con modify "{TEMP_PROFILE}" connection.id "{committed}"')
-    all_profiles = await _list_saved_profiles()
-    other_max = max((p["priority"] for p in all_profiles if p["name"] != committed), default=0)
-    await _cmd(f'nmcli con modify "{committed}" connection.autoconnect-priority {other_max + 1}')
+    # Commit WiFi profile permanently with incremental priority (unless a
+    # Step-2-only retry already had it committed).
+    committed = retry_profile or await _commit_wifi_profile(ssid)
+    _last_good_wifi.clear()
 
     if site != "LEGACY":
         write_status({
@@ -1777,6 +1830,20 @@ async def index(request):
     quote, author = _GANDALF_QUOTE
 
     if await _ap_is_active():
+        if request.args.get("reset") and _last_good_wifi.get("profile"):
+            # Explicit "Start Over" — the saved network is discarded too.
+            await _cmd(f'nmcli con delete "{_last_good_wifi["profile"]}" 2>/dev/null; true')
+            _last_good_wifi.clear()
+
+        if not request.args.get("reset") and _last_good_wifi.get("ssid"):
+            # Wi-Fi + token were already proven good on a previous attempt —
+            # only registration failed, so skip straight back to Step 2
+            # instead of asking for Wi-Fi details again.
+            sess_tok = _new_session("setup", ssid=_last_good_wifi["ssid"])
+            wifi_sessions[sess_tok]["step"] = 1
+            wifi_sessions[sess_tok]["retry_profile"] = _last_good_wifi["profile"]
+            return Response("", status_code=302, headers={"Location": f"/step2?s={sess_tok}"})
+
         # Setup mode: show Step 1 form. If the last attempt failed, surface
         # why — the client device dropped the AP mid-attempt to reach this
         # page again, so a live WebSocket message alone isn't reliable;
@@ -1868,14 +1935,22 @@ async def step2_page(request):
         "assetLocked": asset_locked,
     })
     quote, author = _GLINDA_QUOTE
+    last_error_banner = ""
+    if reg_state.get("state") == "error" and reg_state.get("message"):
+        last_error_banner = (
+            '<div class="notice notice-err">'
+            '<strong>Last attempt failed:</strong> '
+            f'{_html.escape(reg_state["message"])}</div>'
+        )
     body = _render(STEP2_HTML, raw={
-        "init_json":       init_json,
-        "session_token":   sess_tok,
-        "indoor_checked":  "checked" if env == "indoor"  else "",
-        "outdoor_checked": "checked" if env == "outdoor" else "",
-        "wizard_emoji":    _wizard_emoji("f"),
-        "quote":           quote,
-        "quote_author":    author,
+        "init_json":         init_json,
+        "session_token":     sess_tok,
+        "indoor_checked":    "checked" if env == "indoor"  else "",
+        "outdoor_checked":   "checked" if env == "outdoor" else "",
+        "wizard_emoji":      _wizard_emoji("f"),
+        "quote":             quote,
+        "quote_author":      author,
+        "last_error_banner": last_error_banner,
     }, ssid=sess.get("ssid", ""))
     return _html_response(body)
 
