@@ -1,0 +1,6 @@
+[Unit]
+Description=SchoolAir: check whether a pending OTA update was confirmed working
+
+[Service]
+Type=oneshot
+ExecStart=/home/admin/schoolair_rollback.sh --check

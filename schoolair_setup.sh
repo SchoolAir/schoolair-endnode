@@ -75,6 +75,86 @@ warn()  { echo -e "  ${YELLOW}⚠${NC}   $*"; }
 skip()  { echo -e "  –   $* (skipped)"; }
 die()   { echo -e "${RED}${BOLD}FATAL: $*${NC}"; exit 1; }
 
+# ── Rollback backup store ─────────────────────────────────────────────────────
+# Every file/directory this script overwrites during an --update run is
+# backed up here first (mirrored by absolute path, listed in the manifest)
+# so a broken update can be restored offline — no network, no GitHub — even
+# if the update itself broke networking. install_with_backup() /
+# install_dir_with_backup() are the ONLY sanctioned way to replace a path
+# the rollback mechanism protects; tests/test_ota_backup_coverage.py fails
+# if a direct cp/install to a protected path is ever added outside them.
+BACKUP_ROOT="/var/backups/schoolair-update"
+BACKUP_MANIFEST="${BACKUP_ROOT}.manifest"
+
+install_with_backup() {
+    # $1 = source file, $2 = destination path (file, not directory)
+    local src="$1" dst="$2"
+    if [ -e "$dst" ]; then
+        mkdir -p "$(dirname "${BACKUP_ROOT}${dst}")"
+        cp -a "$dst" "${BACKUP_ROOT}${dst}"
+        echo "$dst" >> "$BACKUP_MANIFEST"
+    fi
+    cp "$src" "$dst"
+}
+
+install_dir_with_backup() {
+    # $1 = source directory (its *contents* are copied in), $2 = destination directory
+    local src="$1" dst="$2"
+    if [ -e "$dst" ]; then
+        rm -rf "${BACKUP_ROOT}${dst}"
+        mkdir -p "$(dirname "${BACKUP_ROOT}${dst}")"
+        cp -a "$dst" "${BACKUP_ROOT}${dst}"
+        echo "$dst" >> "$BACKUP_MANIFEST"
+    fi
+    mkdir -p "$dst"
+    cp -r "${src}/." "${dst}/"
+}
+
+restore_from_backup() {
+    # Inline fallback used only if ~/schoolair_rollback.sh doesn't exist yet
+    # (the very first rollout of this mechanism) — same logic as that
+    # script's own restore_from_backup(), kept duplicated intentionally so
+    # neither copy depends on the other existing.
+    if [ ! -s "$BACKUP_MANIFEST" ]; then
+        echo "No backup manifest at ${BACKUP_MANIFEST} — nothing to restore."
+        return 0
+    fi
+    local real_path
+    while IFS= read -r real_path; do
+        [ -n "$real_path" ] || continue
+        if [ -e "${BACKUP_ROOT}${real_path}" ]; then
+            echo "Restoring ${real_path}"
+            rm -rf "$real_path"
+            cp -a "${BACKUP_ROOT}${real_path}" "$real_path"
+        else
+            echo "WARNING: no backup found for ${real_path} — leaving as-is"
+        fi
+    done < "$BACKUP_MANIFEST"
+}
+
+_rollback_on_failure() {
+    local rc=$?
+    if [ "$rc" -ne 0 ] && [ "$MODE" == "--update" ]; then
+        echo -e "${RED}${BOLD}Update failed (exit ${rc}) — restoring from backup…${NC}"
+        if [ -x "${ADMIN_HOME}/schoolair_rollback.sh" ]; then
+            "${ADMIN_HOME}/schoolair_rollback.sh" --restore-now
+        else
+            restore_from_backup
+            systemctl daemon-reload 2>/dev/null || true
+            for svc in sen6x.service schoolair.service schoolair-netwatch.service schoolair-led.service; do
+                systemctl restart "$svc" 2>/dev/null || true
+            done
+        fi
+        echo -e "${RED}${BOLD}Rolled back to the previous working version.${NC}"
+    fi
+}
+trap _rollback_on_failure EXIT
+
+if [[ "${MODE:-}" == "--update" ]]; then
+    mkdir -p "$BACKUP_ROOT" "$(dirname "$BACKUP_MANIFEST")"
+    : > "$BACKUP_MANIFEST"   # fresh manifest for this run — see install_*_with_backup()
+fi
+
 # ── 0. Pre-flight ──────────────────────────────────────────────────────────────
 step "0 / Pre-flight"
 [[ $EUID -eq 0 ]] \
@@ -173,13 +253,16 @@ git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR" \
 ok "Cloned from ${REPO_URL}"
 
 mkdir -p "$SCHOOLAIR_DIR"
+_PRE_UPDATE_VERSION=""
+[ -f "${SCHOOLAIR_DIR}/jobs/ingest.py" ] \
+    && _PRE_UPDATE_VERSION="$(grep -m1 '^VERSION' "${SCHOOLAIR_DIR}/jobs/ingest.py" | sed -nE 's/.*"([^"]+)".*/\1/p')"
 if [ -f "${SCHOOLAIR_DIR}/.env" ]; then
     cp "${SCHOOLAIR_DIR}/.env" /tmp/schoolair-env.bak
-    cp -r "${REPO_DIR}/." "${SCHOOLAIR_DIR}/"
+    install_dir_with_backup "$REPO_DIR" "$SCHOOLAIR_DIR"
     mv /tmp/schoolair-env.bak "${SCHOOLAIR_DIR}/.env"
     ok "App deployed  (existing .env preserved)"
 else
-    cp -r "${REPO_DIR}/." "${SCHOOLAIR_DIR}/"
+    install_dir_with_backup "$REPO_DIR" "$SCHOOLAIR_DIR"
     cp "${SCHOOLAIR_DIR}/.env.example" "${SCHOOLAIR_DIR}/.env"
     ok "App deployed + .env created from .env.example"
 fi
@@ -202,9 +285,9 @@ ok "microdot, simple-websocket, httpx, python-dotenv, questionary, netifaces ins
 
 # ── 5. Device utility scripts ─────────────────────────────────────────────────
 step "5 / Device utility scripts  →  ${ADMIN_HOME}/"
-for _f in first_boot.sh set_hostname.sh version_check.py add_wifi.sh; do
+for _f in first_boot.sh set_hostname.sh version_check.py add_wifi.sh schoolair_rollback.sh; do
     if [ -f "${SCHOOLAIR_DIR}/${_f}" ]; then
-        cp "${SCHOOLAIR_DIR}/${_f}" "${ADMIN_HOME}/${_f}"
+        install_with_backup "${SCHOOLAIR_DIR}/${_f}" "${ADMIN_HOME}/${_f}"
         chmod +x "${ADMIN_HOME}/${_f}"
         chown "${ADMIN_USER}:${ADMIN_USER}" "${ADMIN_HOME}/${_f}"
         ok "${_f}  →  ${ADMIN_HOME}/"
@@ -216,7 +299,7 @@ ln -sf "${ADMIN_HOME}/version_check.py" /usr/local/bin/schoolair
 ok "schoolair command  →  /usr/local/bin/schoolair"
 
 if [ -f "${SCHOOLAIR_DIR}/schoolair-update" ]; then
-    cp "${SCHOOLAIR_DIR}/schoolair-update" /usr/local/bin/schoolair-update
+    install_with_backup "${SCHOOLAIR_DIR}/schoolair-update" /usr/local/bin/schoolair-update
     chmod 755 /usr/local/bin/schoolair-update
     chown root:root /usr/local/bin/schoolair-update
     ok "schoolair-update  →  /usr/local/bin/  (OTA entry point, root-owned)"
@@ -249,8 +332,8 @@ else
     systemctl stop sen6x 2>/dev/null || true
     if make -C "${SCHOOLAIR_DIR}/i2c/sen6x" -f Makefile.daemon; then
         mkdir -p "${I2C_DIR}/sen6x"
-        cp "${SCHOOLAIR_DIR}/i2c/sen6x/sen6x_d"    "${I2C_DIR}/sen6x/sen6x_d"
-        cp "${SCHOOLAIR_DIR}/i2c/sen6x/sen6x_read"  "${I2C_DIR}/sen6x/sen6x_read"
+        install_with_backup "${SCHOOLAIR_DIR}/i2c/sen6x/sen6x_d"   "${I2C_DIR}/sen6x/sen6x_d"
+        install_with_backup "${SCHOOLAIR_DIR}/i2c/sen6x/sen6x_read" "${I2C_DIR}/sen6x/sen6x_read"
         chmod +x "${I2C_DIR}/sen6x/sen6x_d" "${I2C_DIR}/sen6x/sen6x_read"
         chown -R "${ADMIN_USER}:${ADMIN_USER}" "$I2C_DIR"
         ok "sen6x binaries compiled  →  ${I2C_DIR}/sen6x/"
@@ -422,9 +505,9 @@ ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update wit
 step "15 / systemd services"
 DEPLOY_DIR="${SCHOOLAIR_DIR}/deploy"
 
-for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-pigpio-setup.service schoolair-led.service; do
+for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-pigpio-setup.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer; do
     if [ -f "${DEPLOY_DIR}/${svc}" ]; then
-        cp "${DEPLOY_DIR}/${svc}" /etc/systemd/system/
+        install_with_backup "${DEPLOY_DIR}/${svc}" "/etc/systemd/system/${svc}"
         ok "${svc} installed"
     else
         warn "${svc} not found in deploy/ — skipped"
@@ -432,7 +515,7 @@ for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-la
 done
 
 if [ -f "${DEPLOY_DIR}/schoolair-first-boot.service" ]; then
-    cp "${DEPLOY_DIR}/schoolair-first-boot.service" /etc/systemd/system/
+    install_with_backup "${DEPLOY_DIR}/schoolair-first-boot.service" /etc/systemd/system/schoolair-first-boot.service
     ok "schoolair-first-boot.service installed"
 fi
 
@@ -443,6 +526,8 @@ systemctl enable sen6x.service
 systemctl enable schoolair-first-boot.service 2>/dev/null || true
 systemctl enable schoolair-pigpio-setup.service 2>/dev/null || true
 systemctl enable schoolair-led.service 2>/dev/null || true
+systemctl enable schoolair-update-watchdog.timer 2>/dev/null || true
+systemctl start  schoolair-update-watchdog.timer 2>/dev/null || true
 ok "Services enabled"
 
 if [[ "$MODE" == "--update" ]]; then
@@ -477,6 +562,25 @@ if [[ "$MODE" == "--update" ]]; then
     # led_status.py code on devices where it was already running.
     systemctl restart schoolair-led.service      || warn "schoolair-led.service restart failed"
     ok "Services restarted with updated code"
+
+    # Arm the rollback watchdog: if a real successful upload doesn't confirm
+    # this version works within the deadline, schoolair-update-watchdog.timer
+    # restores the pre-update backup automatically. jobs/ingest.py clears this
+    # file itself the moment an upload actually succeeds.
+    _NEW_VERSION="$(grep -m1 '^VERSION' "${SCHOOLAIR_DIR}/jobs/ingest.py" | sed -nE 's/.*"([^"]+)".*/\1/p')"
+    if [ -n "$_PRE_UPDATE_VERSION" ] && [ "$_NEW_VERSION" != "$_PRE_UPDATE_VERSION" ]; then
+        mkdir -p /var/lib
+        python3 -c "
+import json, time
+json.dump(
+    {'from_version': '${_PRE_UPDATE_VERSION}', 'to_version': '${_NEW_VERSION}', 'deadline': time.time() + 2400},
+    open('/var/lib/schoolair-update-pending.json', 'w'),
+)
+"
+        ok "Rollback watchdog armed — v${_PRE_UPDATE_VERSION} → v${_NEW_VERSION} must be confirmed by a successful upload within 40 min or it auto-reverts"
+    else
+        ok "Version unchanged (v${_NEW_VERSION}) — no rollback watchdog needed"
+    fi
 fi
 
 # ── 16. Verification ───────────────────────────────────────────────────────────
@@ -507,6 +611,8 @@ chk "schoolair-launcher enabled"          systemctl is-enabled schoolair-launche
 chk "schoolair.service enabled"           systemctl is-enabled schoolair.service
 chk "sen6x.service enabled"              systemctl is-enabled sen6x.service
 chk "schoolair-first-boot enabled"        systemctl is-enabled schoolair-first-boot.service
+chk "schoolair_rollback.sh executable"    test -x "${ADMIN_HOME}/schoolair_rollback.sh"
+chk "update-watchdog timer enabled"       systemctl is-enabled schoolair-update-watchdog.timer
 chk "nginx proxies to ${TELEMETRY_PORT}"  grep -q "${TELEMETRY_PORT}" /etc/nginx/sites-available/default
 if [[ "$MODE" == "setup" ]]; then
     chk "nginx disabled (correct pre-reg)"   bash -c "! systemctl is-enabled nginx >/dev/null 2>&1"
