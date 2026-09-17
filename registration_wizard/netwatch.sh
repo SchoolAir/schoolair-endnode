@@ -26,6 +26,10 @@ TELEMETRY_SERVICE="schoolair"
 # without this check we'd race in and stop the wizard before it finishes
 # writing the token to disk.
 WIZARD_BUSY_FILE="/run/schoolair-wizard-busy"
+# Status-LED signal (led_status.py). We only ever write "ap" here — wizard.py
+# owns "thinking"/"error"/"ok" for the states it actually knows about, and
+# jobs/ingest.py owns "ok"/"no_sensor"/"error" during normal operation.
+LED_STATE_FILE="/run/schoolair-led-state"
 
 POLL_INTERVAL="${NETWATCH_POLL:-30}"
 GRACE_SECS="${NETWATCH_GRACE:-120}"
@@ -69,6 +73,7 @@ _remove_captive_portal() {
 
 bring_up_ap() {
     log "Bringing up AP '${AP_CONN}'"
+    echo ap > "$LED_STATE_FILE" 2>/dev/null || true
     if nmcli con up "$AP_CONN" 2>/dev/null; then
         log "AP is up"
     else
@@ -148,6 +153,7 @@ last_reconnect=0
 if ap_is_up; then
     state="ap"
     last_reconnect=$(date +%s)
+    echo ap > "$LED_STATE_FILE" 2>/dev/null || true
     log "Initial state: ap (AP already up from launcher)"
 elif has_uplink; then
     log "Initial state: online"

@@ -1463,10 +1463,33 @@ async def _post_heartbeat(payload: dict) -> tuple[bool, str, str]:
 
 # ── State helper ──────────────────────────────────────────────────────────────
 
+LED_STATE_FILE = "/run/schoolair-led-state"
+
+# reg_state values -> status-LED pattern words (led_status.py). Anything not
+# listed here (e.g. "idle") is left alone — netwatch.sh owns "ap" for the
+# AP-idle/awaiting-setup case, since it's the thing that actually knows when
+# the AP comes up.
+_LED_STATE_MAP = {
+    "connecting":  "thinking",
+    "wifi_up":     "thinking",
+    "validating":  "thinking",
+    "heartbeat":   "thinking",
+    "error":       "error",
+    "success":     "ok",
+}
+
+
 def _set(state: str, message: str, redirect: str = "") -> None:
     reg_state["state"]    = state
     reg_state["message"]  = message
     reg_state["redirect"] = redirect
+    led_state = _LED_STATE_MAP.get(state)
+    if led_state:
+        try:
+            with open(LED_STATE_FILE, "w") as f:
+                f.write(led_state)
+        except OSError:
+            pass
 
 
 # ── Network helpers (AP detection) ────────────────────────────────────────────

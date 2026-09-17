@@ -34,6 +34,20 @@ import state
 
 load_dotenv()
 
+LED_STATE_FILE = "/run/schoolair-led-state"
+
+
+def _set_led_state(state: str) -> None:
+    """Best-effort status-LED signal — led_status.py renders the pattern;
+    this just writes the current word. Never let a missing/unwritable
+    state file (e.g. outdoor units, or led_status.py not started yet)
+    affect real ingest behavior."""
+    try:
+        with open(LED_STATE_FILE, "w") as f:
+            f.write(state)
+    except OSError:
+        pass
+
 VERSION = "2.3.1"
 
 
@@ -836,6 +850,7 @@ async def _run_read(settings: dict, active_sensors: list):
         data = read_sensor()
     except RuntimeError as e:
         print(f"Sensor read failed: {e}")
+        _set_led_state("no_sensor")
         return
 
     for sensor in active_sensors:
@@ -991,6 +1006,7 @@ async def _upload_loop() -> None:
         if not token:
             queue.enqueue(entry["data"], entry["recorded_at"])
             print(f"[upload] no token — reading stored in SQLite")
+            _set_led_state("error")
             continue
 
         backlog_count = queue.count_pending()
@@ -1008,6 +1024,7 @@ async def _upload_loop() -> None:
         asyncio.create_task(_mirror_batch([_format_reading(entry)]))
         await _handle_response(response)
         print(f"[upload] live reading sent (backlog: {backlog_count})")
+        _set_led_state("ok")
 
         if backlog_count > 0 and _credit_bytes > 0:
             await _drain_backlog()
