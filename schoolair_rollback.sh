@@ -28,9 +28,11 @@
 
 set -uo pipefail   # not -e: a failed restore of one path shouldn't abort the rest
 
-BACKUP_ROOT="/var/backups/schoolair-update"
-BACKUP_MANIFEST="${BACKUP_ROOT}.manifest"
-PENDING_FILE="/var/lib/schoolair-update-pending.json"
+# Overridable via env for tests/test_ota_rollback.py — production always
+# uses the defaults, nothing here changes real behavior on a device.
+BACKUP_ROOT="${SCHOOLAIR_BACKUP_ROOT:-/var/backups/schoolair-update}"
+BACKUP_MANIFEST="${SCHOOLAIR_BACKUP_MANIFEST:-${BACKUP_ROOT}.manifest}"
+PENDING_FILE="${SCHOOLAIR_PENDING_FILE:-/var/lib/schoolair-update-pending.json}"
 LOG_TAG="[schoolair-rollback]"
 
 log() { echo "${LOG_TAG} $*"; }
