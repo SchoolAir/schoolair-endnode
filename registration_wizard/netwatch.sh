@@ -20,6 +20,12 @@ set -euo pipefail
 AP_CONN="SchoolAir_AP"
 WIZARD_SERVICE="schoolair-wizard"
 TELEMETRY_SERVICE="schoolair"
+# Held by the wizard's run_registration() for the whole connect→register
+# attempt (see wizard.py). Wi-Fi now stays up continuously through token
+# validation and registration, so has_uplink() can go true mid-attempt —
+# without this check we'd race in and stop the wizard before it finishes
+# writing the token to disk.
+WIZARD_BUSY_FILE="/run/schoolair-wizard-busy"
 
 POLL_INTERVAL="${NETWATCH_POLL:-30}"
 GRACE_SECS="${NETWATCH_GRACE:-120}"
@@ -177,12 +183,19 @@ while true; do
 
         ap)
             if has_uplink; then
-                # Uplink appeared — either the user configured WiFi via wizard,
-                # or a previously-known network came back on its own.
-                log "Uplink detected while in AP mode — closing AP"
-                take_down_ap
-                systemctl restart "$TELEMETRY_SERVICE" 2>/dev/null || true
-                state="online"
+                if [ -f "$WIZARD_BUSY_FILE" ]; then
+                    # The wizard brought this uplink up itself and is still
+                    # mid-registration — let it finish and do its own cleanup
+                    # (success path or _revert_to_ap()) rather than racing in.
+                    log "Uplink detected but wizard is mid-registration — deferring"
+                else
+                    # Uplink appeared — either the user configured WiFi via
+                    # wizard, or a previously-known network came back on its own.
+                    log "Uplink detected while in AP mode — closing AP"
+                    take_down_ap
+                    systemctl restart "$TELEMETRY_SERVICE" 2>/dev/null || true
+                    state="online"
+                fi
             elif [ $(( $(date +%s) - last_reconnect )) -ge "$RECONNECT_INTERVAL" ]; then
                 if try_reconnect; then
                     # AP already cleaned up inside try_reconnect
