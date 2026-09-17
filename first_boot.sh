@@ -27,6 +27,18 @@ echo "[schoolair-first-boot] Hostname is now: ${NEW_HN}"
 # output rather than duplicating the I2C probe. Golden-image clones inherit
 # I2C already enabled and sen6x_read already built from the source device,
 # so this works on true first boot without waiting on a prior reboot.
+#
+# Only does fast, offline-safe work (I2C probe + a local cmdline.txt edit).
+# schoolair-first-boot.service runs *before* schoolair-launcher.service (the
+# thing that brings up the AP hotspot) — there is deliberately no
+# network-dependent work here, since anything that blocks on connectivity
+# at this point would delay the AP from ever appearing on a truly fresh
+# clone (no WiFi creds exist yet, and the AP isn't up yet either — nothing
+# provides a network at this stage). Installing pigpiod needs the network,
+# so that's handled by schoolair-pigpio-setup.service instead, gated on the
+# marker file this writes and on network-online.target actually being met
+# — whenever that happens, registration-time or later, without blocking
+# anything else in the boot sequence.
 configure_unit_type() {
     local sen6x_read="/home/admin/i2c/sen6x/sen6x_read"
     if [ ! -x "$sen6x_read" ]; then
@@ -49,25 +61,7 @@ configure_unit_type() {
             sed -i 's/console=serial0,[0-9]* //' /boot/firmware/cmdline.txt
             echo "[schoolair-first-boot] Serial console disabled (GPIO14 freed for flower actuator)"
         fi
-
-        # pigpiod needs the network, which may not be up yet this early in
-        # boot — retry apt-get update for up to a minute before giving up.
-        echo "[schoolair-first-boot] Waiting for network to install pigpiod…"
-        local attempt=0
-        until apt-get update -qq 2>/dev/null; do
-            attempt=$((attempt + 1))
-            if [ "$attempt" -ge 12 ]; then
-                echo "[schoolair-first-boot] WARNING: no network after 60s — pigpiod not installed, install manually later"
-                return
-            fi
-            sleep 5
-        done
-        if apt-get install -y -qq pigpio python3-pigpio; then
-            systemctl enable --now pigpiod
-            echo "[schoolair-first-boot] pigpiod installed and running"
-        else
-            echo "[schoolair-first-boot] WARNING: pigpiod install failed"
-        fi
+        echo "[schoolair-first-boot] pigpiod install deferred to schoolair-pigpio-setup.service (needs network)"
     elif echo "$reading" | grep -q '"voc"'; then
         echo "[schoolair-first-boot] SEN65 detected — outdoor unit, no actuator"
         echo "outdoor" > /etc/schoolair-unit-type
