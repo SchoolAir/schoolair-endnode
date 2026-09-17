@@ -108,6 +108,18 @@ def _render(template: str, raw: dict = None, **kwargs) -> str:
     return template
 
 
+def _token_field_html(heading: str = "Registration Token", oninput: str = "") -> str:
+    """The registration-token input, shared across Step 0/1/2 forms so the
+    markup, id, and placeholder text can't drift out of sync between them."""
+    on_attr = f' oninput="{oninput}"' if oninput else ""
+    return (
+        f'<div class="sect">{_html.escape(heading)}</div>\n'
+        '  <label for="token">Token</label>\n'
+        '  <input type="text" id="token" placeholder="8-character code, e.g. aB3xQr7Z" '
+        f'autocomplete="on"{on_attr}>'
+    )
+
+
 def _html_response(body: str, status: int = 200) -> Response:
     return Response(body, status_code=status,
                     headers={"Content-Type": "text/html; charset=utf-8"})
@@ -468,9 +480,7 @@ input:disabled{background:#f3f4f6;color:#374151;cursor:default}
   [[last_error_banner]]
   <div id="notice" class="notice notice-err" style="display:none"></div>
 
-  <div class="sect">Registration Token</div>
-  <label for="token">Token</label>
-  <input type="text" id="token" placeholder="8-character code, e.g. aB3xQr7Z" autocomplete="on" oninput="update()">
+  [[token_field]]
 
   <div class="sect">Location</div>
   <label for="site">Site Name</label>
@@ -719,9 +729,7 @@ input:focus{border-color:#1a56db}
   [[site_row]]
   [[asset_row]]
 
-  <div class="sect">Enter Token to Configure</div>
-  <label for="token">Registration Token</label>
-  <input type="text" id="token" placeholder="8-character code, e.g. aB3xQr7Z" autocomplete="on">
+  [[token_field]]
   <div id="notice" class="notice notice-err" style="display:none"></div>
   <button type="button" class="btn" onclick="doAuth()">Verify →</button>
 </div>
@@ -1879,9 +1887,10 @@ async def index(request):
         site_row = asset_row = ""
 
     body = _render(MANAGEMENT_AUTH_HTML, raw={
-        "reg_badge":  badge,
-        "site_row":   site_row,
-        "asset_row":  asset_row,
+        "reg_badge":    badge,
+        "site_row":     site_row,
+        "asset_row":    asset_row,
+        "token_field":  _token_field_html(heading="Enter Token to Configure"),
     }, hostname=hostname)
     return _html_response(body)
 
@@ -1951,6 +1960,7 @@ async def step2_page(request):
         "quote":             quote,
         "quote_author":      author,
         "last_error_banner": last_error_banner,
+        "token_field":       _token_field_html(oninput="update()"),
     }, ssid=sess.get("ssid", ""))
     return _html_response(body)
 
