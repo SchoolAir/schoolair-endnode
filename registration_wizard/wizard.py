@@ -237,6 +237,7 @@ LANDING_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
 <title>SchoolAir Device</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -280,6 +281,7 @@ STEP1_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
 <title>SchoolAir Setup – Step 1</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -415,6 +417,7 @@ STEP2_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
 <title>SchoolAir Setup – Step 2</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -597,6 +600,7 @@ CONNECTING_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
 <title>SchoolAir – Connecting</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -692,6 +696,7 @@ MANAGEMENT_AUTH_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
 <title>SchoolAir Device</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -768,6 +773,7 @@ MANAGEMENT_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
 <title>SchoolAir – Device Configuration</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}

@@ -579,8 +579,14 @@ async def _try_post(
             )
         if res.status_code == 401:
             print("Ingest failed: auth token rejected.")
+            _maybe_trigger_update_from_error(res)
             return None
-        res.raise_for_status()
+        try:
+            res.raise_for_status()
+        except httpx.HTTPStatusError:
+            print(f"Ingest failed: server returned {res.status_code}")
+            _maybe_trigger_update_from_error(res)
+            return None
 
         if pending_acks:
             wifi_state["pending_acks"] = []
@@ -593,6 +599,17 @@ async def _try_post(
     except Exception as e:
         print(f"Ingest POST error: {e}")
         return None
+
+
+def _maybe_trigger_update_from_error(res: "httpx.Response") -> None:
+    """A rejected/error response can't go through _handle_response (the caller
+    treats it as a failed post and must not touch criteria/schedule/wifi_push
+    from it) but may still carry min_version — e.g. a revoked token shouldn't
+    also hide a mandatory update. Body may not be JSON at all; that's fine."""
+    try:
+        _maybe_trigger_update(res.json())
+    except Exception:
+        pass
 
 
 async def _mirror_batch(readings: list[dict]) -> None:
@@ -778,13 +795,21 @@ async def _wait_for_boundary(seconds: float) -> None:
         pass
 
 
+def _maybe_trigger_update(response: dict) -> None:
+    """Check a server response's min_version, however it got here — a normal
+    successful ingest, or a rejected/error response. A device with a revoked
+    token or one hitting rate limits should still be able to learn it's
+    outdated and self-heal, not just a device with a healthy token."""
+    min_ver = response.get("min_version")
+    if min_ver and _version_is_older_than(min_ver):
+        asyncio.create_task(_trigger_update())
+
+
 async def _handle_response(response: dict) -> None:
     """Process server directives from any successful ingest response."""
     if response.get("criteria"):
         save_criteria(response["criteria"])
-    min_ver = response.get("min_version")
-    if min_ver and _version_is_older_than(min_ver):
-        asyncio.create_task(_trigger_update())
+    _maybe_trigger_update(response)
     schedule = response.get("schedule")
     if schedule and "active_start" in schedule and "active_end" in schedule:
         new_window = {"start": schedule["active_start"], "end": schedule["active_end"]}

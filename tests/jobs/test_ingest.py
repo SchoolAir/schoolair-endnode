@@ -400,6 +400,74 @@ async def test_try_post_returns_none_on_auth_rejection(monkeypatch):
     assert result is None
 
 
+async def test_try_post_schedules_update_from_401_body(monkeypatch):
+    """A revoked/invalid token still returns None, but a min_version in that
+    401 body must still be able to trigger an update — a device that lost
+    auth shouldn't also be blind to a mandatory update fixing it."""
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://server/ingest")
+    mock_client = _mock_client({"error": "Invalid or expired token", "min_version": "99.0.0"}, status=401)
+
+    tasks = []
+    with patch("httpx.AsyncClient", return_value=mock_client), \
+         patch("asyncio.create_task", side_effect=tasks.append):
+        result = await _try_post([{"recorded_at": "t", "data": {}}], 0)
+
+    assert result is None
+    assert len(tasks) >= 1
+
+
+async def test_try_post_schedules_update_from_generic_error_body(monkeypatch):
+    """Same as above, but for a non-401 error (e.g. 429 rate limit, 500) —
+    any rejected response can carry min_version, not just success ones."""
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://server/ingest")
+    mock_resp = MagicMock()
+    mock_resp.status_code = 429
+    mock_resp.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("429", request=MagicMock(), response=MagicMock())
+    )
+    mock_resp.json.return_value = {"error": "Burst limit exceeded for this asset.", "min_version": "99.0.0"}
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    tasks = []
+    with patch("httpx.AsyncClient", return_value=mock_client), \
+         patch("asyncio.create_task", side_effect=tasks.append):
+        result = await _try_post([{"recorded_at": "t", "data": {}}], 0)
+
+    assert result is None
+    assert len(tasks) >= 1
+
+
+async def test_try_post_error_body_no_update_when_min_version_met(monkeypatch):
+    """An error response with min_version at/below the running version must
+    not trigger an update — same rule as the success path."""
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://server/ingest")
+    mock_client = _mock_client({"error": "Invalid or expired token", "min_version": "1.0.0"}, status=401)
+
+    tasks = []
+    with patch("httpx.AsyncClient", return_value=mock_client), \
+         patch("asyncio.create_task", side_effect=tasks.append):
+        result = await _try_post([{"recorded_at": "t", "data": {}}], 0)
+
+    assert result is None
+    assert len(tasks) == 0
+
+
+async def test_try_post_error_body_non_json_does_not_raise(monkeypatch):
+    """A malformed/non-JSON error body (e.g. an upstream proxy's HTML error
+    page) must not crash the caller — it's just silently not actionable."""
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://server/ingest")
+    mock_client = _mock_client({}, status=401)
+    mock_client.post.return_value.json.side_effect = ValueError("not JSON")
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        result = await _try_post([{"recorded_at": "t", "data": {}}], 0)
+
+    assert result is None
+
+
 async def test_try_post_includes_backlog_metadata_when_backlog_nonzero(monkeypatch):
     """Request body carries backlog_readings and bytes_per_reading when backlog > 0."""
     monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://server/ingest")
