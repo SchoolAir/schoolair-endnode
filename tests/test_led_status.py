@@ -9,7 +9,11 @@ the module docstring for the real live-fire test that found this gap.
 subprocess.run is mocked throughout — no real systemctl/systemd involved.
 """
 
+import signal
+import sys
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import led_status
 
@@ -87,3 +91,62 @@ def test_second_call_with_unchanged_restarts_stays_healthy():
     )):
         unhealthy = led_status._check_watched_services(last_restarts)
     assert unhealthy is False
+
+
+# ── SIGTERM handling ────────────────────────────────────────────────────────
+#
+# Python's default SIGTERM disposition kills the process outright and never
+# runs a `finally` block — found live: "systemctl stop"/"restart" left the
+# LED frozen at its last duty cycle, looking "on" for a daemon that was
+# actually dead. main() now converts SIGTERM into SystemExit so its finally
+# block (which zeroes the duty cycle) still runs.
+
+def test_on_sigterm_raises_systemexit():
+    """The registered handler itself: SIGTERM -> SystemExit, not a raw kill."""
+    with pytest.raises(SystemExit):
+        led_status._on_sigterm(signal.SIGTERM, None)
+
+
+def test_main_turns_led_off_on_sigterm(monkeypatch, tmp_path):
+    """End-to-end: simulate SIGTERM arriving mid-loop and confirm the finally
+    block's cleanup — set_PWM_dutycycle(GPIO_LED, 0) then pi.stop() — actually
+    runs, rather than the process just dying with the LED stuck lit."""
+    fake_pi = MagicMock()
+    fake_pi.connected = True
+    fake_pi.get_PWM_real_range.return_value = 2000
+
+    fake_pigpio = MagicMock()
+    fake_pigpio.pi.return_value = fake_pi
+
+    unit_type_file = tmp_path / "schoolair-unit-type"
+    unit_type_file.write_text("indoor")
+    led_state_file = tmp_path / "schoolair-led-state"
+
+    monkeypatch.setattr(led_status, "LED_STATE_FILE", str(led_state_file))
+    monkeypatch.setattr(led_status, "_read_state", lambda: "ok")
+    monkeypatch.setattr(led_status, "_health_monitor_loop", lambda health: None)
+    monkeypatch.setattr(__import__("threading"), "Thread", lambda *a, **k: MagicMock())
+
+    real_open = open
+    def fake_open(path, *args, **kwargs):
+        if path == "/etc/schoolair-unit-type":
+            path = str(unit_type_file)
+        return real_open(path, *args, **kwargs)
+
+    registered_handler = {}
+    def fake_signal(signum, handler):
+        registered_handler[signum] = handler
+
+    def fake_sleep(seconds):
+        # Simulate the signal arriving during the loop's sleep.
+        registered_handler[signal.SIGTERM](signal.SIGTERM, None)
+
+    with patch.dict(sys.modules, {"pigpio": fake_pigpio}), \
+         patch("builtins.open", side_effect=fake_open), \
+         patch("signal.signal", side_effect=fake_signal), \
+         patch("time.sleep", side_effect=fake_sleep):
+        with pytest.raises(SystemExit):
+            led_status.main()
+
+    fake_pi.set_PWM_dutycycle.assert_called_with(led_status.GPIO_LED, 0)
+    fake_pi.stop.assert_called_once()
