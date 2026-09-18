@@ -612,6 +612,33 @@ def _maybe_trigger_update_from_error(res: "httpx.Response") -> None:
         pass
 
 
+async def _startup_connectivity_ping() -> None:
+    """Fired once at boot, in the background — confirms the server is
+    reachable and resolves the LED out of "thinking" (its default state on
+    startup) immediately, instead of leaving it there until the first real
+    sensor read/upload succeeds. That first upload can be up to
+    READ_IDLE_SECONDS away outside the active window, which reads as
+    "something's wrong" the whole time even though nothing is. GET
+    /aqc/v1/validate is a deliberately cheap, no-DB-write endpoint — this
+    isn't meant to replace the real upload, just prove connectivity exists.
+    Failure leaves the LED at "thinking"; the first real read/upload
+    (or the next boot) will resolve it from there — no retry loop here."""
+    token = os.getenv("NEW_AUTH_TOKEN", "").strip()
+    if not token or not _PRIMARY_SERVER_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            res = await client.get(f"{_PRIMARY_SERVER_URL}/aqc/v1/validate", headers=_auth_headers())
+        if res.is_success:
+            _set_led_state("ok")
+            print("[startup] connectivity confirmed")
+            _maybe_trigger_update(res.json())
+        else:
+            _maybe_trigger_update_from_error(res)
+    except Exception:
+        pass
+
+
 async def _mirror_batch(readings: list[dict]) -> None:
     """Best-effort POST to the legacy secondary server. Never raises."""
     if not _SECONDARY_INGEST_URL:
@@ -1114,6 +1141,7 @@ async def ingest_loop():
         f"write-through with SQLite fallback"
         + (f" | aux sensors: {', '.join(s['name'] for s in active_sensors)}" if active_sensors else "")
     )
+    asyncio.create_task(_startup_connectivity_ping())
     await asyncio.gather(
         _read_loop(active_sensors),
         _upload_loop(),

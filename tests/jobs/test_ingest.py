@@ -40,6 +40,7 @@ from jobs.ingest import (
     _version_is_older_than,
     _auth_headers,
     _trigger_update,
+    _startup_connectivity_ping,
     _ensure_drain_jitter,
     ALERT_NEAR_PCT,
     ALERT_BUFFER_CAPACITY,
@@ -622,6 +623,93 @@ async def test_drain_backlog_holds_rows_on_server_error(tmp_db):
         await _drain_backlog()
 
     assert queue.count_pending() == 1
+
+
+# ── _startup_connectivity_ping ──────────────────────────────────────────────
+
+def _mock_get_client(response_json: dict, status: int = 200):
+    """Like _mock_client but for a GET (no request body to inspect)."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = status
+    mock_resp.is_success = 200 <= status < 300
+    mock_resp.json.return_value = response_json
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    return mock_client
+
+
+async def test_startup_ping_sets_led_ok_on_success(monkeypatch, tmp_path):
+    monkeypatch.setattr(ingest, "_PRIMARY_SERVER_URL", "http://server")
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(tmp_path / "led-state"))
+    mock_client = _mock_get_client({"device_id": 1, "min_version": None})
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        await _startup_connectivity_ping()
+
+    assert (tmp_path / "led-state").read_text() == "ok"
+
+
+async def test_startup_ping_schedules_update_when_min_version_newer(monkeypatch, tmp_path):
+    monkeypatch.setattr(ingest, "_PRIMARY_SERVER_URL", "http://server")
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(tmp_path / "led-state"))
+    mock_client = _mock_get_client({"device_id": 1, "min_version": "99.0.0"})
+
+    tasks = []
+    with patch("httpx.AsyncClient", return_value=mock_client), \
+         patch("asyncio.create_task", side_effect=tasks.append):
+        await _startup_connectivity_ping()
+
+    assert len(tasks) >= 1
+
+
+async def test_startup_ping_does_not_touch_led_on_rejection(monkeypatch, tmp_path):
+    """A failed ping (e.g. revoked token) must leave the LED alone — it
+    stays "thinking" (or whatever it already was), not flipped to "ok"."""
+    monkeypatch.setattr(ingest, "_PRIMARY_SERVER_URL", "http://server")
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+    led_file = tmp_path / "led-state"
+    led_file.write_text("thinking")
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(led_file))
+    mock_client = _mock_get_client({"error": "Invalid or expired token"}, status=401)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        await _startup_connectivity_ping()
+
+    assert led_file.read_text() == "thinking"
+
+
+async def test_startup_ping_no_token_skips_request(monkeypatch):
+    monkeypatch.setattr(ingest, "_PRIMARY_SERVER_URL", "http://server")
+    monkeypatch.delenv("NEW_AUTH_TOKEN", raising=False)
+
+    with patch("httpx.AsyncClient") as mock_cls:
+        await _startup_connectivity_ping()
+
+    mock_cls.assert_not_called()
+
+
+async def test_startup_ping_connect_error_is_swallowed(monkeypatch, tmp_path):
+    """Server unreachable at boot must not crash ingest_loop's startup."""
+    monkeypatch.setattr(ingest, "_PRIMARY_SERVER_URL", "http://server")
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+    led_file = tmp_path / "led-state"
+    led_file.write_text("thinking")
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(led_file))
+
+    mock_client = AsyncMock()
+    mock_client.get.side_effect = httpx.ConnectError("refused")
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        await _startup_connectivity_ping()  # must not raise
+
+    assert led_file.read_text() == "thinking"
 
 
 # ── _handle_response ──────────────────────────────────────────────────────────
