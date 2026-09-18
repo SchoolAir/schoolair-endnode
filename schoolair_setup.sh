@@ -612,6 +612,25 @@ if [[ "$MODE" == "--update" ]]; then
     fi
     ok "sen6x, schoolair, schoolair-netwatch all active post-update, no restarts since"
 
+    # schoolair-led is checked separately, non-fatally: it's a status
+    # indicator, not core functionality, so it must never trigger a
+    # rollback — but "systemctl restart" returning 0 only means the start
+    # was *requested*, not that the process stayed up. Caught live: on a
+    # device updating from a pre-LED golden image, the unit came back
+    # inactive with zero log output (a clean, silent exit(0) very early in
+    # led_status.py, before Restart=on-failure would ever have a reason to
+    # fire) and nothing here would have noticed short of physically looking
+    # at the LED. One retry covers a transient (e.g. pigpiod not ready yet
+    # on this same first activation); a persistent failure just gets a
+    # clear warning instead of update failure.
+    if ! systemctl is-active --quiet schoolair-led.service; then
+        systemctl restart schoolair-led.service 2>/dev/null || true
+        sleep 3
+        systemctl is-active --quiet schoolair-led.service \
+            && warn "schoolair-led.service was inactive after update — recovered on retry" \
+            || warn "schoolair-led.service is not active after update (non-fatal — status LED only)"
+    fi
+
     # Arm the rollback watchdog: if a real successful upload doesn't confirm
     # this version works within the deadline, schoolair-update-watchdog.timer
     # restores the pre-update backup automatically. jobs/ingest.py clears this
