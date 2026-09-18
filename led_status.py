@@ -25,6 +25,7 @@ from before the crash would otherwise just sit there being rendered
 forever. See _check_watched_services().
 """
 
+import bisect
 import math
 import os
 import subprocess
@@ -37,8 +38,12 @@ PWM_FREQ_HZ = 100      # well above flicker-fusion; low enough for a wide duty-c
 PEAK_FRAC = 0.1        # single global brightness cap for every state
 GAMMA = 2.8            # perceptual correction so dimming looks linear to the eye
 TICK = 0.02            # render granularity
-OK_PERIOD_S = 8.0        # breathe: 4s up, 4s down
-THINKING_PERIOD_S = 1.2  # pulse: 0.6s up, 0.6s down
+OK_PERIOD_S = 8.0        # breathe: 4s up, 4s down (nominal — actual is shorter, see below)
+THINKING_PERIOD_S = 1.2  # pulse: 0.6s up, 0.6s down (nominal)
+TEMPO_SCALE = 2.0        # scales both the nominal period and the per-step dwell
+                          # cap together (see _build_breath_table) — the only
+                          # knob that changes overall breathe/pulse speed
+                          # without distorting the low-end-vs-peak timing shape
 
 _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 
@@ -92,48 +97,75 @@ def _curve(frac: float, peak: int) -> int:
     return round(peak * (frac ** GAMMA))
 
 
-def _build_breath_table(peak: int, period: float) -> list:
+def _perceptual_weight(v: int) -> float:
+    """How visually significant one more step away from value v is, per
+    Weber-Fechner: perceived brightness change tracks the *ratio* between
+    consecutive values, not their difference. 0->1->2 are each 100%+
+    relative jumps (large weight); 199->200 is a 0.5% jump (tiny weight).
+    +1/+2 offsets just avoid a log(0) singularity at v=0."""
+    return math.log((v + 2) / (v + 1))
+
+
+def _build_breath_table(peak: int, period: float, max_dwell: float = TICK):
     """Precomputed once at startup per (peak, period) pair — not per-tick.
+    Returns (values, cumulative_end_times, total_duration).
 
-    Near the extremes, gamma-corrected brightness changes so little per
-    unit time that many consecutive fine-grained time samples round to
-    the identical integer duty value before it can tick down/up again —
-    a real, unavoidable consequence of only having ~peak distinct levels
-    to work with (peak=200 here) spread across a curve shaped to
-    compress hard near zero. Sampled every 1ms and rounded, that showed
-    up as visibly held plateaus (e.g. "5,5,4,4,3,3,3,2,2,2,1,1,1,0,0,0,0,0")
-    especially on the way down.
+    Two distinct problems, found live, in tension with each other:
 
-    Deduplicating consecutive identical samples into a single table entry
-    fixes it directly: the render loop walks this table at a constant
-    rate (one entry per period/len(table) seconds), so every entry — one
-    per *achievable distinct value*, not per raw time-sample — gets an
-    equal, short slice of the total period. A plateau that used to hold
-    for hundreds of milliseconds collapses to a single slice, exactly as
-    fast as any other transition. A region that already produces a new
-    distinct value on every fine-grained sample doesn't get deduplicated
-    at all — nothing changes structurally for it; it just ends up
-    spanning a proportionally larger, and typically slightly longer than
-    one raw render tick, share of the walked period once the coarse
-    region's redundant duplicates are gone. That's the intended trade:
-    faster through the parts with nothing new to show, correspondingly
-    a little more time on parts that actually have somewhere to go."""
+    1. Near the extremes, gamma-corrected brightness changes so little
+       per unit time that many consecutive fine-grained time samples
+       round to the identical integer before it can tick down/up again —
+       showed up as visibly held plateaus, worst on the way down.
+    2. Giving every *distinct* value an equal time slice (the direct fix
+       for #1) creates a new problem: a linear step near the peak
+       (199->200, a 0.5% relative change) gets the same on-screen time as
+       a linear step near the trough (1->2, a 100% relative change) —
+       so the perceptually-tiny steps near the peak, being individually
+       indistinguishable, collectively read as one long stuck-feeling
+       plateau even though nothing is technically repeating.
+
+    Fix: weight each achievable value's dwell time by _perceptual_weight()
+    instead of giving every one an equal slice, then cap the maximum any
+    single value can claim at `max_dwell` — chosen so the low end (whose
+    natural weight exceeds the cap almost everywhere) ends up ~unchanged,
+    while higher values — whose natural weight is much smaller — get
+    progressively less than the cap the closer they are to the peak. No
+    renormalization: capping trims the total below `period` somewhat,
+    which just means the breath completes a bit faster than nominal —
+    an acceptable trade for an ambient indicator, not a metronome.
+
+    `period` and `max_dwell` should be scaled together (see TEMPO_SCALE)
+    to change overall speed without distorting this shape — scaling only
+    `period` would shift the cap relative to the curve and change which
+    values get capped at all, not just how fast things move."""
     SAMPLE_S = 0.001  # fine enough to catch every achievable integer transition
     n_samples = max(2, round(period / SAMPLE_S))
-    table = []
+    values = []
     last = None
     for i in range(n_samples + 1):
         t = (i / n_samples) * period
         v = _curve(_ease(t, period), peak)
         if v != last:
-            table.append(v)
+            values.append(v)
             last = v
-    return table
+
+    weights = [_perceptual_weight(v) for v in values]
+    total_weight = sum(weights)
+    dwell = [min(max_dwell, period * w / total_weight) for w in weights]
+
+    cumulative = []
+    running = 0.0
+    for d in dwell:
+        running += d
+        cumulative.append(running)
+    return values, cumulative, running
 
 
-def _table_lookup(table: list, elapsed: float, period: float) -> int:
-    idx = int((elapsed % period) / period * len(table))
-    return table[min(idx, len(table) - 1)]
+def _table_lookup(table, elapsed: float) -> int:
+    values, cumulative, total_duration = table
+    t_in_cycle = elapsed % total_duration
+    idx = bisect.bisect_right(cumulative, t_in_cycle)
+    return values[min(idx, len(values) - 1)]
 
 
 def _service_is_active(svc: str) -> bool:
@@ -234,10 +266,11 @@ def main() -> None:
     peak = round(real_range * PEAK_FRAC)
     print(f"[led] pigpiod ready — GPIO{GPIO_LED}, real_range={real_range}, peak_duty={peak}")
 
-    ok_table = _build_breath_table(peak, OK_PERIOD_S)
-    thinking_table = _build_breath_table(peak, THINKING_PERIOD_S)
-    print(f"[led] breathe table: {len(ok_table)} distinct steps over {OK_PERIOD_S}s, "
-          f"pulse table: {len(thinking_table)} steps over {THINKING_PERIOD_S}s")
+    ok_table = _build_breath_table(peak, OK_PERIOD_S * TEMPO_SCALE, TICK * TEMPO_SCALE)
+    thinking_table = _build_breath_table(peak, THINKING_PERIOD_S * TEMPO_SCALE, TICK * TEMPO_SCALE)
+    print(f"[led] breathe table: {len(ok_table[0])} steps, actual cycle {ok_table[2]:.2f}s "
+          f"(nominal {OK_PERIOD_S}s); pulse table: {len(thinking_table[0])} steps, "
+          f"actual cycle {thinking_table[2]:.2f}s (nominal {THINKING_PERIOD_S}s)")
 
     health = {"unhealthy_until": 0.0}
     threading.Thread(target=_health_monitor_loop, args=(health,), daemon=True).start()
@@ -255,12 +288,12 @@ def main() -> None:
             elapsed = time.monotonic() - t0
 
             if state == "ok":
-                # slow breathe: 4s up, 4s down
-                pi.set_PWM_dutycycle(GPIO_LED, _table_lookup(ok_table, elapsed, OK_PERIOD_S))
+                # slow breathe: perceptually-weighted, ~8s nominal
+                pi.set_PWM_dutycycle(GPIO_LED, _table_lookup(ok_table, elapsed))
 
             elif state == "thinking":
-                # sharp, fast pulse: 0.6s up, 0.6s down
-                pi.set_PWM_dutycycle(GPIO_LED, _table_lookup(thinking_table, elapsed, THINKING_PERIOD_S))
+                # sharp, fast pulse: perceptually-weighted, ~1.2s nominal
+                pi.set_PWM_dutycycle(GPIO_LED, _table_lookup(thinking_table, elapsed))
 
             elif state == "ap":
                 # double blink: on 0-100ms, off 100-250ms, on 250-350ms,
