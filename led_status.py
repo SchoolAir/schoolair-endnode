@@ -40,7 +40,7 @@ GAMMA = 2.8            # perceptual correction so dimming looks linear to the ey
 TICK = 0.02            # render granularity
 OK_PERIOD_S = 8.0        # breathe: 4s up, 4s down (nominal — actual is shorter, see below)
 THINKING_PERIOD_S = 1.2  # pulse: 0.6s up, 0.6s down (nominal)
-TEMPO_SCALE = 2.0        # scales both the nominal period and the per-step dwell
+TEMPO_SCALE = 1.5        # scales both the nominal period and the per-step dwell
                           # cap together (see _build_breath_table) — the only
                           # knob that changes overall breathe/pulse speed
                           # without distorting the low-end-vs-peak timing shape
