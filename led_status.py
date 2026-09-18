@@ -28,6 +28,7 @@ forever. See _check_watched_services().
 import bisect
 import math
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -223,6 +224,17 @@ def _health_monitor_loop(shared: dict) -> None:
         time.sleep(HEALTH_CHECK_INTERVAL_S)
 
 
+def _on_sigterm(signum, frame) -> None:
+    """Converts SIGTERM into a normal SystemExit. Python's default SIGTERM
+    disposition kills the process outright and never runs a `finally`
+    block — so "systemctl stop" (or a restart, which is stop-then-start)
+    would leave the LED frozen at whatever duty cycle it happened to be
+    mid-breathe, silently looking "on" for a daemon that's actually dead.
+    Routing it through SystemExit lets main()'s finally block turn the
+    LED off before the process actually exits."""
+    raise SystemExit(0)
+
+
 def main() -> None:
     import pigpio  # deferred: Pi-only, keeps this module importable/testable elsewhere
 
@@ -274,6 +286,8 @@ def main() -> None:
 
     health = {"unhealthy_until": 0.0}
     threading.Thread(target=_health_monitor_loop, args=(health,), daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     last_state = None
     t0 = time.monotonic()
