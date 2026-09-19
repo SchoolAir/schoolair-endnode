@@ -712,6 +712,61 @@ async def test_startup_ping_connect_error_is_swallowed(monkeypatch, tmp_path):
     assert led_file.read_text() == "thinking"
 
 
+async def test_startup_ping_drains_backlog_when_present(monkeypatch, tmp_db, tmp_path):
+    """A device reconnecting with a queued backlog should start draining it
+    right on this ping — not wait for its first live reading, which can be
+    minutes away outside the active window."""
+    monkeypatch.setattr(ingest, "_PRIMARY_SERVER_URL", "http://server")
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(tmp_path / "led-state"))
+    queue.enqueue({"co2": 400}, "2026-06-23T10:00:00+00:00")
+
+    mock_client = _mock_get_client({"device_id": 1, "min_version": None,
+                                     "credit_bytes": 100_000, "recommended_delay_seconds": 0})
+
+    with patch("httpx.AsyncClient", return_value=mock_client), \
+         patch("jobs.ingest.aggregate.run_aggregation",
+               return_value={"buckets": 0, "rows_in": 0, "rows_removed": 0}), \
+         patch("jobs.ingest._try_post", new_callable=AsyncMock,
+               return_value={"credit_bytes": 0, "recommended_delay_seconds": 0}), \
+         patch("jobs.ingest._handle_response", new_callable=AsyncMock):
+        await _startup_connectivity_ping()
+
+    assert queue.count_pending() == 0
+
+
+async def test_startup_ping_skips_drain_when_no_backlog(monkeypatch, tmp_db, tmp_path):
+    monkeypatch.setattr(ingest, "_PRIMARY_SERVER_URL", "http://server")
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(tmp_path / "led-state"))
+    mock_client = _mock_get_client({"device_id": 1, "min_version": None,
+                                     "credit_bytes": 100_000, "recommended_delay_seconds": 0})
+
+    with patch("httpx.AsyncClient", return_value=mock_client), \
+         patch("jobs.ingest._drain_backlog", new_callable=AsyncMock) as mock_drain:
+        await _startup_connectivity_ping()
+
+    mock_drain.assert_not_called()
+
+
+async def test_startup_ping_skips_drain_when_credit_zero(monkeypatch, tmp_db, tmp_path):
+    """A backlog exists, but this response granted no credit — don't drain."""
+    monkeypatch.setattr(ingest, "_PRIMARY_SERVER_URL", "http://server")
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(tmp_path / "led-state"))
+    queue.enqueue({"co2": 400}, "2026-06-23T10:00:00+00:00")
+
+    mock_client = _mock_get_client({"device_id": 1, "min_version": None,
+                                     "credit_bytes": 0, "recommended_delay_seconds": 0})
+
+    with patch("httpx.AsyncClient", return_value=mock_client), \
+         patch("jobs.ingest._drain_backlog", new_callable=AsyncMock) as mock_drain:
+        await _startup_connectivity_ping()
+
+    mock_drain.assert_not_called()
+    assert queue.count_pending() == 1
+
+
 # ── _handle_response ──────────────────────────────────────────────────────────
 
 async def test_handle_response_saves_criteria():

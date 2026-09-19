@@ -546,6 +546,21 @@ if [[ "$MODE" == "--update" ]]; then
     fi
 
     if systemctl is-active --quiet nginx; then systemctl restart nginx; fi
+    # schoolair-led.service restarts FIRST, before schoolair.service — it
+    # unconditionally resets the shared LED_STATE_FILE to "thinking" on its
+    # own startup. schoolair.service's startup connectivity ping is what
+    # resolves that back to "ok" moments later; if led restarted *after*
+    # that ping already ran, it would silently stomp the fresh "ok" back
+    # down to "thinking" with nothing left to re-resolve it until the next
+    # scheduled read (up to READ_IDLE_SECONDS away). This way schoolair's
+    # restart is always the one that gets the last word.
+    #
+    # schoolair-led.service is also brand new on any device updating from
+    # before it existed — "systemctl enable" above only arms it for the
+    # *next* boot, it does not start it now. restart (not start) also
+    # correctly picks up new led_status.py code on devices where it was
+    # already running.
+    systemctl restart schoolair-led.service      || warn "schoolair-led.service restart failed"
     systemctl restart sen6x.service           || warn "sen6x.service restart failed"
     systemctl restart schoolair.service       || warn "schoolair.service restart failed"
     # schoolair-netwatch.service is a long-running bash process — cp'ing a new
@@ -556,11 +571,6 @@ if [[ "$MODE" == "--update" ]]; then
     # didn't happen to reboot afterward, silently defeating the whole point
     # of shipping it as an update.
     systemctl restart schoolair-netwatch.service || warn "schoolair-netwatch.service restart failed"
-    # schoolair-led.service is brand new on any device updating from before it
-    # existed — "systemctl enable" above only arms it for the *next* boot, it
-    # does not start it now. restart (not start) also correctly picks up new
-    # led_status.py code on devices where it was already running.
-    systemctl restart schoolair-led.service      || warn "schoolair-led.service restart failed"
     ok "Services restarted with updated code"
 
     # Active health check (adapted from deploy/canary_ota_test.sh's own
