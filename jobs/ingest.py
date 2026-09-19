@@ -622,7 +622,13 @@ async def _startup_connectivity_ping() -> None:
     /aqc/v1/validate is a deliberately cheap, no-DB-write endpoint — this
     isn't meant to replace the real upload, just prove connectivity exists.
     Failure leaves the LED at "thinking"; the first real read/upload
-    (or the next boot) will resolve it from there — no retry loop here."""
+    (or the next boot) will resolve it from there — no retry loop here.
+
+    Also carries the same backlog-drain credit as a real ingest response —
+    a device reconnecting with a queued backlog (e.g. after being offline,
+    or after an OTA update) starts draining it right away instead of
+    waiting for its first live reading to trigger a drain, which can itself
+    be minutes away outside the active window."""
     token = os.getenv("NEW_AUTH_TOKEN", "").strip()
     if not token or not _PRIMARY_SERVER_URL:
         return
@@ -632,7 +638,11 @@ async def _startup_connectivity_ping() -> None:
         if res.is_success:
             _set_led_state("ok")
             print("[startup] connectivity confirmed")
-            _maybe_trigger_update(res.json())
+            response = res.json()
+            _maybe_trigger_update(response)
+            _update_credit(response)
+            if queue.count_pending() > 0 and _credit_bytes > 0:
+                await _drain_backlog()
         else:
             _maybe_trigger_update_from_error(res)
     except Exception:
