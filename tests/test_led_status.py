@@ -150,3 +150,134 @@ def test_main_turns_led_off_on_sigterm(monkeypatch, tmp_path):
 
     fake_pi.set_PWM_dutycycle.assert_called_with(led_status.GPIO_LED, 0)
     fake_pi.stop.assert_called_once()
+
+
+# ── _is_registered ───────────────────────────────────────────────────────────
+
+def test_is_registered_true_when_new_auth_token_set(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("NEW_SERVER_URL=https://example.com\nNEW_AUTH_TOKEN=abc123\n")
+    monkeypatch.setattr(led_status, "ENV_FILE", str(env))
+    assert led_status._is_registered() is True
+
+
+def test_is_registered_false_when_new_auth_token_empty(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("NEW_AUTH_TOKEN=\n")
+    monkeypatch.setattr(led_status, "ENV_FILE", str(env))
+    assert led_status._is_registered() is False
+
+
+def test_is_registered_false_when_key_absent(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("SOME_OTHER_KEY=1\n")
+    monkeypatch.setattr(led_status, "ENV_FILE", str(env))
+    assert led_status._is_registered() is False
+
+
+def test_is_registered_false_when_env_file_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(led_status, "ENV_FILE", str(tmp_path / "does-not-exist.env"))
+    assert led_status._is_registered() is False
+
+
+# ── _resolve_state precedence ────────────────────────────────────────────────
+#
+# Found live: an unregistered device correctly showed "ap" (double blink)
+# while waiting in the wizard's AP mode, but flipped to "error" (single
+# blink) once jobs/ingest.py's upload loop took a sensor reading and tried
+# (and, expectedly, failed) to upload it with no token yet. A networking/
+# auth failure is normal during AP-mode setup — it shouldn't look like a
+# real problem. A genuine internal error should still win either way.
+
+def _healthy(): return {"unhealthy_until": 0.0}
+
+
+def test_resolve_state_downgrades_error_to_ap_when_unregistered(monkeypatch):
+    monkeypatch.setattr(led_status, "_read_state", lambda: "error")
+    monkeypatch.setattr(led_status, "_is_registered", lambda: False)
+    assert led_status._resolve_state(_healthy(), now_mono=0.0) == "ap"
+
+
+def test_resolve_state_keeps_error_when_registered(monkeypatch):
+    """Same "error" from LED_STATE_FILE, but on an already-registered
+    device — this is now a real signal and must not be downgraded."""
+    monkeypatch.setattr(led_status, "_read_state", lambda: "error")
+    monkeypatch.setattr(led_status, "_is_registered", lambda: True)
+    assert led_status._resolve_state(_healthy(), now_mono=0.0) == "error"
+
+
+def test_resolve_state_passes_through_no_sensor_when_unregistered(monkeypatch):
+    """A real hardware problem must not get swept under the AP-mode rug."""
+    monkeypatch.setattr(led_status, "_read_state", lambda: "no_sensor")
+    monkeypatch.setattr(led_status, "_is_registered", lambda: False)
+    assert led_status._resolve_state(_healthy(), now_mono=0.0) == "no_sensor"
+
+
+def test_resolve_state_passes_through_ap_unchanged(monkeypatch):
+    monkeypatch.setattr(led_status, "_read_state", lambda: "ap")
+    monkeypatch.setattr(led_status, "_is_registered", lambda: False)
+    assert led_status._resolve_state(_healthy(), now_mono=0.0) == "ap"
+
+
+def test_resolve_state_health_check_overrides_even_ap_downgrade(monkeypatch):
+    """A genuinely crashed watched service always wins — even over the
+    AP-mode downgrade of an "error" that would otherwise apply here."""
+    monkeypatch.setattr(led_status, "_read_state", lambda: "error")
+    monkeypatch.setattr(led_status, "_is_registered", lambda: False)
+    unhealthy = {"unhealthy_until": 100.0}
+    assert led_status._resolve_state(unhealthy, now_mono=50.0) == "error"
+
+
+def test_resolve_state_health_check_overrides_ok(monkeypatch):
+    monkeypatch.setattr(led_status, "_read_state", lambda: "ok")
+    monkeypatch.setattr(led_status, "_is_registered", lambda: True)
+    unhealthy = {"unhealthy_until": 100.0}
+    assert led_status._resolve_state(unhealthy, now_mono=50.0) == "error"
+
+
+# ── main() always resets LED_STATE_FILE to "thinking" on startup ───────────
+
+def test_main_resets_stale_state_file_to_thinking_on_startup(monkeypatch, tmp_path):
+    """Found live: a race with another writer (e.g. jobs/ingest.py's
+    no-token branch) could leave a stale/wrong value as the very first
+    thing ever rendered, if it wrote before led_status.py initialised the
+    file. main() must unconditionally reset to "thinking" on startup,
+    even if the file already exists with something else."""
+    fake_pi = MagicMock()
+    fake_pi.connected = True
+    fake_pi.get_PWM_real_range.return_value = 2000
+    fake_pigpio = MagicMock()
+    fake_pigpio.pi.return_value = fake_pi
+
+    unit_type_file = tmp_path / "schoolair-unit-type"
+    unit_type_file.write_text("indoor")
+    led_state_file = tmp_path / "schoolair-led-state"
+    led_state_file.write_text("error")  # stale/racy pre-existing value
+
+    monkeypatch.setattr(led_status, "LED_STATE_FILE", str(led_state_file))
+    monkeypatch.setattr(led_status, "_health_monitor_loop", lambda health: None)
+    monkeypatch.setattr(__import__("threading"), "Thread", lambda *a, **k: MagicMock())
+
+    real_open = open
+    def fake_open(path, *args, **kwargs):
+        if path == "/etc/schoolair-unit-type":
+            path = str(unit_type_file)
+        return real_open(path, *args, **kwargs)
+
+    def fake_signal(signum, handler):
+        pass
+
+    def fake_sleep(seconds):
+        raise SystemExit(0)  # stop after the first loop iteration
+
+    with patch.dict(sys.modules, {"pigpio": fake_pigpio}), \
+         patch("builtins.open", side_effect=fake_open), \
+         patch("signal.signal", side_effect=fake_signal), \
+         patch("time.sleep", side_effect=fake_sleep):
+        with pytest.raises(SystemExit):
+            led_status.main()
+
+    # The render loop only ever reads LED_STATE_FILE, never writes it — so
+    # if this still reads "thinking" (not the pre-seeded "error"), main()'s
+    # startup reset is what did it.
+    assert led_state_file.read_text() == "thinking"

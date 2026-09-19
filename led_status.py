@@ -23,6 +23,13 @@ write "error" itself is what's broken — e.g. a crashed main.py never
 reaches the code that writes to LED_STATE_FILE at all, so a stale "ok"
 from before the crash would otherwise just sit there being rendered
 forever. See _check_watched_services().
+
+LED_STATE_FILE's "error" is downgraded to "ap" while the device isn't
+registered yet (see _is_registered/_resolve_state) — a networking/auth
+failure is *expected* during AP-mode setup (jobs/ingest.py still runs and
+tries to upload with no token), so it shouldn't look like a real problem.
+The independent health check above still overrides everything, including
+this downgrade — a genuinely crashed service is a real problem either way.
 """
 
 import bisect
@@ -66,6 +73,25 @@ _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 WATCHED_SERVICES = ("sen6x.service", "schoolair.service", "schoolair-netwatch.service")
 HEALTH_CHECK_INTERVAL_S = 5.0
 UNHEALTHY_HOLD_S = 30.0    # once flagged, hold the "error" override at least this long
+
+
+ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def _is_registered() -> bool:
+    """Mirrors jobs/ingest.py's own upload gate (NEW_AUTH_TOKEN in .env).
+    Lets the render loop tell an *expected* networking/auth failure during
+    the AP-mode setup window — nothing to upload to yet, so every attempt
+    "fails" and jobs/ingest.py writes "error" — apart from a real error on
+    an already-registered device. See the precedence note in main()."""
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                if line.startswith("NEW_AUTH_TOKEN="):
+                    return bool(line.split("=", 1)[1].strip())
+    except OSError:
+        pass
+    return False
 
 
 def _read_state() -> str:
@@ -224,6 +250,27 @@ def _health_monitor_loop(shared: dict) -> None:
         time.sleep(HEALTH_CHECK_INTERVAL_S)
 
 
+def _resolve_state(health: dict, now_mono: float) -> str:
+    """Precedence, highest to lowest:
+      1. Independent health-check failure (health["unhealthy_until"]) — a
+         watched service actually crashed. Always wins: that's a real
+         internal problem regardless of registration/AP-mode.
+      2. Whatever LED_STATE_FILE says, EXCEPT: "error" while the device
+         isn't registered yet gets downgraded to "ap". A networking/auth
+         failure is *expected* during AP-mode setup (there's nothing to
+         reach yet, so a stray sensor-read-and-upload attempt fails every
+         time) — it shouldn't look identical to a real upload error on an
+         already-registered device. A genuine "no_sensor" still passes
+         straight through unchanged — a hardware problem is a hardware
+         problem in either mode."""
+    state = _read_state()
+    if state == "error" and not _is_registered():
+        state = "ap"
+    if now_mono < health["unhealthy_until"]:
+        state = "error"
+    return state
+
+
 def _on_sigterm(signum, frame) -> None:
     """Converts SIGTERM into a normal SystemExit. Python's default SIGTERM
     disposition kills the process outright and never runs a `finally`
@@ -254,10 +301,15 @@ def main() -> None:
     # it regardless of which one gets there first — /run itself is root
     # 755, so a non-root writer can only succeed if the file already
     # exists with permissive mode.
+    #
+    # Always reset to "thinking" here, even if the file already exists —
+    # this process starting is the definitive "nothing rendered yet"
+    # moment. Without this, another writer (e.g. jobs/ingest.py's no-token
+    # branch) can win a startup race and leave a stale/wrong value as the
+    # very first thing ever displayed.
     try:
-        if not os.path.exists(LED_STATE_FILE):
-            with open(LED_STATE_FILE, "w") as f:
-                f.write("thinking")
+        with open(LED_STATE_FILE, "w") as f:
+            f.write("thinking")
         os.chmod(LED_STATE_FILE, 0o666)
     except OSError as e:
         print(f"[led] warning: could not prepare {LED_STATE_FILE}: {e}")
@@ -295,7 +347,7 @@ def main() -> None:
     try:
         while True:
             now_mono = time.monotonic()
-            state = "error" if now_mono < health["unhealthy_until"] else _read_state()
+            state = _resolve_state(health, now_mono)
             if state != last_state:
                 t0 = time.monotonic()  # restart the pattern cleanly at each state change
                 last_state = state
