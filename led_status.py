@@ -54,27 +54,40 @@ PWM_FREQ_HZ = 100      # well above flicker-fusion; low enough for a wide duty-c
 WAVE_PERIOD_US = 1_000_000 // PWM_FREQ_HZ   # one PWM period; the brightness can change once per period
 WAVE_STEP_US = 5       # duty-cycle resolution = pigpiod's sample rate (5us default)
 WAVE_STEPS = WAVE_PERIOD_US // WAVE_STEP_US  # 2000 distinct brightness levels, as with pigpio's own PWM
-PEAK_FRAC = 0.1        # single global brightness cap for every state
-PEAK_STEPS = round(WAVE_STEPS * PEAK_FRAC)   # 200
-GAMMA = 2.8            # perceptual correction so dimming looks linear to the eye
-TICK = 0.02            # per-step dwell cap in the breath table (see _build_breath_table)
+PEAK_FRAC = 0.1        # full-scale reference duty, before BRIGHTNESS
+BRIGHTNESS = 0.8       # global scale on EVERY pattern (all values x0.8, mid-tones included,
+                       # not just a lower cap) — live-tuned by eye: 100% read too bright
+PEAK_STEPS = round(WAVE_STEPS * PEAK_FRAC * BRIGHTNESS)   # 160: the cap for every state (8% duty)
+PEAK_US = PEAK_STEPS * WAVE_STEP_US                        # 800us on-time per 10ms PWM period
+GAMMA = 2.8            # legacy table model only
+TICK = 0.02            # legacy table model only: per-step dwell cap (see _build_breath_table)
+
+# Breathe ("ok") / pulse ("thinking") shape. Defined in PERCEIVED LIGHTNESS, not
+# duty cycle: the PWM duty cycle sets the LED's average current, and its light
+# output (relative luminance Y) is ~proportional to it — but the eye is roughly
+# cube-root: a duty cycle of 18% of full reads as "half as bright" (CIE lightness
+# L* = 50), not 50%. So the animation is a raised cosine in L* (spends exactly half
+# the cycle above the perceived midpoint), converted to luminance by the CIE 1976
+# formula (_lightness_to_luminance) and scaled to the cap. (The previous table
+# model spent 68% of the cycle above the midpoint: its per-step timing came from
+# a log-based weight that ignored the envelope entirely.)
+#  - BREATH_SHAPE_EXPONENT: p = cosine ** this. 1.0 = symmetric (50% above the
+#    midpoint); >1 spends more of the cycle dim (1.3 -> ~44%, 1.6 -> ~40%).
+#  - BREATH_DITHER: at the dim end the wanted on-time is a fraction of one 5us
+#    step; error-diffusion (alternating adjacent steps so the average is exact)
+#    keeps the fade smooth instead of holding one step then jumping to the next.
+#  - BREATH_MODEL "table" selects the previous (legacy) timing for side-by-side
+#    comparison with scripts/led_curve_preview.py; remove once the new one is approved.
+BREATH_MODEL = "perceptual"     # "perceptual" | "table"
+OK_CYCLE_S = 5.0
+THINKING_CYCLE_S = 1.5
+BREATH_SHAPE_EXPONENT = 1.0
+BREATH_DITHER = True
+
+# Legacy table model only (see _build_breath_table):
 OK_PERIOD_S = 8.0        # breathe: 4s up, 4s down (nominal — actual is shorter, see below)
 THINKING_PERIOD_S = 1.2  # pulse: 0.6s up, 0.6s down (nominal)
-
-# Breathe/pulse ("ok" / "thinking") tuning. Live-tuned by eye on a real unit.
-#  - BREATH_PEAK_FRAC: brightness cap of the two table-driven patterns; 0.8 of
-#    PEAK_FRAC because the top of the breath read too bright and stayed bright
-#    too long. The blink/solid states keep PEAK_FRAC.
-#  - *_TEMPO_SCALE scale the nominal period AND the per-step dwell cap together
-#    (see _build_breath_table) — the only way to change speed without distorting
-#    the low-end-vs-peak timing shape. Lowering the peak removes brightness steps
-#    and so shortens the cycle by itself; these are set for a ~5.0s breath and
-#    a 1.49s pulse (the pulse's speed is unchanged).
-#  - BREATH_WEIGHT_EXPONENT: >1 shifts time toward the dim end (and shortens the
-#    cycle, so raise the tempo to compensate); 1.0 = the original timing.
-BREATH_PEAK_FRAC = 0.08
-BREATH_PEAK_STEPS = round(WAVE_STEPS * BREATH_PEAK_FRAC)  # 160
-OK_TEMPO_SCALE = 1.33
+OK_TEMPO_SCALE = 1.33    # nominal period AND per-step dwell cap scale together; set for a ~5.0s breath
 THINKING_TEMPO_SCALE = 1.525
 BREATH_WEIGHT_EXPONENT = 1.0
 
@@ -387,25 +400,49 @@ def _state_file_mtime():
 
 
 def _build_tables():
-    """(ok_table, thinking_table): the two breathe/pulse patterns, built once."""
-    ok = _build_breath_table(BREATH_PEAK_STEPS, OK_PERIOD_S * OK_TEMPO_SCALE,
+    """Legacy table model only: (ok_table, thinking_table), built once."""
+    ok = _build_breath_table(PEAK_STEPS, OK_PERIOD_S * OK_TEMPO_SCALE,
                              TICK * OK_TEMPO_SCALE, BREATH_WEIGHT_EXPONENT)
-    thinking = _build_breath_table(BREATH_PEAK_STEPS, THINKING_PERIOD_S * THINKING_TEMPO_SCALE,
+    thinking = _build_breath_table(PEAK_STEPS, THINKING_PERIOD_S * THINKING_TEMPO_SCALE,
                                    TICK * THINKING_TEMPO_SCALE, BREATH_WEIGHT_EXPONENT)
     return ok, thinking
 
 
-def _pattern_segments(duty_at, cycle_s: float):
-    """Turns a brightness function into the pulse list for ONE repeat of a
-    pattern: [(level, delay_us), ...], level 1 = pin high. `duty_at(t_us)`
-    returns the brightness in steps 0..PEAK_STEPS at t_us microseconds into
-    the cycle, and is sampled once per PWM period (10ms) — each period is
-    `on` for duty*5us then `off` for the rest, i.e. real 100Hz PWM, the same
-    signal as before but with the brightness updated every period instead of
-    every 20ms tick. Adjacent same-level segments are merged (a long dark
-    stretch is a single pulse, not hundreds), keeping waves small."""
+def _lightness_to_luminance(p: float) -> float:
+    """Perceived lightness fraction p (0..1 = CIE L* / 100) -> relative luminance
+    Y (0..1), the CIE 1976 inverse: Y = ((L*+16)/116)^3, with a linear toe below
+    L* = 8. p = 0.5 (perceptual midpoint) is Y = 0.184."""
+    lightness = 100.0 * max(0.0, min(1.0, p))
+    if lightness <= 8.0:
+        return lightness / 903.3
+    return ((lightness + 16.0) / 116.0) ** 3
+
+
+def _luminance_to_lightness(y: float) -> float:
+    """CIE 1976 lightness L* (0..100) of relative luminance y (0..1)."""
+    return 903.3 * y if y <= 0.008856 else 116.0 * y ** (1.0 / 3.0) - 16.0
+
+
+def _breath_on_us(t_us: float, cycle_s: float, shape: float = 1.0) -> float:
+    """On-time (us, fractional) per PWM period at t_us into a breath: raised
+    cosine in perceived lightness -> luminance -> scaled to the cap."""
+    p = _ease(t_us / 1e6, cycle_s) ** shape
+    return PEAK_US * _lightness_to_luminance(p)
+
+
+def _pattern_segments_us(on_us_at, cycle_s: float, dither: bool = False):
+    """Turns an on-time function into the pulse list for ONE repeat of a
+    pattern: [(level, delay_us), ...], level 1 = pin high. `on_us_at(t_us)`
+    returns the wanted on-time (microseconds, may be fractional) per PWM period
+    at t_us into the cycle, and is sampled once per PWM period (10ms) — each
+    period is `on` then `off` for the rest, i.e. real 100Hz PWM. The on-time is
+    quantised to pigpiod's 5us step; with `dither` the rounding error is carried
+    into the next period (error diffusion), so slowly-changing dim levels come
+    out right on average instead of sticking on one step. Adjacent same-level
+    segments are merged (a long dark stretch is a single pulse), keeping waves small."""
     n_periods = max(1, round(cycle_s * 1_000_000 / WAVE_PERIOD_US))
     segments: list = []
+    err = 0.0
 
     def add(level: int, us: int) -> None:
         if us <= 0:
@@ -416,21 +453,37 @@ def _pattern_segments(duty_at, cycle_s: float):
             segments.append((level, us))
 
     for i in range(n_periods):
-        on_us = min(WAVE_PERIOD_US, duty_at(i * WAVE_PERIOD_US) * WAVE_STEP_US)
+        want = on_us_at(i * WAVE_PERIOD_US) + err
+        on_us = max(0, min(WAVE_PERIOD_US, WAVE_STEP_US * round(want / WAVE_STEP_US)))
+        err = (want - on_us) if dither else 0.0
         add(1, on_us)
         add(0, WAVE_PERIOD_US - on_us)
     return segments
 
 
-def _state_segments(state: str, ok_table, thinking_table):
-    """The repeating pulse pattern for a state. Timings are those of the
-    original renderer (see the per-state comments)."""
-    if state == "ok":
-        # slow breathe: perceptually-weighted table, ~6s cycle
-        return _pattern_segments(lambda t_us: _table_lookup(ok_table, t_us / 1e6), ok_table[2])
-    if state == "thinking":
-        # sharp, fast pulse: perceptually-weighted table, ~1.5s cycle
-        return _pattern_segments(lambda t_us: _table_lookup(thinking_table, t_us / 1e6), thinking_table[2])
+def _pattern_segments(duty_at, cycle_s: float):
+    """As _pattern_segments_us for a brightness function in whole 5us steps
+    (0..PEAK_STEPS) — the blink/solid patterns and the legacy table model."""
+    return _pattern_segments_us(lambda t_us: duty_at(t_us) * WAVE_STEP_US, cycle_s)
+
+
+def _breath_segments(cycle_s: float, shape: float = BREATH_SHAPE_EXPONENT, dither: bool = BREATH_DITHER):
+    return _pattern_segments_us(lambda t_us: _breath_on_us(t_us, cycle_s, shape), cycle_s, dither)
+
+
+def _table_segments(table):
+    return _pattern_segments(lambda t_us: _table_lookup(table, t_us / 1e6), table[2])
+
+
+def _state_segments(state: str, ok_table=None, thinking_table=None):
+    """The repeating pulse pattern for a state. Blink timings are those of the
+    original renderer; brightness is capped at PEAK_STEPS (BRIGHTNESS x 10%).
+    The tables are only used by the legacy BREATH_MODEL = "table"."""
+    if state in ("ok", "thinking"):
+        if BREATH_MODEL == "table":
+            return _table_segments(ok_table if state == "ok" else thinking_table)
+        # slow breathe (ok) / sharp fast pulse (thinking), see BREATH_* above
+        return _breath_segments(OK_CYCLE_S if state == "ok" else THINKING_CYCLE_S)
     if state == "ap":
         # double blink: on 0-100ms, off 100-250ms, on 250-350ms,
         # then off until the next pair starts 2s later (2.35s cycle)
@@ -531,10 +584,14 @@ def main() -> None:
     print(f"[led] pigpiod ready — GPIO{GPIO_LED}, {PWM_FREQ_HZ}Hz, {WAVE_STEPS} levels, peak {PEAK_STEPS}")
 
     pi.set_mode(GPIO_LED, pigpio.OUTPUT)
-    ok_table, thinking_table = _build_tables()
-    print(f"[led] breathe table: {len(ok_table[0])} steps, actual cycle {ok_table[2]:.2f}s "
-          f"(nominal {OK_PERIOD_S}s); pulse table: {len(thinking_table[0])} steps, "
-          f"actual cycle {thinking_table[2]:.2f}s (nominal {THINKING_PERIOD_S}s)")
+    if BREATH_MODEL == "table":
+        ok_table, thinking_table = _build_tables()
+        print(f"[led] breathe (legacy table): cycle {ok_table[2]:.2f}s; pulse cycle {thinking_table[2]:.2f}s")
+    else:
+        ok_table = thinking_table = None
+        print(f"[led] breathe: perceptual (CIE L*) cosine, {OK_CYCLE_S}s; pulse {THINKING_CYCLE_S}s; "
+              f"brightness x{BRIGHTNESS} (cap {PEAK_US}us of {WAVE_PERIOD_US}us), "
+              f"shape {BREATH_SHAPE_EXPONENT}, dither {BREATH_DITHER}")
 
     health = {"unhealthy_until": 0.0}
     threading.Thread(target=_health_monitor_loop, args=(health,), daemon=True).start()

@@ -397,13 +397,13 @@ def _tables():
     return led_status._build_tables()
 
 
-def test_constants_match_the_original_pwm_setup():
-    """Same signal as the pigpio-PWM renderer: 100Hz, 2000 levels, cap 200."""
+def test_pwm_constants():
+    """100Hz PWM, 2000 levels of 5us; every pattern is capped at BRIGHTNESS x 10% duty."""
     assert PERIOD == 10_000
     assert led_status.WAVE_STEPS == 2000
-    assert led_status.PEAK_STEPS == 200                  # blink/solid cap: 10%
-    assert led_status.BREATH_PEAK_STEPS == 160           # breathe/pulse cap: 8%
-    assert PEAK_US == 1000  # 10% of a 10ms period
+    assert led_status.BRIGHTNESS == 0.8
+    assert led_status.PEAK_STEPS == round(2000 * 0.1 * 0.8) == 160     # 8%: ALL states, not just the breath
+    assert PEAK_US == 800
 
 
 def test_pattern_segments_are_whole_pwm_periods_with_no_empty_or_adjacent_duplicates():
@@ -427,7 +427,7 @@ def test_error_blinks_100ms_every_second():
     assert _on_us(segs) == 10 * PEAK_US                      # 10 PWM periods lit at the cap
     # all of the light falls inside the first 100ms; the rest is one long dark stretch
     assert all(start + us <= 100_000 for start, (lvl, us) in _starts(segs) if lvl)
-    assert segs[-1] == (0, 1_000_000 - 91_000)               # last lit pulse ends at 91ms, then dark until 1s
+    assert segs[-1] == (0, 1_000_000 - 90_000 - PEAK_US)      # last lit pulse ends at 90ms + 0.8ms, then dark until 1s
     assert _level_at(segs, 500_000) == 0 and _level_at(segs, 999_999) == 0
 
 
@@ -449,26 +449,86 @@ def test_ap_is_a_double_blink_every_2_35s():
     assert _level_at(segs, 200_000) == 0 and _level_at(segs, 1_000_000) == 0
 
 
-def test_breathe_wave_matches_the_table_it_was_built_from():
+def _per_period_on_us(segments):
+    """The on-time of each 10ms PWM period, recovered from a pulse list."""
+    out, on, acc = [], 0, 0
+    for level, us in segments:
+        while us > 0:
+            take = min(us, PERIOD - acc)
+            on += take if level else 0
+            acc += take
+            us -= take
+            if acc == PERIOD:
+                out.append(on)
+                on, acc = 0, 0
+    return out
+
+
+def _share_above_midpoint(on_us_per_period):
+    """Fraction of the cycle spent above perceived-lightness L* = 50."""
+    return sum(1 for x in on_us_per_period
+               if led_status._luminance_to_lightness(x / PEAK_US) >= 50) / len(on_us_per_period)
+
+
+def test_breathe_wave_is_a_five_second_perceptual_cosine_capped_at_the_brightness_scale():
+    segs = led_status._state_segments("ok")
+    per = _per_period_on_us(segs)
+    assert _total_us(segs) == 5_000_000 == led_status.OK_CYCLE_S * 1_000_000
+    assert max(per) == PEAK_US                                   # reaches the cap exactly, never above
+    assert per[0] == 0 and per[len(per) // 2] == PEAK_US         # dark at the start, peak at mid-cycle
+    # dithering preserves the wanted average brightness
+    model_mean = sum(led_status._breath_on_us(i * PERIOD, 5.0) for i in range(len(per))) / len(per)
+    assert sum(per) / len(per) == pytest.approx(model_mean, rel=0.005)
+
+
+def test_breathe_spends_half_its_cycle_above_the_perceptual_midpoint():
+    """The point of defining the curve in perceived lightness: the old table
+    timing spent 68% of the cycle above the midpoint (L* 50); this spends 50%."""
+    for state in ("ok", "thinking"):
+        per = _per_period_on_us(led_status._state_segments(state))
+        assert _share_above_midpoint(per) == pytest.approx(0.50, abs=0.03), state
+
+
+def test_breath_shape_exponent_above_one_spends_less_time_bright():
+    base = _per_period_on_us(led_status._breath_segments(5.0, shape=1.0))
+    dim = _per_period_on_us(led_status._breath_segments(5.0, shape=1.3))
+    assert _share_above_midpoint(dim) < _share_above_midpoint(base) - 0.03
+
+
+def test_lightness_to_luminance_is_the_cie_1976_inverse():
+    f = led_status._lightness_to_luminance
+    assert f(0.0) == 0.0 and f(1.0) == pytest.approx(1.0)
+    assert f(0.5) == pytest.approx(0.184, abs=0.001)             # L* 50 = 18.4% of full luminance
+    assert f(0.08) == pytest.approx(8 / 903.3)                   # toe, meets the cube-root branch at L* 8
+    assert f(0.08 + 1e-9) == pytest.approx(f(0.08), abs=1e-6)    # continuous there
+    steps = [f(i / 100) for i in range(101)]
+    assert steps == sorted(steps)                                # monotonic
+    for p in (0.02, 0.3, 0.5, 0.9):                              # round trip with the forward transform
+        assert led_status._luminance_to_lightness(f(p)) == pytest.approx(100 * p, rel=1e-6)
+    assert f(-1) == 0.0 and f(2) == pytest.approx(1.0)           # clamped
+
+
+def test_dither_keeps_slow_dim_levels_right_on_average():
+    """A wanted 2us on-time is below one 5us step: rounding alone gives 0 forever
+    (the fade would hold dark, then jump); error diffusion averages it out."""
+    plain = led_status._pattern_segments_us(lambda t: 2.0, 1.0, dither=False)
+    dithered = led_status._pattern_segments_us(lambda t: 2.0, 1.0, dither=True)
+    assert _on_us(plain) == 0
+    assert _on_us(dithered) == pytest.approx(2.0 * 100, abs=5)   # 100 periods x 2us
+    assert set(_per_period_on_us(dithered)) <= {0, 5}            # only adjacent steps
+
+
+def test_legacy_table_model_is_still_selectable(monkeypatch):
+    monkeypatch.setattr(led_status, "BREATH_MODEL", "table")
     ok, thinking = _tables()
     segs = led_status._state_segments("ok", ok, thinking)
-    assert abs(_total_us(segs) - ok[2] * 1e6) <= PERIOD        # cycle length = table length (to 10ms)
-    breath_peak_us = led_status.BREATH_PEAK_STEPS * led_status.WAVE_STEP_US
-    assert max(us for lvl, us in segs if lvl) <= breath_peak_us   # never brighter than the breathe cap (8%)
-    # ...and reaches (within a step or two of) it: the table dwells only a few ms on the very
-    # top values, so a 10ms sample can land just below the peak
-    assert max(us for lvl, us in segs if lvl) >= 0.97 * breath_peak_us
-    # mean brightness equals the table's dwell-weighted mean (what the old renderer showed)
-    values, cumulative, total = ok
-    dwell = [cumulative[0]] + [cumulative[i] - cumulative[i - 1] for i in range(1, len(cumulative))]
-    expected_mean = sum(v * d for v, d in zip(values, dwell)) / total * led_status.WAVE_STEP_US / PERIOD
-    assert _on_us(segs) / _total_us(segs) == pytest.approx(expected_mean, rel=0.03)
+    assert abs(_total_us(segs) - ok[2] * 1e6) <= PERIOD
+    assert max(us for lvl, us in segs if lvl) <= PEAK_US
 
 
 def test_breathe_wave_is_small_enough_for_pigpio():
-    ok, thinking = _tables()
     for state in ("ok", "thinking"):
-        assert len(led_status._state_segments(state, ok, thinking)) < 12000   # pigpio's per-wave pulse limit
+        assert len(led_status._state_segments(state)) < 12000   # pigpio's per-wave pulse limit
 
 
 def test_state_segments_rejects_unknown_state():
@@ -558,22 +618,22 @@ def test_health_check_treats_reloading_as_active():
         assert led_status._check_watched_services({}) is False
 
 
-def test_breathe_and_pulse_are_capped_below_the_blink_states():
-    ok, thinking = _tables()
-    cap = led_status.BREATH_PEAK_STEPS * led_status.WAVE_STEP_US
-    for state in ("ok", "thinking"):
-        segs = led_status._state_segments(state, ok, thinking)
-        assert max(us for lvl, us in segs if lvl) <= cap < PEAK_US
+def test_every_state_is_capped_at_the_same_brightness():
+    """BRIGHTNESS applies to all modes: breathe, pulse, blinks and solid alike."""
+    for state in ("ok", "thinking", "ap", "error", "no_sensor"):
+        segs = led_status._state_segments(state)
+        assert max(us for lvl, us in segs if lvl) <= PEAK_US, state
+    assert max(us for lvl, us in led_status._state_segments("error") if lvl) == PEAK_US
 
 
-def test_breathe_cycle_is_about_five_seconds_and_pulse_about_one_and_a_half():
-    ok, thinking = _tables()
-    assert ok[2] == pytest.approx(5.0, abs=0.15)
-    assert thinking[2] == pytest.approx(1.49, abs=0.05)   # pulse speed unchanged by the dimmer peak
+def test_cycle_lengths():
+    assert _total_us(led_status._state_segments("ok")) == 5_000_000
+    assert _total_us(led_status._state_segments("thinking")) == 1_500_000
 
 
 def test_weight_exponent_above_one_shifts_time_toward_the_dim_end():
-    peak = led_status.BREATH_PEAK_STEPS
+    """Legacy table model only."""
+    peak = led_status.PEAK_STEPS
     def share_above(table, frac):
         values, cumulative, total = table
         dwell = [cumulative[0]] + [cumulative[i] - cumulative[i - 1] for i in range(1, len(cumulative))]

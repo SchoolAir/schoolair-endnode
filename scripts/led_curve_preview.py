@@ -5,13 +5,14 @@ Run ON the Pi, as root (it stops schoolair-led.service for the duration and star
 it again afterwards):
 
     sudo python3 ~/schoolair/scripts/led_curve_preview.py            # all candidates
-    sudo python3 ~/schoolair/scripts/led_curve_preview.py B D        # just these
-    sudo python3 ~/schoolair/scripts/led_curve_preview.py -s 20 B E  # 20 s each
+    sudo python3 ~/schoolair/scripts/led_curve_preview.py B C        # just these
+    sudo python3 ~/schoolair/scripts/led_curve_preview.py -s 20 A B  # 20 s each
 
 Each candidate is announced by N quick blinks (A = 1, B = 2, ...), then 1 s of dark,
-then the breathing curve. The table below is what "peak", "cycle" and "low-heavy"
-mean; edit CANDIDATES to try other values. Whatever you settle on goes into
-led_status.py (BREATH_PEAK_FRAC, OK_TEMPO_SCALE, BREATH_WEIGHT_EXPONENT).
+then the breathing curve. Before playing, each one prints how much of its cycle it
+spends above the perceptual midpoint (CIE lightness L* >= 50), which is the number
+that matters for "does it stay bright too long". Whatever you settle on goes into
+led_status.py (BREATH_MODEL, BREATH_SHAPE_EXPONENT, BREATH_DITHER, BRIGHTNESS).
 """
 import argparse
 import os
@@ -22,30 +23,52 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import led_status as L  # noqa: E402
 
-# label: (description, peak fraction of full brightness, target cycle seconds, weight exponent)
+CYCLE = 5.0
+
+
+def legacy_table():
+    """The previous timing (log-weighted dwell per brightness step), at the current cap."""
+    table = L._build_breath_table(L.PEAK_STEPS, L.OK_PERIOD_S * L.OK_TEMPO_SCALE,
+                                  L.TICK * L.OK_TEMPO_SCALE, L.BREATH_WEIGHT_EXPONENT)
+    return L._table_segments(table)
+
+
+# label: (description, function returning the pulse list for one cycle)
 CANDIDATES = {
-    "A": ("before: 10% peak, ~6 s", 0.10, 6.0, 1.0),
-    "B": ("new default: 8% peak, 5 s", 0.08, 5.0, 1.0),
-    "C": ("6% peak, 5 s", 0.06, 5.0, 1.0),
-    "D": ("8% peak, 5 s, a bit low-heavy (weight^1.25)", 0.08, 5.0, 1.25),
-    "E": ("8% peak, 5 s, low-heavy (weight^1.5)", 0.08, 5.0, 1.5),
+    "A": ("previous table timing (the one that felt too bright too long)", legacy_table),
+    "B": ("perceptual cosine, half the cycle above the midpoint (new default)",
+          lambda: L._breath_segments(CYCLE, shape=1.0, dither=True)),
+    "C": ("perceptual, a bit less time bright (shape 1.3)",
+          lambda: L._breath_segments(CYCLE, shape=1.3, dither=True)),
+    "D": ("perceptual, shape 1.0, NO dithering (dim end as plain 5us steps)",
+          lambda: L._breath_segments(CYCLE, shape=1.0, dither=False)),
+    "E": ("perceptual, noticeably less time bright (shape 1.6)",
+          lambda: L._breath_segments(CYCLE, shape=1.6, dither=True)),
 }
 
 
-def build(peak_frac, target_cycle, exponent):
-    """(table, actual_cycle): tempo is solved so the cycle comes out at target_cycle."""
-    peak = round(L.WAVE_STEPS * peak_frac)
+def per_period_on_us(segments):
+    out, on, acc = [], 0, 0
+    for level, us in segments:
+        while us > 0:
+            take = min(us, L.WAVE_PERIOD_US - acc)
+            on += take if level else 0
+            acc += take
+            us -= take
+            if acc == L.WAVE_PERIOD_US:
+                out.append(on)
+                on, acc = 0, 0
+    return out
 
-    def cycle(tempo):
-        return L._build_breath_table(peak, L.OK_PERIOD_S * tempo, L.TICK * tempo, exponent)[2]
 
-    lo, hi = 0.3, 8.0
-    for _ in range(40):
-        mid = (lo + hi) / 2
-        lo, hi = (mid, hi) if cycle(mid) < target_cycle else (lo, mid)
-    tempo = (lo + hi) / 2
-    table = L._build_breath_table(peak, L.OK_PERIOD_S * tempo, L.TICK * tempo, exponent)
-    return table, tempo
+def describe(segments):
+    per = per_period_on_us(segments)
+    lightness = [L._luminance_to_lightness(x / L.PEAK_US) for x in per]
+    above = sum(1 for v in lightness if v >= 50) / len(per) * 100
+    dim = sum(1 for v in lightness if v < 20) / len(per) * 100
+    return (f"cycle {sum(us for _, us in segments) / 1e6:.2f} s, {above:.0f}% of it above the perceptual midpoint, "
+            f"{dim:.0f}% nearly dark (L*<20), mean brightness {sum(per) / len(per) / L.WAVE_PERIOD_US * 100:.2f}% duty, "
+            f"peak {max(per) / L.WAVE_PERIOD_US * 100:.1f}%")
 
 
 def main():
@@ -64,17 +87,16 @@ def main():
     wave = None
     try:
         for label in labels:
-            desc, peak_frac, cycle, exponent = CANDIDATES[label]
-            table, tempo = build(peak_frac, cycle, exponent)
+            desc, build = CANDIDATES[label]
+            segs = build()
             n = list(CANDIDATES).index(label) + 1
-            print(f"{label}: {desc}  (actual cycle {table[2]:.2f} s, tempo {tempo:.3f})  -- {n} blink(s), then the curve")
+            print(f"{label}: {desc}\n     {describe(segs)}\n     -> {n} blink(s), 1 s dark, then the curve for {args.seconds:.0f} s", flush=True)
             blink = L._pattern_segments(lambda t: L.PEAK_STEPS if t < 100_000 else 0, 0.35)
             wave = L._send_pattern(pi, pigpio, blink, wave)
             time.sleep(0.35 * n)
             pi.wave_tx_stop()
             pi.write(L.GPIO_LED, 0)
             time.sleep(1.0)
-            segs = L._pattern_segments(lambda t_us: L._table_lookup(table, t_us / 1e6), table[2])
             wave = L._send_pattern(pi, pigpio, segs, wave)
             time.sleep(args.seconds)
     finally:
