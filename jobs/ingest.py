@@ -49,6 +49,26 @@ def _set_led_state(state: str) -> None:
         pass
 
 
+def _get_led_state() -> "str | None":
+    """Current word in the LED state file, or None if there isn't one (outdoor
+    units, or led_status.py not started). Only used to decide whether the LED is
+    still waiting for confirmation — see _connectivity_ping_loop()."""
+    try:
+        with open(LED_STATE_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+# Held by the registration wizard for the whole of a connect-and-register attempt
+# (see registration_wizard/wizard.py run_registration). While it exists the wizard
+# owns the LED ("thinking" is its own), so don't second-guess it.
+WIZARD_BUSY_FILE = "/run/schoolair-wizard-busy"
+
+_PING_RECHECK_S = 15       # while the LED is "thinking": ping again this often (each check is one RAM read)...
+_PING_RETRY_MAX_S = 300    # ...backing off (doubling) up to this if the server keeps refusing
+
+
 PENDING_UPDATE_FILE = "/var/lib/schoolair/update-pending.json"
 
 
@@ -612,17 +632,16 @@ def _maybe_trigger_update_from_error(res: "httpx.Response") -> None:
         pass
 
 
-async def _startup_connectivity_ping() -> None:
-    """Fired once at boot, in the background — confirms the server is
-    reachable and resolves the LED out of "thinking" (its default state on
-    startup) immediately, instead of leaving it there until the first real
-    sensor read/upload succeeds. That first upload can be up to
-    READ_IDLE_SECONDS away outside the active window, which reads as
+async def _startup_connectivity_ping() -> bool:
+    """Confirms the server is reachable and resolves the LED out of
+    "thinking" (its default state on startup) immediately, instead of leaving
+    it there until the first real sensor read/upload succeeds — which can be
+    up to READ_IDLE_SECONDS (15 min) away outside the active window, reading as
     "something's wrong" the whole time even though nothing is. GET
     /aqc/v1/validate is a deliberately cheap, no-DB-write endpoint — this
     isn't meant to replace the real upload, just prove connectivity exists.
-    Failure leaves the LED at "thinking"; the first real read/upload
-    (or the next boot) will resolve it from there — no retry loop here.
+    Returns True if the server accepted the token (LED set to "ok"), False
+    otherwise. A failure leaves the LED alone; _connectivity_ping_loop() retries.
 
     Also carries the same backlog-drain credit as a real ingest response —
     a device reconnecting with a queued backlog (e.g. after being offline,
@@ -631,22 +650,49 @@ async def _startup_connectivity_ping() -> None:
     be minutes away outside the active window."""
     token = os.getenv("NEW_AUTH_TOKEN", "").strip()
     if not token or not _PRIMARY_SERVER_URL:
-        return
+        return False
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             res = await client.get(f"{_PRIMARY_SERVER_URL}/aqc/v1/validate", headers=_auth_headers())
-        if res.is_success:
-            _set_led_state("ok")
-            print("[startup] connectivity confirmed")
+        if not res.is_success:
+            _maybe_trigger_update_from_error(res)
+            return False
+        _set_led_state("ok")
+        print("[startup] connectivity confirmed")
+        try:
             response = res.json()
             _maybe_trigger_update(response)
             _update_credit(response)
             if queue.count_pending() > 0 and _credit_bytes > 0:
                 await _drain_backlog()
-        else:
-            _maybe_trigger_update_from_error(res)
+        except Exception:
+            pass
+        return True
     except Exception:
-        pass
+        return False
+
+
+async def _connectivity_ping_loop() -> None:
+    """Pings at startup, then keeps re-checking for as long as the LED is stuck
+    in "thinking". The one-shot ping used to be the only thing that could
+    resolve it early, so a boot ping that fired before the network was really
+    up (or a restart of led_status.py, which resets the LED to "thinking" while
+    everything else is fine) left the LED "thinking" until the next real upload
+    — up to 15 minutes. Now it resolves within _PING_RECHECK_S.
+
+    Cheap when nothing is wrong: one read of the (RAM-backed) state file per
+    interval, no network. Backs off if the server keeps refusing (e.g. revoked
+    token). Skipped while the wizard is mid-registration, and on units with no
+    LED state file at all."""
+    ok = await _startup_connectivity_ping()
+    delay = _PING_RECHECK_S
+    while True:
+        await asyncio.sleep(delay)
+        if os.path.exists(WIZARD_BUSY_FILE) or _get_led_state() != "thinking":
+            delay = _PING_RECHECK_S
+            continue
+        ok = await _startup_connectivity_ping()
+        delay = _PING_RECHECK_S if ok else min(delay * 2, _PING_RETRY_MAX_S)
 
 
 async def _mirror_batch(readings: list[dict]) -> None:
@@ -1151,7 +1197,7 @@ async def ingest_loop():
         f"write-through with SQLite fallback"
         + (f" | aux sensors: {', '.join(s['name'] for s in active_sensors)}" if active_sensors else "")
     )
-    asyncio.create_task(_startup_connectivity_ping())
+    asyncio.create_task(_connectivity_ping_loop())
     await asyncio.gather(
         _read_loop(active_sensors),
         _upload_loop(),
