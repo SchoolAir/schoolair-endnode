@@ -1059,3 +1059,105 @@ def test_ensure_drain_jitter_honours_existing_value(tmp_path, monkeypatch):
 
     assert jitter == 42
     assert not settings_file.exists(), "file must not be written when value already present"
+
+
+# ── _startup_connectivity_ping return value + _connectivity_ping_loop ─────────
+
+async def test_startup_ping_returns_true_only_on_success(monkeypatch, tmp_path):
+    monkeypatch.setattr(ingest, "_PRIMARY_SERVER_URL", "http://server")
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(tmp_path / "led-state"))
+    with patch("httpx.AsyncClient", return_value=_mock_get_client({"device_id": 1, "min_version": None})):
+        assert await _startup_connectivity_ping() is True
+    with patch("httpx.AsyncClient", return_value=_mock_get_client({"error": "nope"}, status=401)):
+        assert await _startup_connectivity_ping() is False
+    monkeypatch.delenv("NEW_AUTH_TOKEN")
+    assert await _startup_connectivity_ping() is False
+
+
+async def test_startup_ping_returns_false_when_server_unreachable(monkeypatch):
+    monkeypatch.setattr(ingest, "_PRIMARY_SERVER_URL", "http://server")
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+    boom = AsyncMock()
+    boom.__aenter__ = AsyncMock(side_effect=httpx.ConnectError("down"))
+    with patch("httpx.AsyncClient", return_value=boom):
+        assert await _startup_connectivity_ping() is False
+
+
+class _StopLoop(BaseException):
+    pass
+
+
+def _run_ping_loop(monkeypatch, led_states, ping_results, wizard_busy=False, max_sleeps=6):
+    """Drives _connectivity_ping_loop with scripted LED states / ping outcomes.
+    Returns (ping_call_count, list_of_sleep_delays)."""
+    states = iter(led_states)
+    results = iter(ping_results)
+    pings, delays = [], []
+
+    async def fake_ping():
+        pings.append(1)
+        return next(results)
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+        if len(delays) >= max_sleeps:
+            raise _StopLoop
+
+    monkeypatch.setattr(ingest, "_startup_connectivity_ping", fake_ping)
+    monkeypatch.setattr(ingest, "_get_led_state", lambda: next(states))
+    monkeypatch.setattr(ingest.os.path, "exists", lambda p: wizard_busy and p == ingest.WIZARD_BUSY_FILE)
+    monkeypatch.setattr(ingest.asyncio, "sleep", fake_sleep)
+    return pings, delays
+
+
+async def test_ping_loop_pings_at_startup_then_only_while_led_is_thinking(monkeypatch):
+    # startup ping fails -> LED stays thinking -> re-ping succeeds -> LED "ok" -> no more pings
+    pings, delays = _run_ping_loop(monkeypatch,
+        led_states=["thinking", "ok", "ok", "ok", "ok", "ok"], ping_results=[False, True])
+    with pytest.raises(_StopLoop):
+        await ingest._connectivity_ping_loop()
+    assert len(pings) == 2                       # startup + one re-ping, then quiet
+    assert set(delays) == {ingest._PING_RECHECK_S}   # a recovered ping resets the interval
+
+
+async def test_ping_loop_recovers_a_reset_led_within_one_interval(monkeypatch):
+    """The 15-minute quirk: led_status.py restarts (LED reset to "thinking") while
+    everything else is fine. The next loop tick pings and puts it back to "ok"."""
+    pings, delays = _run_ping_loop(monkeypatch,
+        led_states=["ok", "ok", "thinking", "ok", "ok", "ok"], ping_results=[True, True])
+    with pytest.raises(_StopLoop):
+        await ingest._connectivity_ping_loop()
+    assert len(pings) == 2 and set(delays) == {ingest._PING_RECHECK_S}
+
+
+async def test_ping_loop_backs_off_while_the_server_keeps_refusing(monkeypatch):
+    pings, delays = _run_ping_loop(monkeypatch,
+        led_states=["thinking"] * 8, ping_results=[False] * 8, max_sleeps=7)
+    with pytest.raises(_StopLoop):
+        await ingest._connectivity_ping_loop()
+    r = ingest._PING_RECHECK_S
+    assert delays == [r, r * 2, r * 4, r * 8, r * 16, 300, 300]   # doubles, capped at 5 min
+
+
+async def test_ping_loop_does_nothing_while_the_wizard_is_registering(monkeypatch):
+    pings, delays = _run_ping_loop(monkeypatch,
+        led_states=["thinking"] * 6, ping_results=[True], wizard_busy=True)
+    with pytest.raises(_StopLoop):
+        await ingest._connectivity_ping_loop()
+    assert len(pings) == 1                                   # only the startup ping
+
+
+async def test_ping_loop_is_silent_on_units_with_no_led_state_file(monkeypatch):
+    pings, _ = _run_ping_loop(monkeypatch, led_states=[None] * 6, ping_results=[True])
+    with pytest.raises(_StopLoop):
+        await ingest._connectivity_ping_loop()
+    assert len(pings) == 1
+
+
+def test_get_led_state_reads_the_word_and_tolerates_a_missing_file(monkeypatch, tmp_path):
+    f = tmp_path / "led-state"
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(f))
+    assert ingest._get_led_state() is None
+    f.write_text("thinking\n")
+    assert ingest._get_led_state() == "thinking"

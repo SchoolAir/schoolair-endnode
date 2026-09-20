@@ -1,6 +1,6 @@
 """tests/test_setup.py
 
-Unit tests for setup.py: write_env_token and check_registration.
+Unit tests for setup.py: write_env_token.
 """
 
 from unittest.mock import patch
@@ -33,28 +33,3 @@ def test_write_env_token_appends_if_key_absent(tmp_path, monkeypatch):
     monkeypatch.setattr(setup, "ENV_PATH", env_file)
     setup.write_env_token("tok456")
     assert "AUTH_TOKEN=tok456" in env_file.read_text()
-
-
-def test_check_registration_returns_false_without_token(monkeypatch):
-    monkeypatch.delenv("AUTH_TOKEN", raising=False)
-    assert setup.check_registration() is False
-
-
-def test_check_registration_returns_true_with_valid_token(monkeypatch):
-    monkeypatch.setenv("AUTH_TOKEN", "tok123")
-    with patch("setup.validate_token", return_value=True):
-        assert setup.check_registration() is True
-
-
-def test_check_registration_returns_true_when_server_unreachable(monkeypatch):
-    """Server errors must not block startup — readings queue locally instead."""
-    monkeypatch.setenv("AUTH_TOKEN", "tok123")
-    with patch("setup.validate_token", side_effect=Exception("unreachable")):
-        assert setup.check_registration() is True
-
-
-def test_check_registration_returns_true_on_non_2xx(monkeypatch):
-    """Non-2xx validation is a warning, not a gate."""
-    monkeypatch.setenv("AUTH_TOKEN", "tok123")
-    with patch("setup.validate_token", return_value=False):
-        assert setup.check_registration() is True

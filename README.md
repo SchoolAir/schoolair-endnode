@@ -372,8 +372,7 @@ schoolair-pi/
 ├── tests/                     103 tests across 7 modules
 │
 ├── main.py                    Entrypoint — ingest loop + Microdot server
-├── setup.py                   Registration gate (check_registration) and
-│                              recovery CLI (python -m setup)
+├── setup.py                   Recovery CLI (python -m setup)
 ├── read-sensor.sh             Invokes sen6x_read; sensor.py captures its stdout
 ├── schoolair_setup.sh         Unified installer + OTA updater (pass --update for field upgrades)
 ├── schoolair-update           Thin OTA wrapper → /usr/local/bin/ (root-owned, sudoers-approved)

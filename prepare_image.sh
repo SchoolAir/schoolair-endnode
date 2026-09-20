@@ -108,7 +108,12 @@ ethernets:
 NETCFG
     ok "cloud-init network-config: replaced with ethernet-only config (WiFi credentials removed)"
 fi
-ok "cloud-init reset"
+# cloud-init is disabled outright on SchoolAir devices (see schoolair_setup.sh):
+# its per-boot modules cost ~35s of CPU on a Pi Zero W and its Imager
+# provisioning is superseded by first_boot.sh / set_hostname.sh + the wizard.
+# `cloud-init clean` does not touch this marker.
+sudo mkdir -p /etc/cloud && sudo touch /etc/cloud/cloud-init.disabled
+ok "cloud-init reset and disabled (/etc/cloud/cloud-init.disabled) — no first-boot delay on clones"
 
 # ── 8. Reset hostname ─────────────────────────────────────────────────────────
 step "Ensuring first-boot service is enabled for clones"

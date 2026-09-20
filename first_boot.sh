@@ -14,6 +14,17 @@ if ! ls /etc/ssh/ssh_host_*_key &>/dev/null 2>&1; then
     echo "[schoolair-first-boot] SSH host keys generated"
 fi
 
+# rpi-resize.service (grow + fstrim the root fs) is ConditionFirstBoot=yes and only
+# disables itself when it actually runs. If systemd did not consider this a first
+# boot (e.g. /etc/machine-id was already populated) it is skipped every boot —
+# yet its Wants= still pulls in fstrim.service, a full-card TRIM that stalls the
+# SD card for ~30s on a Pi Zero W (starving NetworkManager and everything
+# after it) on EVERY boot. Drop the enable once it has been skipped.
+if [ "$(systemctl show rpi-resize.service -p ConditionResult --value 2>/dev/null)" = "no" ]; then
+    systemctl disable rpi-resize.service &>/dev/null || true
+    echo "[schoolair-first-boot] rpi-resize.service was skipped (not a first boot) — disabled so it stops triggering fstrim"
+fi
+
 [[ "$(hostname)" == "schoolair-template" ]] || exit 0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
