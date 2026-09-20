@@ -26,16 +26,17 @@ import led_status as L  # noqa: E402
 CYCLE = 5.0
 
 
-def breath(shape, dither_below_us):
-    return lambda: L._breath_segments(CYCLE, shape=shape, dither_below_us=dither_below_us)
+def breath(dither_below_us, black_point_us=0.0):
+    return lambda: L._breath_segments(CYCLE, dither_below_us=dither_below_us, black_point_us=black_point_us)
 
 
 # label: (description, function returning the pulse list for one cycle)
-# Needs pigpiod running with -s 1 (deploy/pigpiod-early.conf) for the 1us steps to be exact.
+# All are shape 1.6. Needs pigpiod running with -s 1 (deploy/pigpiod-early.conf).
 CANDIDATES = {
-    "A": ("shape 1.6, plain 1us steps: the bottom you called steppy (esp. on the way down)", breath(1.6, 0.0)),
-    "B": ("shape 1.6, bottom dithered below 16us: the new default", breath(1.6, L.BREATH_DIM_DITHER_US)),
-    "C": ("shape 1.0, bottom dithered: symmetric, for reference", breath(1.0, L.BREATH_DIM_DITHER_US)),
+    "A": ("dither below 16us (what you saw last): brightening still steppy", breath(16.0)),
+    "B": ("dither below 64us: the new default", breath(64.0)),
+    "C": ("B + black point 1us: the fade emerges from true dark, so brightening spends far less time on single sparks", breath(64.0, 1.0)),
+    "D": ("B + black point 2us: as C, a little more dark", breath(64.0, 2.0)),
 }
 
 
@@ -63,9 +64,12 @@ def describe(segments):
     lightness = [L._luminance_to_lightness(x / L.PEAK_US) for x in per]
     above = sum(1 for v in lightness if v >= 50) / len(per) * 100
     dim = sum(1 for v in lightness if v < 20) / len(per) * 100
+    half = len(per) // 2
+    sparks_ms = sum(1 for i in range(half - 10)
+                    if 0 < sum(per[i:i + 10]) / 10 < 1.0) * L.WAVE_PERIOD_US / 1000    # rising half, 100 ms windows
     return (f"cycle {sum(us for _, us in segments) / 1e6:.2f} s, {above:.0f}% of it above the perceptual midpoint, "
             f"{dim:.0f}% nearly dark (L*<20), mean brightness {sum(per) / len(per) / L.WAVE_PERIOD_US * 100:.2f}% duty, "
-            f"peak {max(per) / L.WAVE_PERIOD_US * 100:.1f}%")
+            f"peak {max(per) / L.WAVE_PERIOD_US * 100:.1f}%, brightening passes the single-spark zone in {sparks_ms:.0f} ms")
 
 
 def main():

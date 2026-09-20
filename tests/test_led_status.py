@@ -734,3 +734,79 @@ def test_no_pulse_is_ever_dropped_or_negative_when_dithering_down_to_dark():
     assert all(0 <= x <= PEAK_US for x in per)
     # the fade actually reaches full dark, and stays a sequence of small steps into it
     assert per[0] == 0 and per[-1] == 0
+
+
+# ── both dark ends, the higher threshold, and the black point ────────────────
+
+def _eye_window_error(per, ideal, idx_range, win=10):
+    """(worst, rms) relative error of 100ms-window brightness vs the ideal fade."""
+    rel = []
+    for i in idx_range:
+        want = sum(ideal[i:i + win]) / win
+        if want >= 0.15:
+            rel.append(abs(sum(per[i:i + win]) / win - want) / want)
+    return max(rel), (sum(r * r for r in rel) / len(rel)) ** 0.5
+
+
+def test_dither_threshold_default_is_64us():
+    assert led_status.BREATH_DIM_DITHER_US == 64.0
+
+
+def test_dithering_treats_the_rising_and_falling_dark_ends_alike():
+    """Error diffusion runs in time order, so it smooths the brightening exactly as
+    it smooths the darkening: same eye-window error on both halves."""
+    n, half = 500, 250
+    ideal = [led_status._breath_on_us(i * PERIOD, 5.0) for i in range(n)]
+    per = _per_period_on_us(led_status._breath_segments(5.0))
+    rise_worst, rise_rms = _eye_window_error(per, ideal, range(0, half - 10))
+    fall_worst, fall_rms = _eye_window_error(per, ideal, range(half, n - 10))
+    assert rise_rms < 0.06 and fall_rms < 0.06
+    assert rise_rms == pytest.approx(fall_rms, rel=0.35)
+    assert rise_worst < 0.5 and fall_worst < 0.5
+
+
+def test_rising_and_falling_pulse_trains_are_mirror_images_at_the_dark_end():
+    """So any difference in how the two ends look is perceptual (dark adaptation),
+    not something in the signal."""
+    per = _per_period_on_us(led_status._breath_segments(5.0))
+    rise, fall = per[:50], per[-50:][::-1]
+    assert sum(1 for x in rise if x) == pytest.approx(sum(1 for x in fall if x), abs=3)
+    assert sum(rise) == pytest.approx(sum(fall), rel=0.15)
+
+
+def test_threshold_above_16us_makes_no_difference_to_the_eye_integrated_error():
+    """Documents why raising it was not the lever for the steppy rise: the remaining
+    error is sub-3us; above ~16us plain rounding is already within a percent or two."""
+    n = 500
+    ideal = [led_status._breath_on_us(i * PERIOD, 5.0) for i in range(n)]
+    e16 = _eye_window_error(_per_period_on_us(led_status._breath_segments(5.0, dither_below_us=16.0)), ideal, range(n - 10))
+    e64 = _eye_window_error(_per_period_on_us(led_status._breath_segments(5.0, dither_below_us=64.0)), ideal, range(n - 10))
+    assert e64[1] == pytest.approx(e16[1], abs=0.01)
+
+
+def test_black_point_default_is_off_and_leaves_the_curve_unchanged():
+    assert led_status.BREATH_BLACK_POINT_US == 0.0
+    for t in (0, 700_000, 1_500_000, 2_500_000, 4_000_000):
+        assert led_status._breath_on_us(t, 5.0) == led_status._breath_on_us(t, 5.0, black_point_us=0.0)
+
+
+def test_black_point_darkens_the_bottom_and_keeps_the_peak():
+    peak_t = 2_500_000
+    assert led_status._breath_on_us(peak_t, 5.0, black_point_us=2.0) == pytest.approx(PEAK_US)
+    # everything the plain curve has below the black point is dark
+    for t in range(0, 5_000_000, 10_000):
+        plain = led_status._breath_on_us(t, 5.0)
+        shifted = led_status._breath_on_us(t, 5.0, black_point_us=2.0)
+        if plain <= 2.0:
+            assert shifted == 0.0
+        assert shifted <= plain + 1e-9
+
+
+def test_black_point_shortens_the_single_spark_zone_of_the_brightening():
+    """The sparse zone (100ms-window mean below 1us per slot, where the LED emits
+    single 1us pulses) is what a dark-adapted eye sees as steps on the way up."""
+    def sparks_ms(black):
+        per = _per_period_on_us(led_status._breath_segments(5.0, black_point_us=black))
+        return sum(1 for i in range(240) if 0 < sum(per[i:i + 10]) / 10 < 1.0) * 10
+    assert sparks_ms(1.0) < sparks_ms(0.0) / 1.8
+    assert sparks_ms(2.0) <= sparks_ms(1.0)

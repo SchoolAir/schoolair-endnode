@@ -90,7 +90,22 @@ PEAK_US = round(WAVE_PERIOD_US * PEAK_FRAC * BRIGHTNESS)   # 800us on-time per 1
 OK_CYCLE_S = 5.0
 THINKING_CYCLE_S = 1.5
 BREATH_SHAPE_EXPONENT = 1.6      # 40% of the cycle above the perceptual midpoint (chosen by eye from 1.0/1.3/1.6)
-BREATH_DIM_DITHER_US = 16.0
+BREATH_DIM_DITHER_US = 64.0
+#    (Raised from 16us at the user's request. It applies identically to the rising and
+#    falling halves — the error diffusion runs in time order — and measured no change in
+#    the eye-integrated error above ~16us, where plain rounding is already within 1-2%;
+#    64us keeps every step in the dithered region below 1.6%. It costs nothing: the wave
+#    is the same size.)
+#  - BREATH_BLACK_POINT_US: on-times below this are dark and the fade emerges from there
+#    (the curve is shifted and rescaled so the peak is unchanged). Why: the eye is
+#    dark-adapted by the time the LED brightens again after ~1.5s near dark, and then
+#    each individual 1us pulse of the sparse zone (mean < 1us per slot, where the
+#    LED is emitting single sparks) is visible as a step; on the way down the eye is
+#    still light-adapted and they are masked. The rise and fall pulse trains are mirror
+#    images, so this is perceptual, and a higher dither threshold cannot fix it: the
+#    only lever is spending less time in the sparse zone (390ms at 0; 100ms at 1us;
+#    70ms at 2us), at the price of a longer fully-dark stretch (0 / 0.8s / 1.0s of 5s).
+BREATH_BLACK_POINT_US = 0.0
 
 _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 
@@ -338,12 +353,17 @@ def _luminance_to_lightness(y: float) -> float:
     return 903.3 * y if y <= 0.008856 else 116.0 * y ** (1.0 / 3.0) - 16.0
 
 
-def _breath_on_us(t_us: float, cycle_s: float, shape: float = None) -> float:
+def _breath_on_us(t_us: float, cycle_s: float, shape: float = None, black_point_us: float = None) -> float:
     """On-time (us, fractional) per PWM period at t_us into a breath: raised
-    cosine in perceived lightness -> luminance -> scaled to the cap."""
+    cosine in perceived lightness -> luminance -> scaled to the cap, then
+    (optionally) shifted so everything below the black point is dark."""
     shape = BREATH_SHAPE_EXPONENT if shape is None else shape
+    black = BREATH_BLACK_POINT_US if black_point_us is None else black_point_us
     p = _ease(t_us / 1e6, cycle_s) ** shape
-    return PEAK_US * _lightness_to_luminance(p)
+    on_us = PEAK_US * _lightness_to_luminance(p)
+    if black > 0:
+        on_us = max(0.0, on_us - black) * PEAK_US / (PEAK_US - black)
+    return on_us
 
 
 def _pattern_segments_us(on_us_at, cycle_s: float, dither_below_us: float = 0.0):
@@ -381,12 +401,14 @@ def _pattern_segments_us(on_us_at, cycle_s: float, dither_below_us: float = 0.0)
     return segments
 
 
-def _breath_segments(cycle_s: float, shape: float = None, dither_below_us: float = None):
+def _breath_segments(cycle_s: float, shape: float = None, dither_below_us: float = None,
+                     black_point_us: float = None):
     shape = BREATH_SHAPE_EXPONENT if shape is None else shape
     if dither_below_us is None:
         # only worthwhile once pulses are fine enough (see BREATH_DIM_DITHER_US)
         dither_below_us = BREATH_DIM_DITHER_US if WAVE_STEP_US == 1 else 0.0
-    return _pattern_segments_us(lambda t_us: _breath_on_us(t_us, cycle_s, shape), cycle_s, dither_below_us)
+    return _pattern_segments_us(
+        lambda t_us: _breath_on_us(t_us, cycle_s, shape, black_point_us), cycle_s, dither_below_us)
 
 
 def _state_segments(state: str):
