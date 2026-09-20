@@ -214,17 +214,11 @@ alerts are not lost on a clean shutdown.
 
 ---
 
-## `test_setup.py` — Registration gate (7 tests)
+## `test_setup.py` — setup.py helpers (3 tests)
 
-Tests `write_env_token()` and `check_registration()` from `setup.py`.
+Tests `write_env_token()` from `setup.py`.
 
 **`write_env_token`** (3 tests) — writes `AUTH_TOKEN=<value>` to the `.env` file
 - `test_write_env_token_creates_file_if_absent` — file does not exist → created with the token line
 - `test_write_env_token_updates_existing_token` — `AUTH_TOKEN=old` is replaced in-place; other lines (e.g. `SERVER_URL`) are preserved
 - `test_write_env_token_appends_if_key_absent` — file exists but has no `AUTH_TOKEN` line → token is appended
-
-**`check_registration`** (4 tests) — non-interactive startup gate used by `main.py`
-- `test_check_registration_returns_false_without_token` — no `AUTH_TOKEN` env var → `False` (device will buffer locally)
-- `test_check_registration_returns_true_with_valid_token` — token present and server confirms valid → `True`
-- `test_check_registration_returns_true_when_server_unreachable` — token present but server throws → still `True` (ingest loop starts and queues readings)
-- `test_check_registration_returns_true_on_non_2xx` — server returns non-2xx validation response → still `True` (warning only, not a gate)

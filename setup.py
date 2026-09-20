@@ -4,9 +4,9 @@ Device commissioning and registration.
 
 Run manually to register a device:   python -m setup
 
-Also exposes check_registration(), a NON-interactive gate used by main.py
-under systemd. It never prompts, and treats an unreachable server as
-"proceed" so the ingest loop can start and queue locally.
+(main.py does not import this module: an unregistered or unreachable device
+is handled by jobs.ingest — readings queue locally, and the startup connectivity
+ping validates the token against the primary server in the background.)
 """
 
 import os
@@ -14,7 +14,6 @@ import re
 import json
 import uuid
 import httpx
-import questionary
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -73,16 +72,6 @@ def write_env_token(token: str):
         content += f"\nAUTH_TOKEN={token}\n"
     ENV_PATH.write_text(content)
     
-def validate_token(token: str) -> bool:
-    """Check with the server whether the provided token is valid."""
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        res = client.get(
-            f"{SERVER_URL}/aqc/v1/validate",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        return res.is_success
-
-
 # ----------------------- Registration flow -----------------------
 
 def prompt_asset() -> tuple[int | None, dict | None]:
@@ -93,6 +82,8 @@ def prompt_asset() -> tuple[int | None, dict | None]:
 
     Returns (asset_id, new_asset_payload) — one will always be None.
     """
+    import questionary  # lazy: heavy (prompt_toolkit), interactive-only
+
     asset_exists = questionary.confirm(
         "Does this asset already exist on the server?"
     ).ask()
@@ -117,6 +108,8 @@ def prompt_asset() -> tuple[int | None, dict | None]:
 def run_registration():
     print_banner()
     mac_address = get_mac_address()
+
+    import questionary  # lazy: heavy (prompt_toolkit), interactive-only
 
     org_token   = questionary.text("Organisation Token:").ask()
     username    = questionary.text("Teacher Username:").ask()
@@ -153,28 +146,6 @@ def run_registration():
 
         write_env_token(data["auth_token"])
         load_dotenv(override=True)
-
-
-# -------------------- Headless gate (used by main.py) --------------------
-
-def check_registration() -> bool:
-    """Non-interactive startup gate. No prompts (safe under systemd).
-
-    Returns False only when AUTH_TOKEN is absent — the device cannot send data
-    without a token. Any server-side validation failures (including 404 if the
-    /validate endpoint doesn't exist) are treated as warnings so the ingest loop
-    can start and queue readings locally.
-    """
-    token = os.getenv("AUTH_TOKEN", "").strip()
-    if not token:
-        print("(info) No AUTH_TOKEN — readings will buffer locally until registration completes")
-        return False
-    try:
-        if not validate_token(token):
-            print("(warn) Token validation returned non-2xx — starting anyway")
-    except Exception:
-        print("(warn) Could not reach server for token validation — starting anyway")
-    return True
 
 
 # ----------------------- Manual entry point -----------------------

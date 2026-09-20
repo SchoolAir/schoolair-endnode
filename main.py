@@ -23,7 +23,6 @@ import db.queue as queue
 from dotenv import load_dotenv
 from microdot import Microdot, Response
 from microdot.websocket import with_websocket
-from setup import check_registration
 import jobs.ingest as _ingest
 from jobs.ingest import ingest_loop
 from services.sensor import extract_metric
@@ -155,7 +154,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    check_registration()  # logs if no token; does not exit
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, asyncio.CancelledError):
