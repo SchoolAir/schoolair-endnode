@@ -60,10 +60,23 @@ GAMMA = 2.8            # perceptual correction so dimming looks linear to the ey
 TICK = 0.02            # per-step dwell cap in the breath table (see _build_breath_table)
 OK_PERIOD_S = 8.0        # breathe: 4s up, 4s down (nominal — actual is shorter, see below)
 THINKING_PERIOD_S = 1.2  # pulse: 0.6s up, 0.6s down (nominal)
-TEMPO_SCALE = 1.5        # scales both the nominal period and the per-step dwell
-                          # cap together (see _build_breath_table) — the only
-                          # knob that changes overall breathe/pulse speed
-                          # without distorting the low-end-vs-peak timing shape
+
+# Breathe/pulse ("ok" / "thinking") tuning. Live-tuned by eye on a real unit.
+#  - BREATH_PEAK_FRAC: brightness cap of the two table-driven patterns; 0.8 of
+#    PEAK_FRAC because the top of the breath read too bright and stayed bright
+#    too long. The blink/solid states keep PEAK_FRAC.
+#  - *_TEMPO_SCALE scale the nominal period AND the per-step dwell cap together
+#    (see _build_breath_table) — the only way to change speed without distorting
+#    the low-end-vs-peak timing shape. Lowering the peak removes brightness steps
+#    and so shortens the cycle by itself; these are set for a ~5.0s breath and
+#    a 1.49s pulse (the pulse's speed is unchanged).
+#  - BREATH_WEIGHT_EXPONENT: >1 shifts time toward the dim end (and shortens the
+#    cycle, so raise the tempo to compensate); 1.0 = the original timing.
+BREATH_PEAK_FRAC = 0.08
+BREATH_PEAK_STEPS = round(WAVE_STEPS * BREATH_PEAK_FRAC)  # 160
+OK_TEMPO_SCALE = 1.33
+THINKING_TEMPO_SCALE = 1.525
+BREATH_WEIGHT_EXPONENT = 1.0
 
 _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 
@@ -82,8 +95,9 @@ _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 # increase as evidence of a crash within that window, even if the service
 # happens to be up again by the time it's sampled.
 WATCHED_SERVICES = ("sen6x.service", "schoolair.service", "schoolair-netwatch.service")
-HEALTH_CHECK_INTERVAL_S = 10.0
-STATE_POLL_S = 0.2        # how often the render loop re-reads LED_STATE_FILE (see main())
+HEALTH_CHECK_INTERVAL_S = 30.0
+STATE_POLL_S = 1.0        # how often main() checks LED_STATE_FILE for a change (see main())
+HEARTBEAT_S = 5.0         # how often main() checks pigpiod is still there
 PIGPIOD_WAIT_S = 60.0     # how long main() waits for pigpiod to accept connections at startup
 UNHEALTHY_HOLD_S = 30.0    # once flagged, hold the "error" override at least this long
 BOOT_GRACE_MAX_S = 600.0   # never suppress health checks for longer than this after boot
@@ -148,7 +162,8 @@ def _perceptual_weight(v: int) -> float:
     return math.log((v + 2) / (v + 1))
 
 
-def _build_breath_table(peak: int, period: float, max_dwell: float = TICK):
+def _build_breath_table(peak: int, period: float, max_dwell: float = TICK,
+                        weight_exponent: float = 1.0):
     """Precomputed once at startup per (peak, period) pair — not per-tick.
     Returns (values, cumulative_end_times, total_duration).
 
@@ -191,7 +206,7 @@ def _build_breath_table(peak: int, period: float, max_dwell: float = TICK):
             values.append(v)
             last = v
 
-    weights = [_perceptual_weight(v) for v in values]
+    weights = [_perceptual_weight(v) ** weight_exponent for v in values]
     total_weight = sum(weights)
     dwell = [min(max_dwell, period * w / total_weight) for w in weights]
 
@@ -364,6 +379,22 @@ def _connect_pigpiod(pigpio, timeout_s: float = PIGPIOD_WAIT_S, poll_s: float = 
         time.sleep(poll_s)
 
 
+def _state_file_mtime():
+    try:
+        return os.stat(LED_STATE_FILE).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _build_tables():
+    """(ok_table, thinking_table): the two breathe/pulse patterns, built once."""
+    ok = _build_breath_table(BREATH_PEAK_STEPS, OK_PERIOD_S * OK_TEMPO_SCALE,
+                             TICK * OK_TEMPO_SCALE, BREATH_WEIGHT_EXPONENT)
+    thinking = _build_breath_table(BREATH_PEAK_STEPS, THINKING_PERIOD_S * THINKING_TEMPO_SCALE,
+                                   TICK * THINKING_TEMPO_SCALE, BREATH_WEIGHT_EXPONENT)
+    return ok, thinking
+
+
 def _pattern_segments(duty_at, cycle_s: float):
     """Turns a brightness function into the pulse list for ONE repeat of a
     pattern: [(level, delay_us), ...], level 1 = pin high. `duty_at(t_us)`
@@ -500,8 +531,7 @@ def main() -> None:
     print(f"[led] pigpiod ready — GPIO{GPIO_LED}, {PWM_FREQ_HZ}Hz, {WAVE_STEPS} levels, peak {PEAK_STEPS}")
 
     pi.set_mode(GPIO_LED, pigpio.OUTPUT)
-    ok_table = _build_breath_table(PEAK_STEPS, OK_PERIOD_S * TEMPO_SCALE, TICK * TEMPO_SCALE)
-    thinking_table = _build_breath_table(PEAK_STEPS, THINKING_PERIOD_S * TEMPO_SCALE, TICK * TEMPO_SCALE)
+    ok_table, thinking_table = _build_tables()
     print(f"[led] breathe table: {len(ok_table[0])} steps, actual cycle {ok_table[2]:.2f}s "
           f"(nominal {OK_PERIOD_S}s); pulse table: {len(thinking_table[0])} steps, "
           f"actual cycle {thinking_table[2]:.2f}s (nominal {THINKING_PERIOD_S}s)")
@@ -513,15 +543,23 @@ def main() -> None:
 
     last_state = None
     wave_id = None
+    # Nothing here needs to be fast: the animation is played by pigpiod, so a
+    # state change showing up within a second is plenty. Even so, the cheapest
+    # way to check is os.stat() on the (tmpfs, i.e. RAM) state file — 56us versus
+    # 621us to open/read/close it, measured on a Pi Zero W — and only re-read it
+    # when its mtime changed. (An environment variable can't do this job: a
+    # process's environment can't be changed from outside.)
     raw_state = _read_state()
-    raw_state_read_at = time.monotonic()
+    state_mtime = _state_file_mtime()
+    last_heartbeat = time.monotonic()
 
     try:
         while True:
             now_mono = time.monotonic()
-            if now_mono - raw_state_read_at >= STATE_POLL_S:
+            mtime = _state_file_mtime()
+            if mtime != state_mtime:
                 raw_state = _read_state()
-                raw_state_read_at = now_mono
+                state_mtime = mtime
             state = _resolve_state(health, now_mono, raw_state)
             if state != last_state:
                 segments = _state_segments(state, ok_table, thinking_table)
@@ -540,7 +578,9 @@ def main() -> None:
             # Heartbeat: raises if pigpiod has gone away (crashed/restarted —
             # either way the wave died with it), so systemd restarts us and a
             # fresh wave is sent, instead of leaving the LED dark.
-            pi.get_current_tick()
+            if now_mono - last_heartbeat >= HEARTBEAT_S:
+                pi.get_current_tick()
+                last_heartbeat = now_mono
             time.sleep(STATE_POLL_S)
     finally:
         _shutdown_led(pi)

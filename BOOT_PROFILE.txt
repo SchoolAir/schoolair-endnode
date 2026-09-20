@@ -68,6 +68,10 @@ LED ANIMATION AS A PIGPIO "WAVE"  (done)
       spawn per 10 s instead of six per 5 s), pigpiod 1% -> 0.2%
     daemon frozen with SIGSTOP for 7 s (worst-case CPU starvation): error blink kept exact
       1.000 s spacing, 90-91 ms windows
+  Follow-up tuning: state file checked once a second via os.stat (56 us) and re-read only when
+    its mtime changes (was: read 5x/s at 621 us); pigpiod heartbeat every 5 s; health check every
+    30 s.  LED stack CPU: daemon 0.09%, its systemctl children 0.62%, pigpiod 0.01% (~0.7% of one
+    core in total; originally ~25%).  State changes still show within ~1 s.
   Gotchas found live: pigpiod ignores a wave on a pin that still has PWM set (so the daemon
   zeroes PWM right before its first wave); a wave outlives its client (so the unit has an
   ExecStopPost that halts it - otherwise a crashed daemon leaves the LED frozen on its last

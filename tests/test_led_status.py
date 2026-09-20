@@ -394,20 +394,15 @@ def _level_at(segments, t_us):
 
 
 def _tables():
-    peak = led_status.PEAK_STEPS
-    return (
-        led_status._build_breath_table(peak, led_status.OK_PERIOD_S * led_status.TEMPO_SCALE,
-                                       led_status.TICK * led_status.TEMPO_SCALE),
-        led_status._build_breath_table(peak, led_status.THINKING_PERIOD_S * led_status.TEMPO_SCALE,
-                                       led_status.TICK * led_status.TEMPO_SCALE),
-    )
+    return led_status._build_tables()
 
 
 def test_constants_match_the_original_pwm_setup():
     """Same signal as the pigpio-PWM renderer: 100Hz, 2000 levels, cap 200."""
     assert PERIOD == 10_000
     assert led_status.WAVE_STEPS == 2000
-    assert led_status.PEAK_STEPS == 200
+    assert led_status.PEAK_STEPS == 200                  # blink/solid cap: 10%
+    assert led_status.BREATH_PEAK_STEPS == 160           # breathe/pulse cap: 8%
     assert PEAK_US == 1000  # 10% of a 10ms period
 
 
@@ -458,10 +453,11 @@ def test_breathe_wave_matches_the_table_it_was_built_from():
     ok, thinking = _tables()
     segs = led_status._state_segments("ok", ok, thinking)
     assert abs(_total_us(segs) - ok[2] * 1e6) <= PERIOD        # cycle length = table length (to 10ms)
-    assert max(us for lvl, us in segs if lvl) <= PEAK_US       # never brighter than the cap
-    # ...and reaches (within one step of) it: the table dwells only ~3.7ms on the very top
-    # value, so a 10ms sample can land on 199 instead of 200 — a 0.5% difference
-    assert max(us for lvl, us in segs if lvl) >= 0.98 * PEAK_US
+    breath_peak_us = led_status.BREATH_PEAK_STEPS * led_status.WAVE_STEP_US
+    assert max(us for lvl, us in segs if lvl) <= breath_peak_us   # never brighter than the breathe cap (8%)
+    # ...and reaches (within a step or two of) it: the table dwells only a few ms on the very
+    # top values, so a 10ms sample can land just below the peak
+    assert max(us for lvl, us in segs if lvl) >= 0.97 * breath_peak_us
     # mean brightness equals the table's dwell-weighted mean (what the old renderer showed)
     values, cumulative, total = ok
     dwell = [cumulative[0]] + [cumulative[i] - cumulative[i - 1] for i in range(1, len(cumulative))]
@@ -560,3 +556,40 @@ def test_health_check_treats_reloading_as_active():
     out = "\n\n".join(f"Id={u}\nActiveState=reloading\nNRestarts=0" for u in led_status.WATCHED_SERVICES)
     with patch("subprocess.run", return_value=MagicMock(stdout=out)):
         assert led_status._check_watched_services({}) is False
+
+
+def test_breathe_and_pulse_are_capped_below_the_blink_states():
+    ok, thinking = _tables()
+    cap = led_status.BREATH_PEAK_STEPS * led_status.WAVE_STEP_US
+    for state in ("ok", "thinking"):
+        segs = led_status._state_segments(state, ok, thinking)
+        assert max(us for lvl, us in segs if lvl) <= cap < PEAK_US
+
+
+def test_breathe_cycle_is_about_five_seconds_and_pulse_about_one_and_a_half():
+    ok, thinking = _tables()
+    assert ok[2] == pytest.approx(5.0, abs=0.15)
+    assert thinking[2] == pytest.approx(1.49, abs=0.05)   # pulse speed unchanged by the dimmer peak
+
+
+def test_weight_exponent_above_one_shifts_time_toward_the_dim_end():
+    peak = led_status.BREATH_PEAK_STEPS
+    def share_above(table, frac):
+        values, cumulative, total = table
+        dwell = [cumulative[0]] + [cumulative[i] - cumulative[i - 1] for i in range(1, len(cumulative))]
+        return sum(d for v, d in zip(values, dwell) if v >= frac * peak) / total
+    base = led_status._build_breath_table(peak, 8.0 * 1.33, 0.02 * 1.33)
+    dim = led_status._build_breath_table(peak, 8.0 * 1.33, 0.02 * 1.33, weight_exponent=1.5)
+    assert share_above(dim, 0.5) < share_above(base, 0.5)
+
+
+def test_state_file_mtime_tracks_changes_and_tolerates_a_missing_file(monkeypatch, tmp_path):
+    f = tmp_path / "state"
+    monkeypatch.setattr(led_status, "LED_STATE_FILE", str(f))
+    assert led_status._state_file_mtime() is None
+    f.write_text("ok")
+    first = led_status._state_file_mtime()
+    assert first is not None
+    import os
+    os.utime(f, ns=(first + 10**9, first + 10**9))
+    assert led_status._state_file_mtime() != first
