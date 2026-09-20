@@ -97,7 +97,8 @@ BREATH_DIM_DITHER_US = 64.0
 #    64us keeps every step in the dithered region below 1.6%. It costs nothing: the wave
 #    is the same size.)
 #  - BREATH_BLACK_POINT_US: on-times below this are dark and the fade emerges from there
-#    (the curve is shifted and rescaled so the peak is unchanged). Why: the eye is
+#    (the curve is shifted and rescaled so the peak is unchanged; applies to both the
+#    breathe and the thinking pulse). Why: the eye is
 #    dark-adapted by the time the LED brightens again after ~1.5s near dark, and then
 #    each individual 1us pulse of the sparse zone (mean < 1us per slot, where the
 #    LED is emitting single sparks) is visible as a step; on the way down the eye is
@@ -105,7 +106,7 @@ BREATH_DIM_DITHER_US = 64.0
 #    images, so this is perceptual, and a higher dither threshold cannot fix it: the
 #    only lever is spending less time in the sparse zone (390ms at 0; 100ms at 1us;
 #    70ms at 2us), at the price of a longer fully-dark stretch (0 / 0.8s / 1.0s of 5s).
-BREATH_BLACK_POINT_US = 0.0
+BREATH_BLACK_POINT_US = 2.0     # chosen by eye (candidate D of 0 / 1 / 2us): the brightening no longer reads as steps
 
 _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 

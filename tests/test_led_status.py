@@ -707,11 +707,12 @@ def test_dither_is_off_at_5us_resolution(monkeypatch):
 
 
 def test_dithering_smooths_the_bottom_of_the_fade_as_the_eye_sees_it():
-    """Regression for the visibly stepped very-bottom (worst on the way down): plain
-    1us rounding holds levels 1-2us for 80-140ms, so 100ms-window brightness strays
-    from the ideal by up to 100% (rms 18%); dithered it is 35% worst / 4% rms."""
+    """Regression for the visibly stepped very-bottom (worst on the way down), on the
+    curve WITHOUT a black point: plain 1us rounding holds levels 1-2us for 80-140ms, so
+    100ms-window brightness strays from the ideal by up to 100% (rms 18%); dithered it
+    is 35% worst / 4% rms."""
     n = 500
-    ideal = [led_status._breath_on_us(i * PERIOD, 5.0) for i in range(n)]
+    ideal = [led_status._breath_on_us(i * PERIOD, 5.0, black_point_us=0.0) for i in range(n)]
 
     def eye_error(per):
         rel = []
@@ -721,11 +722,29 @@ def test_dithering_smooths_the_bottom_of_the_fade_as_the_eye_sees_it():
                 rel.append(abs(sum(per[i:i + 10]) / 10 - want) / want)
         return max(rel), (sum(r * r for r in rel) / len(rel)) ** 0.5
 
-    plain_worst, plain_rms = eye_error(_per_period_on_us(led_status._breath_segments(5.0, dither_below_us=0.0)))
-    worst, rms = eye_error(_per_period_on_us(led_status._breath_segments(5.0)))
+    seg = lambda dither: led_status._breath_segments(5.0, dither_below_us=dither, black_point_us=0.0)
+    plain_worst, plain_rms = eye_error(_per_period_on_us(seg(0.0)))
+    worst, rms = eye_error(_per_period_on_us(seg(64.0)))
     assert plain_rms > 0.12 and rms < 0.06
     assert worst < 0.5 and plain_worst > 0.9
     assert rms < plain_rms / 2
+
+
+def test_the_default_black_point_also_removes_most_of_the_stepping_on_its_own():
+    """With the 2us black point the fade leaves dark at the curve's natural slope instead of
+    crawling through the flat sparse zone, so even plain rounding is close (3.8% rms vs 18%);
+    dithering still improves on it."""
+    n = 500
+    ideal = [led_status._breath_on_us(i * PERIOD, 5.0) for i in range(n)]
+
+    def rms(per):
+        rel = [abs(sum(per[i:i + 10]) / 10 - sum(ideal[i:i + 10]) / 10) / (sum(ideal[i:i + 10]) / 10)
+               for i in range(n - 10) if sum(ideal[i:i + 10]) / 10 >= 0.15]
+        return (sum(r * r for r in rel) / len(rel)) ** 0.5
+
+    plain = rms(_per_period_on_us(led_status._breath_segments(5.0, dither_below_us=0.0)))
+    dithered = rms(_per_period_on_us(led_status._breath_segments(5.0)))
+    assert plain < 0.06 and dithered <= plain
 
 
 def test_no_pulse_is_ever_dropped_or_negative_when_dithering_down_to_dark():
@@ -784,10 +803,11 @@ def test_threshold_above_16us_makes_no_difference_to_the_eye_integrated_error():
     assert e64[1] == pytest.approx(e16[1], abs=0.01)
 
 
-def test_black_point_default_is_off_and_leaves_the_curve_unchanged():
-    assert led_status.BREATH_BLACK_POINT_US == 0.0
+def test_black_point_default_is_2us_and_an_explicit_zero_restores_the_plain_curve():
+    assert led_status.BREATH_BLACK_POINT_US == 2.0
     for t in (0, 700_000, 1_500_000, 2_500_000, 4_000_000):
-        assert led_status._breath_on_us(t, 5.0) == led_status._breath_on_us(t, 5.0, black_point_us=0.0)
+        assert led_status._breath_on_us(t, 5.0) == led_status._breath_on_us(t, 5.0, black_point_us=2.0)
+    assert led_status._breath_on_us(700_000, 5.0, black_point_us=0.0) > led_status._breath_on_us(700_000, 5.0)
 
 
 def test_black_point_darkens_the_bottom_and_keeps_the_peak():
@@ -795,7 +815,7 @@ def test_black_point_darkens_the_bottom_and_keeps_the_peak():
     assert led_status._breath_on_us(peak_t, 5.0, black_point_us=2.0) == pytest.approx(PEAK_US)
     # everything the plain curve has below the black point is dark
     for t in range(0, 5_000_000, 10_000):
-        plain = led_status._breath_on_us(t, 5.0)
+        plain = led_status._breath_on_us(t, 5.0, black_point_us=0.0)
         shifted = led_status._breath_on_us(t, 5.0, black_point_us=2.0)
         if plain <= 2.0:
             assert shifted == 0.0

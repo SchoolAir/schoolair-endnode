@@ -71,3 +71,31 @@ def test_main_restores_the_led_service_even_if_playing_fails(preview, monkeypatc
          patch.object(preview.time, "sleep"), pytest.raises(RuntimeError):
         preview.main()
     assert calls[-1] == ["systemctl", "start", "schoolair-led"]
+
+
+def test_modes_plays_every_status_mode_once_and_restores_the_led_service(preview, monkeypatch, capsys):
+    pi = MagicMock(connected=True)
+    pi.wave_add_generic.return_value = 1
+    pi.wave_create.return_value = 0
+    pi.wave_send_repeat.return_value = 1
+    pi.get_PWM_real_range.return_value = 10000
+    fake_pigpio = MagicMock(OUTPUT=1)
+    fake_pigpio.pi.return_value = pi
+    fake_pigpio.pulse = lambda a, b, c: (a, b, c)
+    calls = []
+    monkeypatch.setattr(sys, "argv", ["led_curve_preview.py", "--modes", "-s", "0.001"])
+    with patch.dict(sys.modules, {"pigpio": fake_pigpio}), \
+         patch.object(preview.subprocess, "run", side_effect=lambda *a, **k: calls.append(a[0])), \
+         patch.object(preview.time, "sleep"):
+        preview.main()
+    assert pi.wave_send_repeat.call_count == 5                          # thinking, ok, ap, error, no_sensor
+    out = capsys.readouterr().out
+    for state in ("thinking", "ok", "ap", "error", "no_sensor"):
+        assert state in out
+    assert calls[0] == ["systemctl", "stop", "schoolair-led"]
+    assert calls[-1] == ["systemctl", "start", "schoolair-led"]
+
+
+def test_every_mode_in_the_showcase_is_a_real_led_state(preview):
+    for state, _, _ in preview.MODES:
+        assert preview.L._state_segments(state)

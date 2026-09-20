@@ -7,6 +7,7 @@ it again afterwards):
     sudo python3 ~/schoolair/scripts/led_curve_preview.py            # all candidates
     sudo python3 ~/schoolair/scripts/led_curve_preview.py B C        # just these
     sudo python3 ~/schoolair/scripts/led_curve_preview.py -s 20 A B  # 20 s each
+    sudo python3 ~/schoolair/scripts/led_curve_preview.py --modes    # every status mode in turn
 
 Each candidate is announced by N quick blinks (A = 1, B = 2, ...), then 1 s of dark,
 then the breathing curve. Before playing, each one prints how much of its cycle it
@@ -36,8 +37,17 @@ CANDIDATES = {
     "A": ("dither below 16us (what you saw last): brightening still steppy", breath(16.0)),
     "B": ("dither below 64us: the new default", breath(64.0)),
     "C": ("B + black point 1us: the fade emerges from true dark, so brightening spends far less time on single sparks", breath(64.0, 1.0)),
-    "D": ("B + black point 2us: as C, a little more dark", breath(64.0, 2.0)),
+    "D": ("B + black point 2us: as C, a little more dark (chosen; now the default)", breath(64.0, 2.0)),
 }
+
+# The status modes, in the order shown by --modes: (state, what it means, seconds).
+MODES = [
+    ("thinking", "connecting / validating / registering: sharp fast pulse", 8),
+    ("ok", "all good, uploading normally: slow breathe", 12),
+    ("ap", "setup hotspot, waiting for the wizard: double blink", 9),
+    ("error", "registration / upload error: single blink each second", 8),
+    ("no_sensor", "sensor read failing: solid on", 6),
+]
 
 
 def blink_segments():
@@ -75,9 +85,11 @@ def describe(segments):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("labels", nargs="*", help="candidates to play (default: all)")
-    ap.add_argument("-s", "--seconds", type=float, default=14.0, help="seconds per candidate")
+    ap.add_argument("-s", "--seconds", type=float, default=None, help="seconds per candidate / mode")
+    ap.add_argument("--modes", action="store_true", help="play every status mode in turn instead of curve candidates")
     args = ap.parse_args()
     labels = [x.upper() for x in args.labels] or list(CANDIDATES)
+    seconds = 14.0 if args.seconds is None else args.seconds
 
     import pigpio
     subprocess.run(["systemctl", "stop", "schoolair-led"], check=False)
@@ -89,18 +101,28 @@ def main():
     if L._detect_step_us(pi) != 1:
         print("WARNING: pigpiod is not running with -s 1; the 1us candidates will be rounded by the hardware")
     try:
-        for label in labels:
-            desc, build = CANDIDATES[label]
-            segs = build()
-            n = list(CANDIDATES).index(label) + 1
-            print(f"{label}: {desc}\n     {describe(segs)}\n     -> {n} blink(s), 1 s dark, then the curve for {args.seconds:.0f} s", flush=True)
-            wave = L._send_pattern(pi, pigpio, blink_segments(), wave)
-            time.sleep(0.35 * n)
-            pi.wave_tx_stop()
-            pi.write(L.GPIO_LED, 0)
-            time.sleep(1.0)
-            wave = L._send_pattern(pi, pigpio, segs, wave)
-            time.sleep(args.seconds)
+        if args.modes:
+            for state, meaning, default_s in MODES:
+                segs = L._state_segments(state)
+                print(f"{time.strftime('%H:%M:%S')}  {state:9s} {meaning}  ({args.seconds or default_s:.0f} s)", flush=True)
+                wave = L._send_pattern(pi, pigpio, segs, wave)
+                time.sleep(args.seconds or default_s)
+                pi.wave_tx_stop()
+                pi.write(L.GPIO_LED, 0)
+                time.sleep(1.5)
+        else:
+            for label in labels:
+                desc, build = CANDIDATES[label]
+                segs = build()
+                n = list(CANDIDATES).index(label) + 1
+                print(f"{label}: {desc}\n     {describe(segs)}\n     -> {n} blink(s), 1 s dark, then the curve for {seconds:.0f} s", flush=True)
+                wave = L._send_pattern(pi, pigpio, blink_segments(), wave)
+                time.sleep(0.35 * n)
+                pi.wave_tx_stop()
+                pi.write(L.GPIO_LED, 0)
+                time.sleep(1.0)
+                wave = L._send_pattern(pi, pigpio, segs, wave)
+                time.sleep(seconds)
     finally:
         L._shutdown_led(pi)
         subprocess.run(["systemctl", "start", "schoolair-led"], check=False)
