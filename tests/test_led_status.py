@@ -26,6 +26,7 @@ def _wave_capable_pi():
     pi.wave_add_generic.return_value = 1
     pi.wave_create.return_value = 0
     pi.wave_send_repeat.return_value = 1
+    pi.get_PWM_real_range.return_value = 10000   # 1us pigpiod sample rate at 100Hz
     return pi
 
 
@@ -372,7 +373,7 @@ def test_resolve_state_uses_provided_raw_state_without_reading_file(monkeypatch)
 # the hand-over to pigpiod.
 
 PERIOD = led_status.WAVE_PERIOD_US
-PEAK_US = led_status.PEAK_STEPS * led_status.WAVE_STEP_US   # on-time per PWM period at the cap
+PEAK_US = led_status.PEAK_US                                 # on-time per PWM period at the cap
 
 
 def _total_us(segments):
@@ -393,36 +394,28 @@ def _level_at(segments, t_us):
     raise AssertionError("t beyond the cycle")
 
 
-def _tables():
-    return led_status._build_tables()
-
-
 def test_pwm_constants():
-    """100Hz PWM, 2000 levels of 5us; every pattern is capped at BRIGHTNESS x 10% duty."""
+    """100Hz PWM; every pattern is capped at BRIGHTNESS x 10% duty; 1us pulse resolution by default."""
     assert PERIOD == 10_000
-    assert led_status.WAVE_STEPS == 2000
     assert led_status.BRIGHTNESS == 0.8
-    assert led_status.PEAK_STEPS == round(2000 * 0.1 * 0.8) == 160     # 8%: ALL states, not just the breath
-    assert PEAK_US == 800
+    assert PEAK_US == 800                                 # 8%: ALL states, not just the breath
+    assert led_status.WAVE_STEP_US == 1
 
 
 def test_pattern_segments_are_whole_pwm_periods_with_no_empty_or_adjacent_duplicates():
-    ok, thinking = _tables()
     for state in ("ok", "thinking", "ap", "error", "no_sensor"):
-        segs = led_status._state_segments(state, ok, thinking)
+        segs = led_status._state_segments(state)
         assert _total_us(segs) % PERIOD == 0, state          # loops seamlessly
         assert all(us > 0 for _, us in segs), state           # pigpio rejects zero delays
         assert all(a[0] != b[0] for a, b in zip(segs, segs[1:])), state  # merged
 
 
 def test_no_sensor_is_solid_pwm_at_the_cap():
-    ok, thinking = _tables()
-    assert led_status._state_segments("no_sensor", ok, thinking) == [(1, PEAK_US), (0, PERIOD - PEAK_US)]
+    assert led_status._state_segments("no_sensor") == [(1, PEAK_US), (0, PERIOD - PEAK_US)]
 
 
 def test_error_blinks_100ms_every_second():
-    ok, thinking = _tables()
-    segs = led_status._state_segments("error", ok, thinking)
+    segs = led_status._state_segments("error")
     assert _total_us(segs) == 1_000_000
     assert _on_us(segs) == 10 * PEAK_US                      # 10 PWM periods lit at the cap
     # all of the light falls inside the first 100ms; the rest is one long dark stretch
@@ -439,8 +432,7 @@ def _starts(segs):
 
 
 def test_ap_is_a_double_blink_every_2_35s():
-    ok, thinking = _tables()
-    segs = led_status._state_segments("ap", ok, thinking)
+    segs = led_status._state_segments("ap")
     assert _total_us(segs) == 2_350_000
     assert _on_us(segs) == 20 * PEAK_US                      # two 100ms windows
     lit = [(start, start + us) for start, (lvl, us) in _starts(segs) if lvl]
@@ -476,7 +468,7 @@ def test_breathe_wave_is_a_five_second_perceptual_cosine_capped_at_the_brightnes
     assert _total_us(segs) == 5_000_000 == led_status.OK_CYCLE_S * 1_000_000
     assert max(per) == PEAK_US                                   # reaches the cap exactly, never above
     assert per[0] == 0 and per[len(per) // 2] == PEAK_US         # dark at the start, peak at mid-cycle
-    # dithering preserves the wanted average brightness
+    # quantisation to whole microseconds keeps the wanted average brightness
     model_mean = sum(led_status._breath_on_us(i * PERIOD, 5.0) for i in range(len(per))) / len(per)
     assert sum(per) / len(per) == pytest.approx(model_mean, rel=0.005)
 
@@ -508,33 +500,14 @@ def test_lightness_to_luminance_is_the_cie_1976_inverse():
     assert f(-1) == 0.0 and f(2) == pytest.approx(1.0)           # clamped
 
 
-def test_dither_keeps_slow_dim_levels_right_on_average():
-    """A wanted 2us on-time is below one 5us step: rounding alone gives 0 forever
-    (the fade would hold dark, then jump); error diffusion averages it out."""
-    plain = led_status._pattern_segments_us(lambda t: 2.0, 1.0, dither=False)
-    dithered = led_status._pattern_segments_us(lambda t: 2.0, 1.0, dither=True)
-    assert _on_us(plain) == 0
-    assert _on_us(dithered) == pytest.approx(2.0 * 100, abs=5)   # 100 periods x 2us
-    assert set(_per_period_on_us(dithered)) <= {0, 5}            # only adjacent steps
-
-
-def test_legacy_table_model_is_still_selectable(monkeypatch):
-    monkeypatch.setattr(led_status, "BREATH_MODEL", "table")
-    ok, thinking = _tables()
-    segs = led_status._state_segments("ok", ok, thinking)
-    assert abs(_total_us(segs) - ok[2] * 1e6) <= PERIOD
-    assert max(us for lvl, us in segs if lvl) <= PEAK_US
-
-
 def test_breathe_wave_is_small_enough_for_pigpio():
     for state in ("ok", "thinking"):
         assert len(led_status._state_segments(state)) < 12000   # pigpio's per-wave pulse limit
 
 
 def test_state_segments_rejects_unknown_state():
-    ok, thinking = _tables()
     with pytest.raises(ValueError):
-        led_status._state_segments("bogus", ok, thinking)
+        led_status._state_segments("bogus")
 
 
 class _FakePigpio:
@@ -579,10 +552,10 @@ def test_send_pattern_returns_none_when_pigpiod_refuses(failing):
 
 
 def test_steady_glow_fallback_shows_the_cap_via_plain_pwm():
-    pi = MagicMock()
+    pi = _wave_capable_pi()
     led_status._steady_glow(pi)
     pi.wave_tx_stop.assert_called_once()
-    pi.set_PWM_dutycycle.assert_called_with(led_status.GPIO_LED, led_status.PEAK_STEPS)
+    pi.set_PWM_dutycycle.assert_called_with(led_status.GPIO_LED, round(10000 * 800 / 10000))   # 8% of pigpiod's PWM range
 
 
 def test_shutdown_led_never_raises_even_if_pigpiod_is_gone():
@@ -631,18 +604,6 @@ def test_cycle_lengths():
     assert _total_us(led_status._state_segments("thinking")) == 1_500_000
 
 
-def test_weight_exponent_above_one_shifts_time_toward_the_dim_end():
-    """Legacy table model only."""
-    peak = led_status.PEAK_STEPS
-    def share_above(table, frac):
-        values, cumulative, total = table
-        dwell = [cumulative[0]] + [cumulative[i] - cumulative[i - 1] for i in range(1, len(cumulative))]
-        return sum(d for v, d in zip(values, dwell) if v >= frac * peak) / total
-    base = led_status._build_breath_table(peak, 8.0 * 1.33, 0.02 * 1.33)
-    dim = led_status._build_breath_table(peak, 8.0 * 1.33, 0.02 * 1.33, weight_exponent=1.5)
-    assert share_above(dim, 0.5) < share_above(base, 0.5)
-
-
 def test_state_file_mtime_tracks_changes_and_tolerates_a_missing_file(monkeypatch, tmp_path):
     f = tmp_path / "state"
     monkeypatch.setattr(led_status, "LED_STATE_FILE", str(f))
@@ -653,3 +614,55 @@ def test_state_file_mtime_tracks_changes_and_tolerates_a_missing_file(monkeypatc
     import os
     os.utime(f, ns=(first + 10**9, first + 10**9))
     assert led_status._state_file_mtime() != first
+
+
+# ── dim-end resolution: no visible stepping, no jitter ───────────────────────
+
+def test_detect_step_us_reads_pigpiods_sample_rate():
+    """real_range at 100Hz is the number of sample ticks per PWM period."""
+    pi = _wave_capable_pi()
+    pi.get_PWM_real_range.return_value = 10000          # pigpiod -s 1
+    assert led_status._detect_step_us(pi) == 1
+    pi.get_PWM_real_range.return_value = 2000           # pigpiod's default -s 5
+    assert led_status._detect_step_us(pi) == 5
+    pi.set_PWM_frequency.assert_called_with(led_status.GPIO_LED, led_status.PWM_FREQ_HZ)
+
+
+def test_on_times_are_quantised_to_the_pulse_resolution(monkeypatch):
+    for step in (1, 5):
+        monkeypatch.setattr(led_status, "WAVE_STEP_US", step)
+        per = _per_period_on_us(led_status._state_segments("ok"))
+        assert all(x % step == 0 for x in per), step
+
+
+def _dim_end_quality(step, monkeypatch):
+    """(worst gap between the realised and the ideal fade in CIE L*, eye-averaged over
+    ~60ms; longest time stuck on one level while the ideal moved >1.5 L* away)."""
+    monkeypatch.setattr(led_status, "WAVE_STEP_US", step)
+    per = _per_period_on_us(led_status._breath_segments(5.0))
+    n = len(per)
+    ideal = [led_status._breath_on_us(i * PERIOD, 5.0) for i in range(n)]
+    lstar = lambda on: led_status._luminance_to_lightness(on / PEAK_US)
+    worst = 0.0
+    for i in range(n):
+        a, b = max(0, i - 3), min(n, i + 4)
+        worst = max(worst, abs(lstar(sum(per[a:b]) / (b - a)) - lstar(sum(ideal[a:b]) / (b - a))))
+    stuck = best = 0
+    for i in range(1, n):
+        if per[i] == per[i - 1] and per[i] > 0 and abs(lstar(ideal[i]) - lstar(per[i])) > 1.5:
+            stuck += 1
+        else:
+            stuck = 0
+        best = max(best, stuck)
+    return worst, best * PERIOD / 1000
+
+
+def test_one_microsecond_resolution_gives_a_smooth_dim_end(monkeypatch):
+    """Regression for the visible stepping / jitter at the bottom of the breath: with
+    5us steps the realised fade strays >2 L* from the ideal and sticks on a level;
+    at 1us it stays well under one visible step."""
+    worst_1, stuck_1 = _dim_end_quality(1, monkeypatch)
+    worst_5, stuck_5 = _dim_end_quality(5, monkeypatch)
+    assert worst_1 < 0.5 and stuck_1 == 0
+    assert worst_5 > 1.5 and stuck_5 > 0                 # documents what the old resolution did
+    assert worst_1 < worst_5 / 4

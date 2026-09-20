@@ -625,6 +625,13 @@ if [[ "$MODE" == "--update" ]]; then
     # *next* boot, it does not start it now. restart (not start) also
     # correctly picks up new led_status.py code on devices where it was
     # already running.
+    # pigpiod first: its command-line (deploy/pigpiod-early.conf, e.g. the 1us sample
+    # rate led_status.py relies on) only takes effect on restart, and led_status.py
+    # reads the resolution once at startup. Harmless if pigpiod isn't installed
+    # (outdoor units). The LED goes dark for a moment.
+    if systemctl cat pigpiod.service &>/dev/null; then
+        systemctl restart pigpiod.service    || warn "pigpiod.service restart failed"
+    fi
     systemctl restart schoolair-led.service      || warn "schoolair-led.service restart failed"
     systemctl restart sen6x.service           || warn "sen6x.service restart failed"
     systemctl restart schoolair.service       || warn "schoolair.service restart failed"

@@ -12,7 +12,7 @@ Each candidate is announced by N quick blinks (A = 1, B = 2, ...), then 1 s of d
 then the breathing curve. Before playing, each one prints how much of its cycle it
 spends above the perceptual midpoint (CIE lightness L* >= 50), which is the number
 that matters for "does it stay bright too long". Whatever you settle on goes into
-led_status.py (BREATH_MODEL, BREATH_SHAPE_EXPONENT, BREATH_DITHER, BRIGHTNESS).
+led_status.py (BREATH_SHAPE_EXPONENT, OK_CYCLE_S, BRIGHTNESS).
 """
 import argparse
 import os
@@ -26,24 +26,25 @@ import led_status as L  # noqa: E402
 CYCLE = 5.0
 
 
-def legacy_table():
-    """The previous timing (log-weighted dwell per brightness step), at the current cap."""
-    table = L._build_breath_table(L.PEAK_STEPS, L.OK_PERIOD_S * L.OK_TEMPO_SCALE,
-                                  L.TICK * L.OK_TEMPO_SCALE, L.BREATH_WEIGHT_EXPONENT)
-    return L._table_segments(table)
+def at_step(step_us, shape):
+    """Pulse list built with a given pulse resolution (restores the real one after)."""
+    def build():
+        real = L.WAVE_STEP_US
+        L.WAVE_STEP_US = step_us
+        try:
+            return L._breath_segments(CYCLE, shape=shape)
+        finally:
+            L.WAVE_STEP_US = real
+    return build
 
 
 # label: (description, function returning the pulse list for one cycle)
+# Needs pigpiod running with -s 1 (deploy/pigpiod-early.conf) for the 1us candidates to be exact.
 CANDIDATES = {
-    "A": ("previous table timing (the one that felt too bright too long)", legacy_table),
-    "B": ("perceptual cosine, half the cycle above the midpoint (new default)",
-          lambda: L._breath_segments(CYCLE, shape=1.0, dither=True)),
-    "C": ("perceptual, a bit less time bright (shape 1.3)",
-          lambda: L._breath_segments(CYCLE, shape=1.3, dither=True)),
-    "D": ("perceptual, shape 1.0, NO dithering (dim end as plain 5us steps)",
-          lambda: L._breath_segments(CYCLE, shape=1.0, dither=False)),
-    "E": ("perceptual, noticeably less time bright (shape 1.6)",
-          lambda: L._breath_segments(CYCLE, shape=1.6, dither=True)),
+    "A": ("5us steps, symmetric: what you saw before (stepped / jittery dim end)", at_step(5, 1.0)),
+    "B": ("1us steps, symmetric: half the cycle above the midpoint (new default)", at_step(1, 1.0)),
+    "C": ("1us steps, a bit less time bright (shape 1.3)", at_step(1, 1.3)),
+    "D": ("1us steps, noticeably less time bright (shape 1.6)", at_step(1, 1.6)),
 }
 
 
@@ -85,6 +86,8 @@ def main():
         sys.exit("pigpiod is not running")
     pi.set_mode(L.GPIO_LED, pigpio.OUTPUT)
     wave = None
+    if L._detect_step_us(pi) != 1:
+        print("WARNING: pigpiod is not running with -s 1; the 1us candidates will be rounded by the hardware")
     try:
         for label in labels:
             desc, build = CANDIDATES[label]
