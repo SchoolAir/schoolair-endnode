@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """led_status.py — status LED driver (indoor units only, needs pigpiod).
 
-Renders one of a small set of patterns on GPIO24 via pigpiod's DMA-driven
-PWM, continuously, based on whatever the other services last wrote to
-LED_STATE_FILE (plain text, one word). Producers — wizard.py, netwatch.sh,
-jobs/ingest.py — write their state independently and never talk to pigpio
-directly; this is the only process that touches the pin.
+Shows one of a small set of patterns on GPIO24, chosen by whatever the other
+services last wrote to LED_STATE_FILE (plain text, one word). Producers —
+wizard.py, netwatch.sh, jobs/ingest.py — write their state independently and
+never talk to pigpio directly; this is the only process that touches the pin.
+
+Each pattern is handed to pigpiod ONCE, as a "wave" (a precomputed list of
+timed on/off pulses, repeated forever), and then played entirely by pigpiod's
+DMA engine. This process does nothing while a pattern runs except poll the
+state file at 5Hz and hand over a new wave when the state changes. So the
+animation is exactly timed and stays perfectly smooth however busy the CPU is
+(a Pi Zero W is pegged for its whole boot), and costs ~0 CPU — the previous
+implementation woke up 50x/s to set the duty cycle, ~6s of CPU per boot and
+visibly stuttering under load. See _pattern_segments()/_send_pattern().
 
 States (unrecognized/missing file content falls back to "thinking"):
   ok        — all's good, uploading normally         → slow breathe
@@ -43,9 +51,13 @@ import time
 GPIO_LED = 24
 LED_STATE_FILE = "/run/schoolair-led-state"
 PWM_FREQ_HZ = 100      # well above flicker-fusion; low enough for a wide duty-cycle range
+WAVE_PERIOD_US = 1_000_000 // PWM_FREQ_HZ   # one PWM period; the brightness can change once per period
+WAVE_STEP_US = 5       # duty-cycle resolution = pigpiod's sample rate (5us default)
+WAVE_STEPS = WAVE_PERIOD_US // WAVE_STEP_US  # 2000 distinct brightness levels, as with pigpio's own PWM
 PEAK_FRAC = 0.1        # single global brightness cap for every state
+PEAK_STEPS = round(WAVE_STEPS * PEAK_FRAC)   # 200
 GAMMA = 2.8            # perceptual correction so dimming looks linear to the eye
-TICK = 0.02            # render granularity
+TICK = 0.02            # per-step dwell cap in the breath table (see _build_breath_table)
 OK_PERIOD_S = 8.0        # breathe: 4s up, 4s down (nominal — actual is shorter, see below)
 THINKING_PERIOD_S = 1.2  # pulse: 0.6s up, 0.6s down (nominal)
 TEMPO_SCALE = 1.5        # scales both the nominal period and the per-step dwell
@@ -60,18 +72,17 @@ _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 # exact gap: a crashed main.py never even reaches the code that would
 # write "error" to LED_STATE_FILE, so a stale "ok" from before the crash
 # just sits there being rendered forever. Runs in its own thread
-# (_health_monitor_loop), not the render loop — these shell out to
-# systemctl, measured at 1.365s combined real time on this hardware, and
-# that much blocking time every HEALTH_CHECK_INTERVAL_S in a 20ms render
-# loop was a very real, very visible freeze (found live, on a real
-# device). A single is-active snapshot isn't enough either — the same
+# (_health_monitor_loop) — shelling out to systemctl is slow on this
+# hardware (six spawns took 1.365s combined, which froze the old
+# tick-driven animation), so it is a single spawn per check now. A single
+# is-active snapshot isn't enough either — the same
 # rollback test showed Type=simple marks a service "active" the instant
 # its process is spawned, even if it crashes moments later — so this also
 # tracks each service's restart count between checks and treats an
 # increase as evidence of a crash within that window, even if the service
 # happens to be up again by the time it's sampled.
 WATCHED_SERVICES = ("sen6x.service", "schoolair.service", "schoolair-netwatch.service")
-HEALTH_CHECK_INTERVAL_S = 5.0
+HEALTH_CHECK_INTERVAL_S = 10.0
 STATE_POLL_S = 0.2        # how often the render loop re-reads LED_STATE_FILE (see main())
 PIGPIOD_WAIT_S = 60.0     # how long main() waits for pigpiod to accept connections at startup
 UNHEALTHY_HOLD_S = 30.0    # once flagged, hold the "error" override at least this long
@@ -199,24 +210,31 @@ def _table_lookup(table, elapsed: float) -> int:
     return values[min(idx, len(values) - 1)]
 
 
-def _service_is_active(svc: str) -> bool:
-    try:
-        return subprocess.run(
-            ["systemctl", "is-active", "--quiet", svc], timeout=2,
-        ).returncode == 0
-    except subprocess.SubprocessError:
-        return True  # don't flag unhealthy just because the check itself hiccuped
-
-
-def _service_restarts(svc: str) -> int:
+def _read_service_states(services):
+    """{unit: (is_active, restart_count)} for all `services` from ONE
+    `systemctl show` spawn, or None if the check itself failed. Spawning
+    systemctl is by far the most expensive thing this daemon does on a Pi Zero W
+    (measured: six spawns per check cost ~8% of the CPU, several times the
+    animation itself — which now costs ~0), so this is one spawn per check.
+    "active" here matches `systemctl is-active` (also true while reloading)."""
     try:
         out = subprocess.run(
-            ["systemctl", "show", svc, "-p", "NRestarts", "--value"],
-            capture_output=True, text=True, timeout=2,
-        ).stdout.strip()
-        return int(out)
-    except (ValueError, subprocess.SubprocessError):
-        return 0
+            ["systemctl", "show", *services, "-p", "Id", "-p", "ActiveState", "-p", "NRestarts"],
+            capture_output=True, text=True, timeout=BOOT_CHECK_TIMEOUT_S,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    states = {}
+    for block in out.strip().split("\n\n"):
+        kv = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
+        if "Id" not in kv:
+            continue
+        try:
+            restarts = int(kv.get("NRestarts") or 0)
+        except ValueError:
+            restarts = 0
+        states[kv["Id"]] = (kv.get("ActiveState") in ("active", "reloading"), restarts)
+    return states
 
 
 def _boot_in_progress() -> bool:
@@ -257,12 +275,15 @@ def _check_watched_services(last_restarts: dict) -> bool:
     call for any given service just seeds its baseline (no prior value to
     compare against yet), so it never flags unhealthy purely for having
     restarted at some point before this process started."""
+    states = _read_service_states(WATCHED_SERVICES)
+    if states is None:
+        return False  # don't flag unhealthy just because the check itself hiccuped
     unhealthy = False
     for svc in WATCHED_SERVICES:
-        if not _service_is_active(svc):
+        is_active, now_restarts = states.get(svc, (False, 0))
+        if not is_active:
             print(f"[led] health: {svc} is not active")
             unhealthy = True
-        now_restarts = _service_restarts(svc)
         if svc in last_restarts and now_restarts > last_restarts[svc]:
             print(f"[led] health: {svc} restarted ({last_restarts[svc]} -> {now_restarts})")
             unhealthy = True
@@ -271,16 +292,14 @@ def _check_watched_services(last_restarts: dict) -> bool:
 
 
 def _health_monitor_loop(shared: dict) -> None:
-    """Runs in its own daemon thread — deliberately NOT in the render loop.
-    Each of the 6 systemctl calls in _check_watched_services() spawns a
-    real process; measured at 1.365s combined, real, on this hardware. That
-    much blocking time inline in a 20ms render loop is a full-second-plus
-    freeze of the LED every ~5s, landing at a different phase of the
-    breathe/pulse cycle each time (5s and 8s share no common short cycle)
-    — which is exactly what "irregular steps, otherwise smooth" turned out
-    to be. The render loop only ever reads shared["unhealthy_until"], a
-    single float — cheap, and safe without an explicit lock under
-    CPython's GIL for a single plain assignment/read like this."""
+    """Runs in its own daemon thread. (Originally this had to stay out of the
+    render loop: the six systemctl spawns it once made took 1.365s combined on
+    this hardware, a visible freeze of a tick-driven animation. The animation
+    is now played by pigpiod and has no render loop left to freeze, but spawn
+    cost is still the biggest thing this daemon does — hence a single
+    `systemctl show` per HEALTH_CHECK_INTERVAL_S.) The main loop only ever
+    reads shared["unhealthy_until"], a single float — safe without a lock
+    under CPython's GIL for a plain assignment/read."""
     last_restarts: dict = {}
     boot_gate_logged = False
     while True:
@@ -345,6 +364,104 @@ def _connect_pigpiod(pigpio, timeout_s: float = PIGPIOD_WAIT_S, poll_s: float = 
         time.sleep(poll_s)
 
 
+def _pattern_segments(duty_at, cycle_s: float):
+    """Turns a brightness function into the pulse list for ONE repeat of a
+    pattern: [(level, delay_us), ...], level 1 = pin high. `duty_at(t_us)`
+    returns the brightness in steps 0..PEAK_STEPS at t_us microseconds into
+    the cycle, and is sampled once per PWM period (10ms) — each period is
+    `on` for duty*5us then `off` for the rest, i.e. real 100Hz PWM, the same
+    signal as before but with the brightness updated every period instead of
+    every 20ms tick. Adjacent same-level segments are merged (a long dark
+    stretch is a single pulse, not hundreds), keeping waves small."""
+    n_periods = max(1, round(cycle_s * 1_000_000 / WAVE_PERIOD_US))
+    segments: list = []
+
+    def add(level: int, us: int) -> None:
+        if us <= 0:
+            return
+        if segments and segments[-1][0] == level:
+            segments[-1] = (level, segments[-1][1] + us)
+        else:
+            segments.append((level, us))
+
+    for i in range(n_periods):
+        on_us = min(WAVE_PERIOD_US, duty_at(i * WAVE_PERIOD_US) * WAVE_STEP_US)
+        add(1, on_us)
+        add(0, WAVE_PERIOD_US - on_us)
+    return segments
+
+
+def _state_segments(state: str, ok_table, thinking_table):
+    """The repeating pulse pattern for a state. Timings are those of the
+    original renderer (see the per-state comments)."""
+    if state == "ok":
+        # slow breathe: perceptually-weighted table, ~6s cycle
+        return _pattern_segments(lambda t_us: _table_lookup(ok_table, t_us / 1e6), ok_table[2])
+    if state == "thinking":
+        # sharp, fast pulse: perceptually-weighted table, ~1.5s cycle
+        return _pattern_segments(lambda t_us: _table_lookup(thinking_table, t_us / 1e6), thinking_table[2])
+    if state == "ap":
+        # double blink: on 0-100ms, off 100-250ms, on 250-350ms,
+        # then off until the next pair starts 2s later (2.35s cycle)
+        return _pattern_segments(
+            lambda t_us: PEAK_STEPS if (t_us < 100_000 or 250_000 <= t_us < 350_000) else 0, 2.35)
+    if state == "error":
+        # single blink every 1s: on 100ms, off 900ms
+        return _pattern_segments(lambda t_us: PEAK_STEPS if t_us < 100_000 else 0, 1.0)
+    if state == "no_sensor":
+        # solid on (at the global cap): a single PWM period, repeated
+        return _pattern_segments(lambda t_us: PEAK_STEPS, WAVE_PERIOD_US / 1e6)
+    raise ValueError(f"unknown LED state: {state!r}")
+
+
+def _send_pattern(pi, pigpio, segments, prev_wave_id):
+    """Hands a pattern to pigpiod and starts it repeating, replacing whatever
+    was playing, with no gap. Returns the new wave id, or None if pigpiod
+    refused it (caller falls back to a steady glow — never a dark LED).
+
+    Order matters (both found live on a Pi Zero W):
+      - pigpiod ignores a wave on a pin that still has a PWM duty cycle set —
+        e.g. the dim "on" that schoolair-led.service's ExecStartPre leaves
+        behind — so PWM is zeroed immediately before the wave starts.
+      - the new wave is created and started BEFORE the old one is deleted;
+        starting a wave replaces the running one in place."""
+    mask = 1 << GPIO_LED
+    pulses = [pigpio.pulse(mask if level else 0, 0 if level else mask, us) for level, us in segments]
+    if pi.wave_add_generic(pulses) < 0:
+        return None
+    wave_id = pi.wave_create()
+    if wave_id < 0:
+        return None
+    pi.set_PWM_dutycycle(GPIO_LED, 0)
+    if pi.wave_send_repeat(wave_id) < 0:
+        pi.wave_delete(wave_id)
+        return None
+    if prev_wave_id is not None:
+        pi.wave_delete(prev_wave_id)
+    return wave_id
+
+
+def _steady_glow(pi) -> None:
+    """Last-resort display if a wave can't be created: plain PWM at the cap."""
+    pi.wave_tx_stop()
+    pi.set_PWM_frequency(GPIO_LED, PWM_FREQ_HZ)
+    pi.set_PWM_range(GPIO_LED, WAVE_STEPS)
+    pi.set_PWM_dutycycle(GPIO_LED, PEAK_STEPS)
+
+
+def _shutdown_led(pi) -> None:
+    """Best effort — pigpiod may already be gone. A wave keeps playing after
+    its client dies (verified: kill -9 of the client leaves it running), so
+    this must run on the way out or the LED stays frozen on its last pattern."""
+    try:
+        pi.wave_tx_stop()
+        pi.wave_clear()
+        pi.write(GPIO_LED, 0)
+        pi.stop()
+    except Exception:
+        pass
+
+
 def main() -> None:
     import pigpio  # deferred: Pi-only, keeps this module importable/testable elsewhere
 
@@ -380,21 +497,11 @@ def main() -> None:
     pi = _connect_pigpiod(pigpio)
     if pi is None:
         raise SystemExit("[led] could not connect to pigpiod")
+    print(f"[led] pigpiod ready — GPIO{GPIO_LED}, {PWM_FREQ_HZ}Hz, {WAVE_STEPS} levels, peak {PEAK_STEPS}")
 
-    pi.set_PWM_frequency(GPIO_LED, PWM_FREQ_HZ)
-    real_range = pi.get_PWM_real_range(GPIO_LED)
-    # set_PWM_dutycycle() validates against the *nominal* range from
-    # set_PWM_range() (default 255) — completely separate from real_range,
-    # which is just the DMA-tick count at the current frequency. Without
-    # this, every dutycycle value we compute against real_range gets
-    # rejected as out-of-range on any device that hasn't had this GPIO's
-    # nominal range touched before (i.e. every fresh device).
-    pi.set_PWM_range(GPIO_LED, real_range)
-    peak = round(real_range * PEAK_FRAC)
-    print(f"[led] pigpiod ready — GPIO{GPIO_LED}, real_range={real_range}, peak_duty={peak}")
-
-    ok_table = _build_breath_table(peak, OK_PERIOD_S * TEMPO_SCALE, TICK * TEMPO_SCALE)
-    thinking_table = _build_breath_table(peak, THINKING_PERIOD_S * TEMPO_SCALE, TICK * TEMPO_SCALE)
+    pi.set_mode(GPIO_LED, pigpio.OUTPUT)
+    ok_table = _build_breath_table(PEAK_STEPS, OK_PERIOD_S * TEMPO_SCALE, TICK * TEMPO_SCALE)
+    thinking_table = _build_breath_table(PEAK_STEPS, THINKING_PERIOD_S * TEMPO_SCALE, TICK * TEMPO_SCALE)
     print(f"[led] breathe table: {len(ok_table[0])} steps, actual cycle {ok_table[2]:.2f}s "
           f"(nominal {OK_PERIOD_S}s); pulse table: {len(thinking_table[0])} steps, "
           f"actual cycle {thinking_table[2]:.2f}s (nominal {THINKING_PERIOD_S}s)")
@@ -405,14 +512,9 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _on_sigterm)
 
     last_state = None
-    t0 = time.monotonic()
-    # Re-reading the state file every 20ms tick cost more CPU (0.69ms/tick,
-    # measured on a Pi Zero W) than the pigpio call that actually drives the
-    # LED (0.36ms) — pure waste, since the state changes every few seconds at
-    # most. On a single core that is already the bottleneck for the whole
-    # boot, poll it at 5Hz instead; a state change still shows within 200ms.
+    wave_id = None
     raw_state = _read_state()
-    raw_state_read_at = t0
+    raw_state_read_at = time.monotonic()
 
     try:
         while True:
@@ -422,41 +524,26 @@ def main() -> None:
                 raw_state_read_at = now_mono
             state = _resolve_state(health, now_mono, raw_state)
             if state != last_state:
-                t0 = time.monotonic()  # restart the pattern cleanly at each state change
+                segments = _state_segments(state, ok_table, thinking_table)
+                new_wave = _send_pattern(pi, pigpio, segments, wave_id)
+                if new_wave is None:
+                    print(f"[led] WARNING: pigpiod refused the {state!r} wave — showing a steady glow")
+                    _steady_glow(pi)
+                    wave_id = None
+                else:
+                    wave_id = new_wave
                 print(f"[led] state {last_state} -> {state} "
                       f"(state file: {_read_state()}, health override: "
-                      f"{now_mono < health['unhealthy_until']})")
+                      f"{now_mono < health['unhealthy_until']}; "
+                      f"{len(segments)} pulses, {sum(us for _, us in segments) / 1e6:.2f}s cycle)")
                 last_state = state
-            elapsed = time.monotonic() - t0
-
-            if state == "ok":
-                # slow breathe: perceptually-weighted, ~8s nominal
-                pi.set_PWM_dutycycle(GPIO_LED, _table_lookup(ok_table, elapsed))
-
-            elif state == "thinking":
-                # sharp, fast pulse: perceptually-weighted, ~1.2s nominal
-                pi.set_PWM_dutycycle(GPIO_LED, _table_lookup(thinking_table, elapsed))
-
-            elif state == "ap":
-                # double blink: on 0-100ms, off 100-250ms, on 250-350ms,
-                # then off until the next pair starts 2s later (2.35s cycle)
-                cycle = elapsed % 2.35
-                on = (0.0 <= cycle < 0.10) or (0.25 <= cycle < 0.35)
-                pi.set_PWM_dutycycle(GPIO_LED, peak if on else 0)
-
-            elif state == "error":
-                # single blink every 1s: on 100ms, off 900ms
-                cycle = elapsed % 1.0
-                on = cycle < 0.10
-                pi.set_PWM_dutycycle(GPIO_LED, peak if on else 0)
-
-            elif state == "no_sensor":
-                pi.set_PWM_dutycycle(GPIO_LED, peak)
-
-            time.sleep(TICK)
+            # Heartbeat: raises if pigpiod has gone away (crashed/restarted —
+            # either way the wave died with it), so systemd restarts us and a
+            # fresh wave is sent, instead of leaving the LED dark.
+            pi.get_current_tick()
+            time.sleep(STATE_POLL_S)
     finally:
-        pi.set_PWM_dutycycle(GPIO_LED, 0)
-        pi.stop()
+        _shutdown_led(pi)
 
 
 if __name__ == "__main__":

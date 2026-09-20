@@ -11,25 +11,36 @@ subprocess.run is mocked throughout — no real systemctl/systemd involved.
 
 import signal
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 import led_status
 
 
+def _wave_capable_pi():
+    """A MagicMock pigpio.pi that accepts waves (real pigpiod returns the
+    pulse count / wave id / control-block count, all >= 0)."""
+    pi = MagicMock()
+    pi.connected = True
+    pi.wave_add_generic.return_value = 1
+    pi.wave_create.return_value = 0
+    pi.wave_send_repeat.return_value = 1
+    return pi
+
+
 def _fake_run(active: dict, restarts: dict):
-    """Builds a subprocess.run replacement matching led_status._service_is_active
-    (systemctl is-active --quiet <svc>, returncode 0/1) and
-    _service_restarts (systemctl show <svc> -p NRestarts --value, stdout)."""
+    """Builds a subprocess.run replacement matching led_status._read_service_states:
+    ONE `systemctl show <svc...> -p Id -p ActiveState -p NRestarts`, whose stdout
+    is one blank-line-separated block per unit, in the order requested."""
     def run(cmd, **kwargs):
         result = MagicMock()
-        if cmd[:2] == ["systemctl", "is-active"]:
-            svc = cmd[-1]
-            result.returncode = 0 if active.get(svc, True) else 1
-        elif cmd[:2] == ["systemctl", "show"]:
-            svc = cmd[2]
-            result.stdout = str(restarts.get(svc, 0))
+        assert cmd[:2] == ["systemctl", "show"], cmd
+        units = [c for c in cmd[2:] if not c.startswith("-") and c not in ("Id", "ActiveState", "NRestarts")]
+        result.stdout = "\n\n".join(
+            f"Id={u}\nActiveState={'active' if active.get(u, True) else 'inactive'}\n"
+            f"NRestarts={restarts.get(u, 0)}"
+            for u in units) + "\n"
         return result
     return run
 
@@ -111,9 +122,7 @@ def test_main_turns_led_off_on_sigterm(monkeypatch, tmp_path):
     """End-to-end: simulate SIGTERM arriving mid-loop and confirm the finally
     block's cleanup — set_PWM_dutycycle(GPIO_LED, 0) then pi.stop() — actually
     runs, rather than the process just dying with the LED stuck lit."""
-    fake_pi = MagicMock()
-    fake_pi.connected = True
-    fake_pi.get_PWM_real_range.return_value = 2000
+    fake_pi = _wave_capable_pi()
 
     fake_pigpio = MagicMock()
     fake_pigpio.pi.return_value = fake_pi
@@ -148,7 +157,10 @@ def test_main_turns_led_off_on_sigterm(monkeypatch, tmp_path):
         with pytest.raises(SystemExit):
             led_status.main()
 
-    fake_pi.set_PWM_dutycycle.assert_called_with(led_status.GPIO_LED, 0)
+    # cleanup must halt the wave (it would otherwise keep playing with no
+    # owner), drive the pin low, and disconnect
+    fake_pi.wave_tx_stop.assert_called()
+    fake_pi.write.assert_called_with(led_status.GPIO_LED, 0)
     fake_pi.stop.assert_called_once()
 
 
@@ -243,9 +255,7 @@ def test_main_resets_stale_state_file_to_thinking_on_startup(monkeypatch, tmp_pa
     thing ever rendered, if it wrote before led_status.py initialised the
     file. main() must unconditionally reset to "thinking" on startup,
     even if the file already exists with something else."""
-    fake_pi = MagicMock()
-    fake_pi.connected = True
-    fake_pi.get_PWM_real_range.return_value = 2000
+    fake_pi = _wave_capable_pi()
     fake_pigpio = MagicMock()
     fake_pigpio.pi.return_value = fake_pi
 
@@ -352,3 +362,201 @@ def test_resolve_state_uses_provided_raw_state_without_reading_file(monkeypatch)
         raise AssertionError("_read_state must not be called when raw_state is given")
     monkeypatch.setattr(led_status, "_read_state", boom)
     assert led_status._resolve_state(_healthy(), now_mono=0.0, raw_state="ok") == "ok"
+
+
+
+# ── pigpio wave patterns ─────────────────────────────────────────────────────
+# The LED animation is played by pigpiod's DMA engine from precomputed pulse
+# lists, not driven tick-by-tick from Python, so it stays smooth under CPU
+# load. These tests pin the pulse lists down: exact timings, brightness, and
+# the hand-over to pigpiod.
+
+PERIOD = led_status.WAVE_PERIOD_US
+PEAK_US = led_status.PEAK_STEPS * led_status.WAVE_STEP_US   # on-time per PWM period at the cap
+
+
+def _total_us(segments):
+    return sum(us for _, us in segments)
+
+
+def _on_us(segments):
+    return sum(us for level, us in segments if level)
+
+
+def _level_at(segments, t_us):
+    """Pin level at t_us into the cycle."""
+    running = 0
+    for level, us in segments:
+        running += us
+        if t_us < running:
+            return level
+    raise AssertionError("t beyond the cycle")
+
+
+def _tables():
+    peak = led_status.PEAK_STEPS
+    return (
+        led_status._build_breath_table(peak, led_status.OK_PERIOD_S * led_status.TEMPO_SCALE,
+                                       led_status.TICK * led_status.TEMPO_SCALE),
+        led_status._build_breath_table(peak, led_status.THINKING_PERIOD_S * led_status.TEMPO_SCALE,
+                                       led_status.TICK * led_status.TEMPO_SCALE),
+    )
+
+
+def test_constants_match_the_original_pwm_setup():
+    """Same signal as the pigpio-PWM renderer: 100Hz, 2000 levels, cap 200."""
+    assert PERIOD == 10_000
+    assert led_status.WAVE_STEPS == 2000
+    assert led_status.PEAK_STEPS == 200
+    assert PEAK_US == 1000  # 10% of a 10ms period
+
+
+def test_pattern_segments_are_whole_pwm_periods_with_no_empty_or_adjacent_duplicates():
+    ok, thinking = _tables()
+    for state in ("ok", "thinking", "ap", "error", "no_sensor"):
+        segs = led_status._state_segments(state, ok, thinking)
+        assert _total_us(segs) % PERIOD == 0, state          # loops seamlessly
+        assert all(us > 0 for _, us in segs), state           # pigpio rejects zero delays
+        assert all(a[0] != b[0] for a, b in zip(segs, segs[1:])), state  # merged
+
+
+def test_no_sensor_is_solid_pwm_at_the_cap():
+    ok, thinking = _tables()
+    assert led_status._state_segments("no_sensor", ok, thinking) == [(1, PEAK_US), (0, PERIOD - PEAK_US)]
+
+
+def test_error_blinks_100ms_every_second():
+    ok, thinking = _tables()
+    segs = led_status._state_segments("error", ok, thinking)
+    assert _total_us(segs) == 1_000_000
+    assert _on_us(segs) == 10 * PEAK_US                      # 10 PWM periods lit at the cap
+    # all of the light falls inside the first 100ms; the rest is one long dark stretch
+    assert all(start + us <= 100_000 for start, (lvl, us) in _starts(segs) if lvl)
+    assert segs[-1] == (0, 1_000_000 - 91_000)               # last lit pulse ends at 91ms, then dark until 1s
+    assert _level_at(segs, 500_000) == 0 and _level_at(segs, 999_999) == 0
+
+
+def _starts(segs):
+    running = 0
+    for seg in segs:
+        yield running, seg
+        running += seg[1]
+
+
+def test_ap_is_a_double_blink_every_2_35s():
+    ok, thinking = _tables()
+    segs = led_status._state_segments("ap", ok, thinking)
+    assert _total_us(segs) == 2_350_000
+    assert _on_us(segs) == 20 * PEAK_US                      # two 100ms windows
+    lit = [(start, start + us) for start, (lvl, us) in _starts(segs) if lvl]
+    assert all(end <= 100_000 or 250_000 <= start and end <= 350_000 for start, end in lit)
+    assert any(start < 100_000 for start, _ in lit) and any(250_000 <= start < 350_000 for start, _ in lit)
+    assert _level_at(segs, 200_000) == 0 and _level_at(segs, 1_000_000) == 0
+
+
+def test_breathe_wave_matches_the_table_it_was_built_from():
+    ok, thinking = _tables()
+    segs = led_status._state_segments("ok", ok, thinking)
+    assert abs(_total_us(segs) - ok[2] * 1e6) <= PERIOD        # cycle length = table length (to 10ms)
+    assert max(us for lvl, us in segs if lvl) <= PEAK_US       # never brighter than the cap
+    # ...and reaches (within one step of) it: the table dwells only ~3.7ms on the very top
+    # value, so a 10ms sample can land on 199 instead of 200 — a 0.5% difference
+    assert max(us for lvl, us in segs if lvl) >= 0.98 * PEAK_US
+    # mean brightness equals the table's dwell-weighted mean (what the old renderer showed)
+    values, cumulative, total = ok
+    dwell = [cumulative[0]] + [cumulative[i] - cumulative[i - 1] for i in range(1, len(cumulative))]
+    expected_mean = sum(v * d for v, d in zip(values, dwell)) / total * led_status.WAVE_STEP_US / PERIOD
+    assert _on_us(segs) / _total_us(segs) == pytest.approx(expected_mean, rel=0.03)
+
+
+def test_breathe_wave_is_small_enough_for_pigpio():
+    ok, thinking = _tables()
+    for state in ("ok", "thinking"):
+        assert len(led_status._state_segments(state, ok, thinking)) < 12000   # pigpio's per-wave pulse limit
+
+
+def test_state_segments_rejects_unknown_state():
+    ok, thinking = _tables()
+    with pytest.raises(ValueError):
+        led_status._state_segments("bogus", ok, thinking)
+
+
+class _FakePigpio:
+    @staticmethod
+    def pulse(gpio_on, gpio_off, delay):
+        return (gpio_on, gpio_off, delay)
+
+
+def test_send_pattern_zeroes_pwm_then_starts_wave_then_deletes_the_old_one():
+    """pigpiod ignores a wave on a pin that still has PWM set (found live —
+    the boot-time dim "on" leaves exactly that), and the old wave must only
+    go once the new one is playing."""
+    pi = _wave_capable_pi()
+    pi.wave_create.return_value = 7
+    calls = []
+    for name in ("wave_add_generic", "wave_create", "set_PWM_dutycycle", "wave_send_repeat", "wave_delete"):
+        getattr(pi, name).side_effect = (lambda n, ret: (lambda *a, **k: (calls.append(n), ret)[1]))(
+            name, {"wave_add_generic": 1, "wave_create": 7, "set_PWM_dutycycle": 0, "wave_send_repeat": 1, "wave_delete": 0}[name])
+    segs = [(1, 1000), (0, 9000)]
+    assert led_status._send_pattern(pi, _FakePigpio, segs, prev_wave_id=3) == 7
+    assert calls == ["wave_add_generic", "wave_create", "set_PWM_dutycycle", "wave_send_repeat", "wave_delete"]
+    pi.set_PWM_dutycycle.assert_called_with(led_status.GPIO_LED, 0)
+    pi.wave_delete.assert_called_with(3)
+    mask = 1 << led_status.GPIO_LED
+    pi.wave_add_generic.assert_called_with([(mask, 0, 1000), (0, mask, 9000)])
+
+
+def test_send_pattern_first_pattern_has_nothing_to_delete():
+    pi = _wave_capable_pi()
+    pi.wave_create.return_value = 0
+    assert led_status._send_pattern(pi, _FakePigpio, [(1, 1000), (0, 9000)], prev_wave_id=None) == 0
+    pi.wave_delete.assert_not_called()
+
+
+@pytest.mark.parametrize("failing", ["wave_add_generic", "wave_create", "wave_send_repeat"])
+def test_send_pattern_returns_none_when_pigpiod_refuses(failing):
+    pi = _wave_capable_pi()
+    getattr(pi, failing).return_value = -1
+    assert led_status._send_pattern(pi, _FakePigpio, [(1, 1000), (0, 9000)], prev_wave_id=3) is None
+    # the previously playing wave is never deleted on failure
+    assert call(3) not in pi.wave_delete.call_args_list
+
+
+def test_steady_glow_fallback_shows_the_cap_via_plain_pwm():
+    pi = MagicMock()
+    led_status._steady_glow(pi)
+    pi.wave_tx_stop.assert_called_once()
+    pi.set_PWM_dutycycle.assert_called_with(led_status.GPIO_LED, led_status.PEAK_STEPS)
+
+
+def test_shutdown_led_never_raises_even_if_pigpiod_is_gone():
+    pi = MagicMock()
+    pi.wave_tx_stop.side_effect = ConnectionResetError("pigpiod died")
+    led_status._shutdown_led(pi)  # must not raise from the finally block
+
+
+def test_shutdown_led_halts_the_wave_and_drives_the_pin_low():
+    pi = MagicMock()
+    led_status._shutdown_led(pi)
+    pi.wave_tx_stop.assert_called_once()
+    pi.wave_clear.assert_called_once()
+    pi.write.assert_called_once_with(led_status.GPIO_LED, 0)
+    pi.stop.assert_called_once()
+
+
+def test_health_check_uses_a_single_systemctl_spawn():
+    """Regression: six spawns per check cost ~8% CPU on a Pi Zero W."""
+    with patch("subprocess.run", side_effect=_fake_run(active={}, restarts={})) as run:
+        led_status._check_watched_services({})
+    assert run.call_count == 1
+
+
+def test_health_check_ignores_a_failed_check():
+    with patch("subprocess.run", side_effect=OSError("no systemctl")):
+        assert led_status._check_watched_services({}) is False
+
+
+def test_health_check_treats_reloading_as_active():
+    out = "\n\n".join(f"Id={u}\nActiveState=reloading\nNRestarts=0" for u in led_status.WATCHED_SERVICES)
+    with patch("subprocess.run", return_value=MagicMock(stdout=out)):
+        assert led_status._check_watched_services({}) is False
