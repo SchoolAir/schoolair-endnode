@@ -39,6 +39,11 @@ CANDIDATES = {
 }
 
 
+def blink_segments():
+    """One 100 ms blink every 350 ms: the marker announcing which candidate is next."""
+    return L._pattern_segments_us(lambda t_us: L.PEAK_US if t_us < 100_000 else 0, 0.35)
+
+
 def per_period_on_us(segments):
     out, on, acc = [], 0, 0
     for level, us in segments:
@@ -85,8 +90,7 @@ def main():
             segs = build()
             n = list(CANDIDATES).index(label) + 1
             print(f"{label}: {desc}\n     {describe(segs)}\n     -> {n} blink(s), 1 s dark, then the curve for {args.seconds:.0f} s", flush=True)
-            blink = L._pattern_segments(lambda t: L.PEAK_STEPS if t < 100_000 else 0, 0.35)
-            wave = L._send_pattern(pi, pigpio, blink, wave)
+            wave = L._send_pattern(pi, pigpio, blink_segments(), wave)
             time.sleep(0.35 * n)
             pi.wave_tx_stop()
             pi.write(L.GPIO_LED, 0)
