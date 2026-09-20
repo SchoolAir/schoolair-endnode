@@ -1,0 +1,70 @@
+SCHOOLAIR ENDNODE - BOOT & STARTUP PROFILE   (Pi Zero W, measured live on .169, 2026-09-20)
+
+RESULT (final configuration, as it would ship)
+  LED "thinking" -> "ok" (server confirmed):  172.7 s  ->  108-112 s   (-61..64 s, ~-36%; final validation boot: 112.5 s)
+  LED first lit (dim, steady):                ~24 s (was ~140 s)     pulse from ~29 s (was ~148 s)
+  systemd "startup finished":                 2m41 s   ->  1m41 s
+
+THE ONE FACT THAT EXPLAINS EVERYTHING
+  The Zero W has a single 700 MHz core, and boot keeps it ~99% busy end to end
+  (/proc/stat: 1.5 s idle in the first 141 s; iowait only 1 s). The work is fixed, so
+  every CPU-second anything else burns delays networking and the LED "ok" almost 1:1.
+
+WHERE THE TIME WENT (and what was done)
+  Measured as three rounds of changes, each followed by a reboot ("ok" time after each):
+  Round 1 -> 140.3 s  (-32 s, measured)
+    cloud-init: re-ran users_groups + keyboard EVERY boot (~35 s of CPU) and held up
+      early boot.  -> disabled (/etc/cloud/cloud-init.disabled)
+    main.py called setup.check_registration(): a blocking request to the stale legacy
+      server (404 every boot, ~3 s + a false warning), left over from before the startup
+      ping existed.  -> removed entirely (jobs.ingest handles no-token; the startup ping
+      does the one real validation).  setup.py also imported questionary/prompt_toolkit
+      (CLI only) on every start -> now imported lazily
+  Round 2 -> 138.2 s  (-2 s, measured)
+    rpi-resize.service: skipped every boot (not a "first boot") yet never disables itself,
+      and its Wants= pulls in fstrim = a full-card TRIM (11.4 GiB) at every boot.
+      -> disabled once skipped; e2scrub_reap/timer masked (LVM-only).
+      (Fixes a real waste and an SD-wear risk, but was not the NetworkManager bottleneck.)
+  Round 3 -> 109.2 s  (-29 s, measured; contributions not isolated)
+    pigpiod: alert sampling burned 10% CPU forever (12.6 s in a boot).  -> -m: 1% CPU,
+      LED PWM unaffected
+    led_status.py: re-read its state file 50x/s (0.69 ms/tick vs 0.36 ms for the LED call).
+      -> polls 5x/s; CPU 11.1 s -> 6.2 s per boot
+    Boot order: NetworkManager/wpa_supplicant/dbus/app get CPUWeight=500 so the work that
+      gates "online" runs ahead of everything else
+    (this round also included the config.txt trims below, since reverted: ~3.5 s of it)
+  Earlier, separately: the LED unit no longer waits for NetworkManager (LED start 139 s
+    -> 24 s) and starts before sysinit; housekeeping timers (apt, man-db, ...) run at idle
+    CPU priority.
+
+STILL THE BIGGEST CPU CONSUMERS (seconds of CPU in one boot)
+  NetworkManager 14.6 | systemd-udevd 12.1 | led_status.py 6.2 | schoolair app 6.0 | dbus 3.2
+  Remaining cost is mostly inherent: NM's own startup and udev enumerating devices.
+
+TESTED, NOT SHIPPED
+  Deferring the HDMI/GPU driver (blacklist vc4, load it after the LED reaches "ok"): works
+  (vc4 bound at 113 s, right after ok; firmware framebuffer console covers HDMI from 4 s)
+  but "ok" stayed at 108.9 s vs 108.4 s -> no measurable gain, so not worth the moving parts.
+  Headless config.txt trims (camera/display probing, audio, vc4-kms): udevd -3.5 s CPU only,
+  loses HDMI console for debugging.  Reverted.
+
+LED PRIORITY / START TIME
+  led_status + pigpiod: CPUWeight=1000, Nice=-5 (NetworkManager 500, rest 100): keeps the
+  animation smooth under load.  It does not make the LED start earlier; the floor is
+  kernel 5.5 s -> initramfs -> systemd starts 11.7 s -> systemd loads units ~6 s ->
+  pigpiod init ~3 s -> dim "on" at ~25 s.  Below that only firmware/kernel-level tricks
+  (full-brightness GPIO, kernel PWM overlay, skipping the initramfs) are possible.
+
+POSSIBLE NEXT STEP: LED animation as a pigpio "wave"
+  Tested on the device: one 6 s breath = 1193 pulses (limit 12000), mean duty matches the
+  table (3.23% measured vs 3.37% expected), pigpiod 0.0% CPU while animating, Python idle.
+  Would remove led_status.py's ~6 s of CPU per boot and make the animation immune to CPU
+  starvation.  Not done: needs a visual re-check of the tuned look, and crash behaviour
+  (does the wave outlive the daemon?) must be defined.
+
+HOW TO RE-PROFILE
+  systemd-analyze; systemd-analyze critical-chain schoolair.service; systemd-analyze blame
+  head -1 /proc/stat                     # user nice system IDLE iowait ... in ticks (1/100 s)
+  journalctl -b -u schoolair-led         # LED now logs every state change with its reason
+  Per-service CPU: add DefaultCPUAccounting=yes to /etc/systemd/system.conf.d/x.conf, reboot,
+  then: systemctl show -p Id -p CPUUsageNSec $(systemctl list-units --type=service --plain --no-legend|cut -d' ' -f1)

@@ -281,3 +281,74 @@ def test_main_resets_stale_state_file_to_thinking_on_startup(monkeypatch, tmp_pa
     # if this still reads "thinking" (not the pre-seeded "error"), main()'s
     # startup reset is what did it.
     assert led_state_file.read_text() == "thinking"
+
+
+def test_connect_pigpiod_retries_until_daemon_is_up():
+    pis = [MagicMock(connected=False), MagicMock(connected=False), MagicMock(connected=True)]
+    fake_pigpio = MagicMock()
+    fake_pigpio.pi.side_effect = pis
+    with patch("time.sleep") as sleep:
+        assert led_status._connect_pigpiod(fake_pigpio, timeout_s=60, poll_s=0.5) is pis[2]
+    assert fake_pigpio.pi.call_count == 3
+    assert sleep.call_count == 2
+
+
+def test_connect_pigpiod_gives_up_after_timeout():
+    fake_pigpio = MagicMock()
+    fake_pigpio.pi.return_value = MagicMock(connected=False)
+    assert led_status._connect_pigpiod(fake_pigpio, timeout_s=0, poll_s=0) is None
+
+
+def test_boot_in_progress_true_while_systemd_is_starting():
+    result = MagicMock(stdout="starting\n")
+    with patch("builtins.open", MagicMock(return_value=MagicMock(
+            __enter__=lambda s: MagicMock(read=lambda: "45.2 40.0"), __exit__=lambda *a: None))), \
+         patch("subprocess.run", return_value=result):
+        assert led_status._boot_in_progress() is True
+
+
+def test_boot_in_progress_false_once_running():
+    result = MagicMock(stdout="running\n")
+    with patch("builtins.open", MagicMock(return_value=MagicMock(
+            __enter__=lambda s: MagicMock(read=lambda: "45.2 40.0"), __exit__=lambda *a: None))), \
+         patch("subprocess.run", return_value=result):
+        assert led_status._boot_in_progress() is False
+
+
+def test_boot_in_progress_gives_up_after_grace_period():
+    # even if systemd still says "starting", a stuck boot job must not
+    # suppress health checks forever
+    with patch("builtins.open", MagicMock(return_value=MagicMock(
+            __enter__=lambda s: MagicMock(read=lambda: "9999.0 9000.0"), __exit__=lambda *a: None))), \
+         patch("subprocess.run") as run:
+        assert led_status._boot_in_progress() is False
+    run.assert_not_called()
+
+
+def test_boot_in_progress_true_while_systemd_is_initializing():
+    # the state systemd reports before basic.target — exactly when the LED
+    # daemon now starts; regression: only "starting" used to be recognised
+    result = MagicMock(stdout="initializing\n")
+    with patch("builtins.open", MagicMock(return_value=MagicMock(
+            __enter__=lambda s: MagicMock(read=lambda: "12.0 10.0"), __exit__=lambda *a: None))), \
+         patch("subprocess.run", return_value=result):
+        assert led_status._boot_in_progress() is True
+
+
+def test_boot_in_progress_assumes_booting_when_systemctl_times_out():
+    # regression (found live on a Pi Zero W): a slow `systemctl is-system-running`
+    # was read as "boot finished", arming the health check ~80s early
+    import subprocess
+    with patch("builtins.open", MagicMock(return_value=MagicMock(
+            __enter__=lambda s: MagicMock(read=lambda: "94.0 80.0"), __exit__=lambda *a: None))), \
+         patch("subprocess.run", side_effect=subprocess.TimeoutExpired("systemctl", 20)):
+        assert led_status._boot_in_progress() is True
+
+
+def test_resolve_state_uses_provided_raw_state_without_reading_file(monkeypatch):
+    """The render loop passes a cached raw state (polled at 5Hz) — it must not
+    re-read the state file itself every tick."""
+    def boom():
+        raise AssertionError("_read_state must not be called when raw_state is given")
+    monkeypatch.setattr(led_status, "_read_state", boom)
+    assert led_status._resolve_state(_healthy(), now_mono=0.0, raw_state="ok") == "ok"

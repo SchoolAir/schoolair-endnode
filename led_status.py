@@ -72,7 +72,11 @@ _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 # happens to be up again by the time it's sampled.
 WATCHED_SERVICES = ("sen6x.service", "schoolair.service", "schoolair-netwatch.service")
 HEALTH_CHECK_INTERVAL_S = 5.0
+STATE_POLL_S = 0.2        # how often the render loop re-reads LED_STATE_FILE (see main())
+PIGPIOD_WAIT_S = 60.0     # how long main() waits for pigpiod to accept connections at startup
 UNHEALTHY_HOLD_S = 30.0    # once flagged, hold the "error" override at least this long
+BOOT_GRACE_MAX_S = 600.0   # never suppress health checks for longer than this after boot
+BOOT_CHECK_TIMEOUT_S = 20.0  # systemctl can be very slow mid-boot on a Pi Zero W; this runs off the render loop
 
 
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -215,6 +219,38 @@ def _service_restarts(svc: str) -> int:
         return 0
 
 
+def _boot_in_progress() -> bool:
+    """True while systemd is still bringing the system up ("initializing" or
+    "starting" — missing the first one made every watched service look
+    crashed for the first ~2 min and the LED blinked "error"). This process
+    now starts at the very beginning of boot (sysinit.target, so the LED can
+    show "thinking" before the slow parts of a boot are done), when the
+    watched services simply haven't been started yet — that's "not started
+    yet", not "crashed", so the health check must stay quiet until boot
+    finishes.
+
+    An inconclusive answer counts as "still booting": on a Pi Zero W under
+    boot load, `systemctl` itself can take longer than any short timeout,
+    and treating that as "boot is over" armed the health check ~80s early
+    (found live: LED blinked "error" because netwatch hadn't started yet).
+    Bounded by uptime so a stuck boot job or a broken systemctl can't mask
+    real breakage forever."""
+    try:
+        with open("/proc/uptime") as f:
+            if float(f.read().split()[0]) > BOOT_GRACE_MAX_S:
+                return False
+    except (OSError, ValueError):
+        return False
+    try:
+        out = subprocess.run(
+            ["systemctl", "is-system-running"],
+            capture_output=True, text=True, timeout=BOOT_CHECK_TIMEOUT_S,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return out in ("initializing", "starting")
+
+
 def _check_watched_services(last_restarts: dict) -> bool:
     """Returns True if anything looks unhealthy right now. Mutates
     last_restarts in place with the freshly observed counts — the first
@@ -224,9 +260,11 @@ def _check_watched_services(last_restarts: dict) -> bool:
     unhealthy = False
     for svc in WATCHED_SERVICES:
         if not _service_is_active(svc):
+            print(f"[led] health: {svc} is not active")
             unhealthy = True
         now_restarts = _service_restarts(svc)
         if svc in last_restarts and now_restarts > last_restarts[svc]:
+            print(f"[led] health: {svc} restarted ({last_restarts[svc]} -> {now_restarts})")
             unhealthy = True
         last_restarts[svc] = now_restarts
     return unhealthy
@@ -244,13 +282,20 @@ def _health_monitor_loop(shared: dict) -> None:
     single float — cheap, and safe without an explicit lock under
     CPython's GIL for a single plain assignment/read like this."""
     last_restarts: dict = {}
+    boot_gate_logged = False
     while True:
+        if _boot_in_progress():
+            time.sleep(HEALTH_CHECK_INTERVAL_S)
+            continue
+        if not boot_gate_logged:
+            print("[led] boot finished — service health checks armed")
+            boot_gate_logged = True
         if _check_watched_services(last_restarts):
             shared["unhealthy_until"] = time.monotonic() + UNHEALTHY_HOLD_S
         time.sleep(HEALTH_CHECK_INTERVAL_S)
 
 
-def _resolve_state(health: dict, now_mono: float) -> str:
+def _resolve_state(health: dict, now_mono: float, raw_state: "str | None" = None) -> str:
     """Precedence, highest to lowest:
       1. Independent health-check failure (health["unhealthy_until"]) — a
          watched service actually crashed. Always wins: that's a real
@@ -263,7 +308,7 @@ def _resolve_state(health: dict, now_mono: float) -> str:
          already-registered device. A genuine "no_sensor" still passes
          straight through unchanged — a hardware problem is a hardware
          problem in either mode."""
-    state = _read_state()
+    state = raw_state if raw_state is not None else _read_state()
     if state == "error" and not _is_registered():
         state = "ap"
     if now_mono < health["unhealthy_until"]:
@@ -280,6 +325,24 @@ def _on_sigterm(signum, frame) -> None:
     Routing it through SystemExit lets main()'s finally block turn the
     LED off before the process actually exits."""
     raise SystemExit(0)
+
+
+def _connect_pigpiod(pigpio, timeout_s: float = PIGPIOD_WAIT_S, poll_s: float = 0.5):
+    """Connects to pigpiod, retrying for up to timeout_s. pigpiod.service
+    declares no ordering of its own, so at boot it can still be starting
+    when this process is — giving up on the first refusal would cost a full
+    RestartSec (plus a Python cold start) before the LED ever lit. Polling
+    here means the LED starts within ~poll_s of pigpiod being ready. Also
+    covers a first boot where pigpiod is still being installed. Returns the
+    connected pigpio.pi, or None if it never came up."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        pi = pigpio.pi()
+        if pi.connected:
+            return pi
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(poll_s)
 
 
 def main() -> None:
@@ -314,8 +377,8 @@ def main() -> None:
     except OSError as e:
         print(f"[led] warning: could not prepare {LED_STATE_FILE}: {e}")
 
-    pi = pigpio.pi()
-    if not pi.connected:
+    pi = _connect_pigpiod(pigpio)
+    if pi is None:
         raise SystemExit("[led] could not connect to pigpiod")
 
     pi.set_PWM_frequency(GPIO_LED, PWM_FREQ_HZ)
@@ -343,13 +406,26 @@ def main() -> None:
 
     last_state = None
     t0 = time.monotonic()
+    # Re-reading the state file every 20ms tick cost more CPU (0.69ms/tick,
+    # measured on a Pi Zero W) than the pigpio call that actually drives the
+    # LED (0.36ms) — pure waste, since the state changes every few seconds at
+    # most. On a single core that is already the bottleneck for the whole
+    # boot, poll it at 5Hz instead; a state change still shows within 200ms.
+    raw_state = _read_state()
+    raw_state_read_at = t0
 
     try:
         while True:
             now_mono = time.monotonic()
-            state = _resolve_state(health, now_mono)
+            if now_mono - raw_state_read_at >= STATE_POLL_S:
+                raw_state = _read_state()
+                raw_state_read_at = now_mono
+            state = _resolve_state(health, now_mono, raw_state)
             if state != last_state:
                 t0 = time.monotonic()  # restart the pattern cleanly at each state change
+                print(f"[led] state {last_state} -> {state} "
+                      f"(state file: {_read_state()}, health override: "
+                      f"{now_mono < health['unhealthy_until']})")
                 last_state = state
             elapsed = time.monotonic() - t0
 

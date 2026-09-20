@@ -4,17 +4,42 @@ Description=SchoolAir: status LED (breathing/blink patterns via pigpiod)
 # actuator. pigpiod itself is installed by schoolair-pigpio-setup.service,
 # which needs network and can run well after this unit first starts —
 # Restart=on-failure just keeps retrying until pigpiod actually exists.
+#
+# Starts at the very beginning of boot (DefaultDependencies=no,
+# WantedBy=sysinit.target) so the "thinking" pulse shows almost
+# immediately. On a Pi Zero W, userspace takes >2 min to reach
+# multi-user.target (cloud-init alone is ~40s, NetworkManager only starts
+# ~60s after that), and a dark LED for that long reads as "dead". The LED
+# needs no network and nothing else from the normal boot, only pigpiod
+# (which schoolair's pigpiod-early drop-in likewise starts early).
 ConditionPathExists=/etc/schoolair-unit-type
-After=NetworkManager.service
+DefaultDependencies=no
+Wants=pigpiod.service
+After=pigpiod.service
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 Type=simple
+# Dim steady "on" the instant pigpiod is up — `pigs` is a tiny native client,
+# so this lands seconds before the Python daemon has finished importing.
+# Same PWM settings as led_status.py (100Hz, range 2000), duty 60 = 3%
+# (led_status.py's pulse peaks at 200 = 10%), so the hand-over is seamless.
+# A plain GPIO can only be fully on or off, so there is no dimmer way to
+# light the LED earlier than the first PWM-capable software. Failure is
+# harmless ("-"): led_status.py takes over regardless.
+ExecStartPre=-/bin/sh -c '/usr/bin/pigs pfs 24 100 && /usr/bin/pigs prs 24 2000 && /usr/bin/pigs p 24 60 && echo "[led] early dim-on set"'
 ExecStart=/usr/bin/python3 -u /home/admin/schoolair/led_status.py
 Restart=on-failure
-RestartSec=5
+RestartSec=2
 User=root
+# Boot on a Pi Zero W is CPU-bound, and this is the "the device is alive and
+# working" indicator: give it a larger CPU share than NetworkManager (500) and
+# the rest of boot (100) so its animation stays smooth and starts first.
+CPUWeight=1000
+Nice=-5
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=sysinit.target multi-user.target

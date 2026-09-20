@@ -514,6 +514,71 @@ for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-la
     fi
 done
 
+# pigpiod (indoor units) must start at the very beginning of boot so the
+# status LED can light early — see the header of deploy/pigpiod-early.conf.
+# Harmless on outdoor units, where pigpiod doesn't exist.
+if [ -f "${DEPLOY_DIR}/pigpiod-early.conf" ]; then
+    mkdir -p /etc/systemd/system/pigpiod.service.d
+    install_with_backup "${DEPLOY_DIR}/pigpiod-early.conf" /etc/systemd/system/pigpiod.service.d/schoolair-early.conf
+    ok "pigpiod early-start drop-in installed"
+fi
+
+# An earlier revision drove GPIO24 high from firmware start via config.txt.
+# That is full brightness (a plain GPIO cannot dim) and was far too bright;
+# schoolair-led.service now lights the LED dimmed via pigs instead. Clean up
+# the line where it was applied.
+if [ -f /boot/firmware/config.txt ] && grep -q '^gpio=24=op,dh' /boot/firmware/config.txt; then
+    sed -i -e '/^# SchoolAir status LED: on from firmware start/d' -e '/^gpio=24=op,dh/d' /boot/firmware/config.txt
+    ok "config.txt: removed obsolete full-brightness LED line"
+fi
+
+# Housekeeping jobs (apt, fstrim, ...) run right after boot on a Pi Zero W and
+# fight the app for the single core — run them at idle priority. See
+# deploy/lowprio.conf.
+if [ -f "${DEPLOY_DIR}/lowprio.conf" ]; then
+    for unit in apt-daily apt-daily-upgrade fstrim e2scrub_all e2scrub_reap man-db dpkg-db-backup logrotate; do
+        mkdir -p "/etc/systemd/system/${unit}.service.d"
+        install_with_backup "${DEPLOY_DIR}/lowprio.conf" "/etc/systemd/system/${unit}.service.d/schoolair-lowprio.conf"
+    done
+    ok "housekeeping units set to idle priority"
+fi
+
+# Boot is CPU-bound on a Pi Zero W: give the units that gate networking and the
+# app a bigger CPU share so the device gets online (and the LED to "ok") sooner.
+# See deploy/boot-priority.conf.
+if [ -f "${DEPLOY_DIR}/boot-priority.conf" ]; then
+    for unit in NetworkManager wpa_supplicant dbus schoolair schoolair-netwatch schoolair-launcher; do
+        mkdir -p "/etc/systemd/system/${unit}.service.d"
+        install_with_backup "${DEPLOY_DIR}/boot-priority.conf" "/etc/systemd/system/${unit}.service.d/schoolair-priority.conf"
+    done
+    ok "boot-critical units given higher CPU priority"
+fi
+
+# rpi-resize.service that was skipped at boot (ConditionFirstBoot unmet) never
+# disables itself, and its Wants= pulls in fstrim.service: a full-card TRIM
+# that stalls the SD card ~30s on EVERY boot (see first_boot.sh). Fix existing
+# devices too. Only when it was really skipped — never on a genuine first boot.
+if [ "$(systemctl show rpi-resize.service -p ConditionResult --value 2>/dev/null)" = "no" ]; then
+    systemctl disable rpi-resize.service 2>/dev/null || true
+    ok "rpi-resize.service disabled (skipped every boot, was triggering fstrim)"
+fi
+# e2scrub_reap/e2scrub_all only do anything for LVM-backed ext4 (Pi OS has none),
+# but e2scrub_reap keeps the SD card busy for ~20s right when networking starts.
+systemctl mask e2scrub_reap.service e2scrub_all.timer 2>/dev/null || true
+
+# cloud-init only ever did first-boot provisioning (Pi Imager's user/hostname/
+# Wi-Fi/keyboard), all of which this device now handles itself
+# (first_boot.sh / set_hostname.sh for the hostname, the wizard for Wi-Fi) and
+# has long since persisted to disk. Left enabled it still re-runs its
+# users_groups and keyboard modules on EVERY boot: ~35s of CPU on a Pi Zero W
+# that delays networking and the whole app. Disabling is reversible
+# (rm /etc/cloud/cloud-init.disabled).
+if [ ! -e /etc/cloud/cloud-init.disabled ]; then
+    mkdir -p /etc/cloud
+    touch /etc/cloud/cloud-init.disabled
+    ok "cloud-init disabled (saves ~35s per boot)"
+fi
+
 if [ -f "${DEPLOY_DIR}/schoolair-first-boot.service" ]; then
     install_with_backup "${DEPLOY_DIR}/schoolair-first-boot.service" /etc/systemd/system/schoolair-first-boot.service
     ok "schoolair-first-boot.service installed"
