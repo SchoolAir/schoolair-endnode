@@ -473,12 +473,20 @@ def test_breathe_wave_is_a_five_second_perceptual_cosine_capped_at_the_brightnes
     assert sum(per) / len(per) == pytest.approx(model_mean, rel=0.005)
 
 
-def test_breathe_spends_half_its_cycle_above_the_perceptual_midpoint():
+def test_symmetric_breath_spends_half_its_cycle_above_the_perceptual_midpoint():
     """The point of defining the curve in perceived lightness: the old table
-    timing spent 68% of the cycle above the midpoint (L* 50); this spends 50%."""
+    timing spent 68% of the cycle above the midpoint (L* 50); a symmetric cosine
+    spends 50%."""
+    per = _per_period_on_us(led_status._breath_segments(5.0, shape=1.0))
+    assert _share_above_midpoint(per) == pytest.approx(0.50, abs=0.03)
+
+
+def test_default_breath_spends_forty_percent_above_the_midpoint():
+    """Shape 1.6, chosen by eye (of 1.0 / 1.3 / 1.6) as the least bright-for-too-long."""
+    assert led_status.BREATH_SHAPE_EXPONENT == 1.6
     for state in ("ok", "thinking"):
         per = _per_period_on_us(led_status._state_segments(state))
-        assert _share_above_midpoint(per) == pytest.approx(0.50, abs=0.03), state
+        assert _share_above_midpoint(per) == pytest.approx(0.40, abs=0.03), state
 
 
 def test_breath_shape_exponent_above_one_spends_less_time_bright():
@@ -666,3 +674,63 @@ def test_one_microsecond_resolution_gives_a_smooth_dim_end(monkeypatch):
     assert worst_1 < 0.5 and stuck_1 == 0
     assert worst_5 > 1.5 and stuck_5 > 0                 # documents what the old resolution did
     assert worst_1 < worst_5 / 4
+
+
+# ── the very bottom: dithering of the last few microseconds ──────────────────
+
+def test_dither_keeps_sub_microsecond_levels_right_on_average():
+    """A wanted 0.3us on-time is below one 1us step: plain rounding gives 0 forever
+    (the fade holds dark, then jumps to 1us); error diffusion averages it out."""
+    plain = led_status._pattern_segments_us(lambda t: 0.3, 2.0)                       # 200 slots
+    dithered = led_status._pattern_segments_us(lambda t: 0.3, 2.0, dither_below_us=16)
+    assert _on_us(plain) == 0
+    assert _on_us(dithered) == pytest.approx(0.3 * 200, abs=1)
+    assert set(_per_period_on_us(dithered)) == {0, 1}
+
+
+def test_dither_only_applies_below_its_threshold():
+    """Above the threshold the steps are small relative jumps: identical to plain rounding."""
+    fn = lambda t: 40.4 if t < 1_000_000 else 3.4
+    dithered = _per_period_on_us(led_status._pattern_segments_us(fn, 2.0, dither_below_us=16))
+    plain = _per_period_on_us(led_status._pattern_segments_us(fn, 2.0))
+    assert dithered[:100] == plain[:100] == [40] * 100
+    assert dithered[100:] != plain[100:]                   # the dim half is dithered (3, 4, 3, 3, 4 ...)
+    assert sum(dithered[100:]) == pytest.approx(3.4 * 100, abs=1)
+
+
+def test_dither_is_off_at_5us_resolution(monkeypatch):
+    """At 5us steps the same dithering measured as jitter (32% slot-to-slot deviation)."""
+    monkeypatch.setattr(led_status, "WAVE_STEP_US", 5)
+    per = _per_period_on_us(led_status._breath_segments(5.0))
+    assert all(x % 5 == 0 for x in per)
+    assert per == _per_period_on_us(led_status._breath_segments(5.0, dither_below_us=0.0))
+
+
+def test_dithering_smooths_the_bottom_of_the_fade_as_the_eye_sees_it():
+    """Regression for the visibly stepped very-bottom (worst on the way down): plain
+    1us rounding holds levels 1-2us for 80-140ms, so 100ms-window brightness strays
+    from the ideal by up to 100% (rms 18%); dithered it is 35% worst / 4% rms."""
+    n = 500
+    ideal = [led_status._breath_on_us(i * PERIOD, 5.0) for i in range(n)]
+
+    def eye_error(per):
+        rel = []
+        for i in range(n - 10):
+            want = sum(ideal[i:i + 10]) / 10
+            if want >= 0.15:
+                rel.append(abs(sum(per[i:i + 10]) / 10 - want) / want)
+        return max(rel), (sum(r * r for r in rel) / len(rel)) ** 0.5
+
+    plain_worst, plain_rms = eye_error(_per_period_on_us(led_status._breath_segments(5.0, dither_below_us=0.0)))
+    worst, rms = eye_error(_per_period_on_us(led_status._breath_segments(5.0)))
+    assert plain_rms > 0.12 and rms < 0.06
+    assert worst < 0.5 and plain_worst > 0.9
+    assert rms < plain_rms / 2
+
+
+def test_no_pulse_is_ever_dropped_or_negative_when_dithering_down_to_dark():
+    per = _per_period_on_us(led_status._breath_segments(5.0))
+    assert min(per) == 0
+    assert all(0 <= x <= PEAK_US for x in per)
+    # the fade actually reaches full dark, and stays a sequence of small steps into it
+    assert per[0] == 0 and per[-1] == 0

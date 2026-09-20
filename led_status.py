@@ -75,9 +75,22 @@ PEAK_US = round(WAVE_PERIOD_US * PEAK_FRAC * BRIGHTNESS)   # 800us on-time per 1
 # from a log-based weight that ignored the envelope entirely.)
 #  - BREATH_SHAPE_EXPONENT: p = cosine ** this. 1.0 = symmetric (50% above the
 #    midpoint); >1 spends more of the cycle dim (1.3 -> ~44%, 1.6 -> ~40%).
+#  - BREATH_DIM_DITHER_US: below this on-time (per 10ms slot) the fade is dithered.
+#    Even at 1us resolution the last few microseconds are big relative jumps (1->2us
+#    is +100%, 4->5 +25%), and the curve is nearly flat there, so plain rounding holds
+#    each level for 50-300ms: a visibly stepped bottom, worst on the way down (in a
+#    dark room the eye sees levels this faint). First-order error diffusion carries
+#    the sub-microsecond remainder into the next slot, so the average is exact and the
+#    fade is continuous down to dark: the eye-integrated (100ms) error at the bottom
+#    falls from 18% rms / 100% worst to 4% / 48%. Above ~1us every slot still carries
+#    a pulse (100Hz, width alternating between neighbouring values); only in the last
+#    moments before full dark does it thin to sparse 1us pulses. Second-order
+#    diffusion was tried and is worse (it fights the can't-be-negative clamp at 0).
+#    Not used at 5us resolution, where the same dithering measured as jitter.
 OK_CYCLE_S = 5.0
 THINKING_CYCLE_S = 1.5
-BREATH_SHAPE_EXPONENT = 1.0
+BREATH_SHAPE_EXPONENT = 1.6      # 40% of the cycle above the perceptual midpoint (chosen by eye from 1.0/1.3/1.6)
+BREATH_DIM_DITHER_US = 16.0
 
 _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 
@@ -325,23 +338,28 @@ def _luminance_to_lightness(y: float) -> float:
     return 903.3 * y if y <= 0.008856 else 116.0 * y ** (1.0 / 3.0) - 16.0
 
 
-def _breath_on_us(t_us: float, cycle_s: float, shape: float = 1.0) -> float:
+def _breath_on_us(t_us: float, cycle_s: float, shape: float = None) -> float:
     """On-time (us, fractional) per PWM period at t_us into a breath: raised
     cosine in perceived lightness -> luminance -> scaled to the cap."""
+    shape = BREATH_SHAPE_EXPONENT if shape is None else shape
     p = _ease(t_us / 1e6, cycle_s) ** shape
     return PEAK_US * _lightness_to_luminance(p)
 
 
-def _pattern_segments_us(on_us_at, cycle_s: float):
+def _pattern_segments_us(on_us_at, cycle_s: float, dither_below_us: float = 0.0):
     """Turns an on-time function into the pulse list for ONE repeat of a
     pattern: [(level, delay_us), ...], level 1 = pin high. `on_us_at(t_us)`
     returns the wanted on-time (microseconds) per PWM period at t_us into the
     cycle, and is sampled once per PWM period (10ms) — each period is `on` then
     `off` for the rest, i.e. real 100Hz PWM — quantised to WAVE_STEP_US.
+    Where the wanted on-time is below `dither_below_us` the rounding error is
+    carried into the next period (first-order error diffusion), so slowly
+    changing dim levels are right on average instead of sticking on one step.
     Adjacent same-level segments are merged (a long dark stretch is a single
     pulse, not hundreds), keeping waves small."""
     n_periods = max(1, round(cycle_s * 1_000_000 / WAVE_PERIOD_US))
     segments: list = []
+    carry = 0.0   # quantisation error carried between periods (dithered region only)
 
     def add(level: int, us: int) -> None:
         if us <= 0:
@@ -352,15 +370,23 @@ def _pattern_segments_us(on_us_at, cycle_s: float):
             segments.append((level, us))
 
     for i in range(n_periods):
-        on_us = max(0, min(WAVE_PERIOD_US, WAVE_STEP_US * round(on_us_at(i * WAVE_PERIOD_US) / WAVE_STEP_US)))
+        want = on_us_at(i * WAVE_PERIOD_US)
+        dithering = want < dither_below_us
+        if dithering:
+            want -= carry
+        on_us = max(0, min(WAVE_PERIOD_US, WAVE_STEP_US * round(want / WAVE_STEP_US)))
+        carry = (on_us - want) if dithering else 0.0
         add(1, on_us)
         add(0, WAVE_PERIOD_US - on_us)
     return segments
 
 
-def _breath_segments(cycle_s: float, shape: float = None):
+def _breath_segments(cycle_s: float, shape: float = None, dither_below_us: float = None):
     shape = BREATH_SHAPE_EXPONENT if shape is None else shape
-    return _pattern_segments_us(lambda t_us: _breath_on_us(t_us, cycle_s, shape), cycle_s)
+    if dither_below_us is None:
+        # only worthwhile once pulses are fine enough (see BREATH_DIM_DITHER_US)
+        dither_below_us = BREATH_DIM_DITHER_US if WAVE_STEP_US == 1 else 0.0
+    return _pattern_segments_us(lambda t_us: _breath_on_us(t_us, cycle_s, shape), cycle_s, dither_below_us)
 
 
 def _state_segments(state: str):

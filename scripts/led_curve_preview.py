@@ -12,7 +12,7 @@ Each candidate is announced by N quick blinks (A = 1, B = 2, ...), then 1 s of d
 then the breathing curve. Before playing, each one prints how much of its cycle it
 spends above the perceptual midpoint (CIE lightness L* >= 50), which is the number
 that matters for "does it stay bright too long". Whatever you settle on goes into
-led_status.py (BREATH_SHAPE_EXPONENT, OK_CYCLE_S, BRIGHTNESS).
+led_status.py (BREATH_SHAPE_EXPONENT, BREATH_DIM_DITHER_US, OK_CYCLE_S, BRIGHTNESS).
 """
 import argparse
 import os
@@ -26,25 +26,16 @@ import led_status as L  # noqa: E402
 CYCLE = 5.0
 
 
-def at_step(step_us, shape):
-    """Pulse list built with a given pulse resolution (restores the real one after)."""
-    def build():
-        real = L.WAVE_STEP_US
-        L.WAVE_STEP_US = step_us
-        try:
-            return L._breath_segments(CYCLE, shape=shape)
-        finally:
-            L.WAVE_STEP_US = real
-    return build
+def breath(shape, dither_below_us):
+    return lambda: L._breath_segments(CYCLE, shape=shape, dither_below_us=dither_below_us)
 
 
 # label: (description, function returning the pulse list for one cycle)
-# Needs pigpiod running with -s 1 (deploy/pigpiod-early.conf) for the 1us candidates to be exact.
+# Needs pigpiod running with -s 1 (deploy/pigpiod-early.conf) for the 1us steps to be exact.
 CANDIDATES = {
-    "A": ("5us steps, symmetric: what you saw before (stepped / jittery dim end)", at_step(5, 1.0)),
-    "B": ("1us steps, symmetric: half the cycle above the midpoint (new default)", at_step(1, 1.0)),
-    "C": ("1us steps, a bit less time bright (shape 1.3)", at_step(1, 1.3)),
-    "D": ("1us steps, noticeably less time bright (shape 1.6)", at_step(1, 1.6)),
+    "A": ("shape 1.6, plain 1us steps: the bottom you called steppy (esp. on the way down)", breath(1.6, 0.0)),
+    "B": ("shape 1.6, bottom dithered below 16us: the new default", breath(1.6, L.BREATH_DIM_DITHER_US)),
+    "C": ("shape 1.0, bottom dithered: symmetric, for reference", breath(1.0, L.BREATH_DIM_DITHER_US)),
 }
 
 
