@@ -43,6 +43,59 @@ MODE="${1:-setup}"
 [[ "$MODE" == "setup" || "$MODE" == "--update" ]] \
     || { echo "Usage: $0 [--update]"; exit 1; }
 
+# >>> schoolair-detach
+# ── Run --update detached from whatever service triggered it ─────────────────
+# An automatic OTA is started by the app itself (jobs/ingest.py _trigger_update:
+# `sudo schoolair-update`), so this script starts life INSIDE schoolair.service's
+# cgroup — and step 15b restarts schoolair.service. systemd kills the whole
+# cgroup on stop, this script included: found live, the update died right after
+# the app's restart. Everything after it never ran: the netwatch restart, the
+# post-restart health check, arming the rollback watchdog (the safety net), the
+# final verification — and a failure-triggered rollback would have killed itself
+# the same way. (Manual `sudo schoolair-update` over SSH and the canary script
+# never hit this: they run outside the app's service.)
+#
+# Fix: re-run ourselves as a transient systemd unit (its own cgroup under
+# system.slice, unaffected by restarting any SchoolAir service) and wait for it.
+#  - The unit's output goes to the journal, NOT to a pipe owned by us (--pipe would
+#    SIGPIPE the update the moment the app is killed). A `journalctl -f` follower
+#    keeps live output flowing to whoever is watching (manual runs, the canary script).
+#  - If systemd-run can't be used, fall back to updating in place: a possibly
+#    truncated update beats no update.
+# Placed before anything with side effects (log redirection, the failure trap).
+_schoolair_detach_update() {
+    [[ "$MODE" == "--update" ]] || return 0
+    [[ -z "${SCHOOLAIR_OTA_DETACHED:-}" ]] || return 0      # we ARE the detached unit
+    command -v systemd-run >/dev/null 2>&1 || return 0
+    [[ -d /run/systemd/system ]] || return 0                # systemd isn't PID 1
+    [[ -r "$0" ]] || return 0                               # piped in (curl | bash): nothing to re-run
+
+    local self unit
+    self="$(readlink -f "$0")"
+    # Can this box create transient units at all? If not, update in place.
+    if ! systemd-run --quiet --collect --wait --unit="schoolair-ota-probe-$$" true >/dev/null 2>&1; then
+        echo "note: cannot create a transient systemd unit — updating in place (not detached from the calling service)" >&2
+        return 0
+    fi
+
+    unit="schoolair-ota-$(date +%Y%m%d-%H%M%S)"
+    local env_args=(--setenv=SCHOOLAIR_OTA_DETACHED=1)
+    [[ -z "${ADMIN_USER:-}" ]]   || env_args+=("--setenv=ADMIN_USER=${ADMIN_USER}")
+    [[ -z "${REPO_BRANCH:-}" ]]  || env_args+=("--setenv=REPO_BRANCH=${REPO_BRANCH}")
+
+    echo "Running the update as ${unit}.service (survives restarting the service that triggered it)"
+    journalctl -u "${unit}.service" -f -o cat --no-pager --since now 2>/dev/null &
+    local follower=$! rc=0
+    systemd-run --quiet --collect --wait --unit="$unit" --description="SchoolAir OTA update" \
+        "${env_args[@]}" /usr/bin/env bash "$self" --update || rc=$?
+    sleep 1                                                 # let the follower print the last lines
+    kill "$follower" 2>/dev/null || true
+    wait "$follower" 2>/dev/null || true
+    exit "$rc"
+}
+_schoolair_detach_update
+# <<< schoolair-detach
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_HOME="/home/${ADMIN_USER}"
@@ -564,7 +617,13 @@ if [ "$(systemctl show rpi-resize.service -p ConditionResult --value 2>/dev/null
 fi
 # e2scrub_reap/e2scrub_all only do anything for LVM-backed ext4 (Pi OS has none),
 # but e2scrub_reap keeps the SD card busy for ~20s right when networking starts.
+# Stop them BEFORE masking: masking a running e2scrub_all.timer leaves it "failed"
+# ("Unit to trigger vanished") at the next daemon-reload and the whole system
+# "degraded" until reboot (found on a device after an OTA). `mask --now` does not
+# avoid it — verified — only an explicit stop first does.
+systemctl stop e2scrub_all.timer e2scrub_reap.service 2>/dev/null || true
 systemctl mask e2scrub_reap.service e2scrub_all.timer 2>/dev/null || true
+systemctl reset-failed e2scrub_all.timer e2scrub_reap.service 2>/dev/null || true
 
 # cloud-init only ever did first-boot provisioning (Pi Imager's user/hostname/
 # Wi-Fi/keyboard), all of which this device now handles itself
