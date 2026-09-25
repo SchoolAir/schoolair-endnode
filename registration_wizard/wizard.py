@@ -62,6 +62,9 @@ TEMP_PROFILE = "school-air-temp"
 # netwatch.sh's independent "uplink appeared, close the AP" poll doesn't
 # race in and stop this service mid-attempt. See run_registration().
 WIZARD_BUSY_FILE = "/run/schoolair-wizard-busy"
+# Written by led_status.py while the device has an error — the LED shows "ap"
+# instead of "error" while the hotspot is up, so the pages here say it instead.
+DEVICE_ERROR_FILE = "/run/schoolair-device-error"
 SAVED_PREFIX = "schoolair-"
 IDLE_TIMEOUT = 15 * 60  # seconds idle before auto-shutdown (management mode only)
 SESSION_TTL  = 30 * 60  # seconds before an incomplete session expires
@@ -261,6 +264,8 @@ h1{font-size:1.4rem;color:#1a56db;font-weight:700;text-align:center;margin-botto
 .badge{display:inline-block;padding:.2rem .6rem;border-radius:999px;font-size:.78rem;font-weight:700}
 .badge-ok{background:#d1fae5;color:#065f46}
 .badge-warn{background:#fef3c7;color:#92400e}
+.notice{padding:.75rem;border-radius:8px;font-size:.875rem;margin:0 0 1rem}
+.notice-err{background:#fef2f2;color:#dc2626;border:1.5px solid #fca5a5}
 .btn{display:block;width:100%;margin-top:1.5rem;padding:.75rem;
      background:#1a56db;color:#fff;border:none;border-radius:8px;
      font-size:1rem;font-weight:600;cursor:pointer;text-align:center;text-decoration:none}
@@ -270,6 +275,7 @@ h1{font-size:1.4rem;color:#1a56db;font-weight:700;text-align:center;margin-botto
 <body>
 <div class="card">
   <h1>🌬️ SchoolAir Device</h1>
+  [[device_error]]
   <div class="row"><span class="lbl">Hostname</span><span class="val">[[hostname]]</span></div>
   <div class="row"><span class="lbl">Registration</span><span class="val">[[reg_badge]]</span></div>
   [[site_row]]
@@ -1083,6 +1089,25 @@ def _bind_identity() -> None:
         print(f"[wizard] Warning: could not save device identity: {e}")
         return
     device_identity.clear_mismatch()
+
+
+def _device_error_html() -> str:
+    """A notice describing what's wrong with the device right now, or "".
+    A card from another Pi comes first, since it's the cause of the rest
+    (schoolair refuses to run); otherwise whatever led_status.py reported."""
+    if device_identity.mismatch_detected():
+        return ('<div class="notice notice-err">'
+                '<strong>This SD card was registered on a different SchoolAir device.</strong> '
+                'Monitoring is stopped until this device is registered again.</div>')
+    try:
+        with open(DEVICE_ERROR_FILE) as f:
+            reason = f.read().strip()
+    except OSError:
+        return ""
+    if not reason:
+        return ""
+    return ('<div class="notice notice-err"><strong>Device error:</strong> '
+            f'{_html.escape(reason)}</div>')
 
 
 def _ensure_dir() -> None:
@@ -1936,6 +1961,7 @@ async def index(request):
             site_row  = ""
             asset_row = ""
         body = (LANDING_HTML
+                .replace("[[device_error]]", _device_error_html())
                 .replace("[[hostname]]", _html.escape(hostname))
                 .replace("[[reg_badge]]", badge)
                 .replace("[[site_row]]",  site_row)
@@ -1971,12 +1997,7 @@ async def index(request):
                 '<strong>Last attempt failed:</strong> '
                 f'{_html.escape(reg_state["message"])}</div>'
             )
-        elif device_identity.mismatch_detected():
-            last_error_banner = (
-                '<div class="notice notice-err">'
-                '<strong>This SD card was registered on a different SchoolAir device.</strong> '
-                'Monitoring is stopped until this device is registered again below.</div>'
-            )
+        last_error_banner += _device_error_html()
         body = _render(STEP1_HTML, raw={
             "wizard_emoji":       _wizard_emoji("m"),
             "quote":              quote,

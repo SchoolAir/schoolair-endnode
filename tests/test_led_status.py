@@ -830,3 +830,112 @@ def test_black_point_shortens_the_single_spark_zone_of_the_brightening():
         return sum(1 for i in range(240) if 0 < sum(per[i:i + 10]) / 10 < 1.0) * 10
     assert sparks_ms(1.0) < sparks_ms(0.0) / 1.8
     assert sparks_ms(2.0) <= sparks_ms(1.0)
+
+
+# ── AP mode beats "error"; the hidden error goes to DEVICE_ERROR_FILE ────────
+#
+# While the setup hotspot is up, the LED must say "ap" (someone is expected to
+# set the device up), even if a watched service is down — e.g. schoolair.service
+# refusing to run on a card from another Pi. The error itself is published for
+# the wizard's pages instead.
+
+_FIB_TRIE_AP = """Main:
+  +-- 0.0.0.0/0 3 0 5
+     +-- 127.0.0.0/8 2 0 2
+           |-- 127.0.0.1
+              /32 host LOCAL
+     +-- 192.168.4.0/24 2 0 2
+        +-- 192.168.4.0/31 1 0 0
+           |-- 192.168.4.0
+              /24 link UNICAST
+           |-- 192.168.4.1
+              /32 host LOCAL
+        |-- 192.168.4.255
+           /32 link BROADCAST
+"""
+
+# A school network that happens to be 192.168.4.0/24: we're a client (.37), and
+# 192.168.4.1 is the gateway — present in the trie only as a route, not LOCAL.
+_FIB_TRIE_CLIENT_SAME_SUBNET = """Main:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 0.0.0.0
+        /0 universe UNICAST
+     +-- 192.168.4.0/24 2 0 2
+           |-- 192.168.4.0
+              /24 link UNICAST
+           |-- 192.168.4.1
+              /32 link UNICAST
+           |-- 192.168.4.37
+              /32 host LOCAL
+"""
+
+
+def test_ap_ip_matches_wizard_config():
+    from pathlib import Path
+    cfg = (Path(led_status.__file__).parent / "registration_wizard" / "config.py").read_text()
+    assert f'AP_IP                 = "{led_status.AP_IP}"' in cfg or f'AP_IP = "{led_status.AP_IP}"' in cfg
+
+
+def test_ap_active_when_device_holds_ap_ip(tmp_path):
+    trie = tmp_path / "fib_trie"
+    trie.write_text(_FIB_TRIE_AP)
+    assert led_status._ap_active(str(trie)) is True
+
+
+def test_ap_not_active_as_client_of_a_192_168_4_network(tmp_path):
+    trie = tmp_path / "fib_trie"
+    trie.write_text(_FIB_TRIE_CLIENT_SAME_SUBNET)
+    assert led_status._ap_active(str(trie)) is False
+
+
+def test_ap_not_active_when_trie_unreadable(tmp_path):
+    assert led_status._ap_active(str(tmp_path / "missing")) is False
+
+
+def test_resolve_state_ap_beats_health_check_error(monkeypatch):
+    monkeypatch.setattr(led_status, "_is_registered", lambda: True)
+    unhealthy = {"unhealthy_until": 100.0}
+    assert led_status._resolve_state(unhealthy, now_mono=50.0, raw_state="ok", ap_active=True) == "ap"
+
+
+def test_resolve_state_ap_beats_state_file_error(monkeypatch):
+    monkeypatch.setattr(led_status, "_is_registered", lambda: True)
+    assert led_status._resolve_state(_healthy(), now_mono=0.0, raw_state="error", ap_active=True) == "ap"
+
+
+def test_resolve_state_ap_does_not_hide_other_states(monkeypatch):
+    monkeypatch.setattr(led_status, "_is_registered", lambda: True)
+    for raw in ("no_sensor", "thinking", "ok"):
+        assert led_status._resolve_state(_healthy(), 0.0, raw_state=raw, ap_active=True) == raw
+
+
+def test_resolve_state_health_error_still_shown_without_ap(monkeypatch):
+    monkeypatch.setattr(led_status, "_is_registered", lambda: True)
+    unhealthy = {"unhealthy_until": 100.0}
+    assert led_status._resolve_state(unhealthy, now_mono=50.0, raw_state="ok", ap_active=False) == "error"
+
+
+def test_check_watched_services_describes_problems():
+    target = "schoolair.service"
+    problems: list = []
+    with patch("subprocess.run", side_effect=_fake_run(
+        active={target: False}, restarts={s: 0 for s in led_status.WATCHED_SERVICES},
+    )):
+        assert led_status._check_watched_services({s: 0 for s in led_status.WATCHED_SERVICES}, problems) is True
+    assert problems == ["The air-quality monitoring service is not running."]
+
+
+def test_error_reason_only_while_unhealthy():
+    health = {"unhealthy_until": 100.0, "reason": "The sensor service is not running."}
+    assert led_status._error_reason(health, now_mono=50.0) == "The sensor service is not running."
+    assert led_status._error_reason(health, now_mono=150.0) is None
+
+
+def test_publish_error_writes_and_removes(monkeypatch, tmp_path):
+    path = tmp_path / "device-error"
+    monkeypatch.setattr(led_status, "DEVICE_ERROR_FILE", str(path))
+    led_status._publish_error("The sensor service is not running.")
+    assert path.read_text() == "The sensor service is not running.\n"
+    led_status._publish_error(None)
+    assert not path.exists()
+    led_status._publish_error(None)  # already gone: no error

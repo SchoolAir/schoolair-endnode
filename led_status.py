@@ -32,6 +32,11 @@ reaches the code that writes to LED_STATE_FILE at all, so a stale "ok"
 from before the crash would otherwise just sit there being rendered
 forever. See _check_watched_services().
 
+While the setup hotspot is up (_ap_active), "ap" beats "error" from any
+source, the health check included: a person standing in front of the device
+must see that it's waiting for them. The error they'd otherwise have seen is
+written to DEVICE_ERROR_FILE, which the wizard's pages show instead.
+
 LED_STATE_FILE's "error" is downgraded to "ap" while the device isn't
 registered yet (see _is_registered/_resolve_state) — a networking/auth
 failure is *expected* during AP-mode setup (jobs/ingest.py still runs and
@@ -50,6 +55,14 @@ import time
 
 GPIO_LED = 24
 LED_STATE_FILE = "/run/schoolair-led-state"
+# One line of plain text describing the current error, present only while there
+# is one. Written here (the one place that knows what the LED would say) and
+# shown by the wizard's pages, since AP mode hides "error" on the LED.
+DEVICE_ERROR_FILE = "/run/schoolair-device-error"
+# The setup hotspot's own address (registration_wizard/config.py AP_IP): wlan0
+# holds it only while the AP is up. A client of a school network never gets it,
+# as that's the gateway's address in any 192.168.4.0/24 network.
+AP_IP = "192.168.4.1"
 PWM_FREQ_HZ = 100      # well above flicker-fusion
 WAVE_PERIOD_US = 1_000_000 // PWM_FREQ_HZ   # one PWM period; the brightness can change once per period
 # Pulse-width resolution = pigpiod's sample rate, which main() reads from the running
@@ -125,6 +138,12 @@ _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 # increase as evidence of a crash within that window, even if the service
 # happens to be up again by the time it's sampled.
 WATCHED_SERVICES = ("sen6x.service", "schoolair.service", "schoolair-netwatch.service")
+# How DEVICE_ERROR_FILE names them for whoever reads the wizard's page.
+_SERVICE_NAMES = {
+    "sen6x.service":              "The sensor service",
+    "schoolair.service":          "The air-quality monitoring service",
+    "schoolair-netwatch.service": "The network watchdog",
+}
 HEALTH_CHECK_INTERVAL_S = 30.0
 STATE_POLL_S = 1.0        # how often main() checks LED_STATE_FILE for a change (see main())
 HEARTBEAT_S = 5.0         # how often main() checks pigpiod is still there
@@ -237,23 +256,28 @@ def _boot_in_progress() -> bool:
     return out in ("initializing", "starting")
 
 
-def _check_watched_services(last_restarts: dict) -> bool:
+def _check_watched_services(last_restarts: dict, problems: "list | None" = None) -> bool:
     """Returns True if anything looks unhealthy right now. Mutates
     last_restarts in place with the freshly observed counts — the first
     call for any given service just seeds its baseline (no prior value to
     compare against yet), so it never flags unhealthy purely for having
-    restarted at some point before this process started."""
+    restarted at some point before this process started. If `problems` is
+    given, a human-readable line per problem is appended to it."""
     states = _read_service_states(WATCHED_SERVICES)
     if states is None:
         return False  # don't flag unhealthy just because the check itself hiccuped
     unhealthy = False
+    problems = [] if problems is None else problems
     for svc in WATCHED_SERVICES:
         is_active, now_restarts = states.get(svc, (False, 0))
+        name = _SERVICE_NAMES.get(svc, svc)
         if not is_active:
             print(f"[led] health: {svc} is not active")
+            problems.append(f"{name} is not running.")
             unhealthy = True
-        if svc in last_restarts and now_restarts > last_restarts[svc]:
+        elif svc in last_restarts and now_restarts > last_restarts[svc]:
             print(f"[led] health: {svc} restarted ({last_restarts[svc]} -> {now_restarts})")
+            problems.append(f"{name} crashed and was restarted.")
             unhealthy = True
         last_restarts[svc] = now_restarts
     return unhealthy
@@ -277,13 +301,58 @@ def _health_monitor_loop(shared: dict) -> None:
         if not boot_gate_logged:
             print("[led] boot finished — service health checks armed")
             boot_gate_logged = True
-        if _check_watched_services(last_restarts):
+        problems: list = []
+        if _check_watched_services(last_restarts, problems):
+            shared["reason"] = " ".join(problems)
             shared["unhealthy_until"] = time.monotonic() + UNHEALTHY_HOLD_S
         time.sleep(HEALTH_CHECK_INTERVAL_S)
 
 
-def _resolve_state(health: dict, now_mono: float, raw_state: "str | None" = None) -> str:
+def _ap_active(fib_trie: str = "/proc/net/fib_trie") -> bool:
+    """True while this device holds AP_IP, i.e. the setup hotspot is up.
+    A plain read of a /proc file: no process spawn (NetworkManager would need
+    nmcli, far too costly to poll on a Pi Zero W)."""
+    try:
+        with open(fib_trie) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return False
+    for i, line in enumerate(lines[:-1]):
+        if line.strip() == f"|-- {AP_IP}" and "/32 host LOCAL" in lines[i + 1]:
+            return True
+    return False
+
+
+def _error_reason(health: dict, now_mono: float) -> "str | None":
+    """The health-check failure behind an "error" LED, in words, or None.
+    Only that source: the other one, "error" in LED_STATE_FILE on a registered
+    device, is written by the wizard, whose page already shows the specific
+    message itself."""
+    if now_mono < health["unhealthy_until"]:
+        return health.get("reason") or "A SchoolAir service stopped or crashed."
+    return None
+
+
+def _publish_error(reason: "str | None") -> None:
+    """Keep DEVICE_ERROR_FILE in line with `reason` (removed when None)."""
+    try:
+        if reason is None:
+            os.remove(DEVICE_ERROR_FILE)
+        else:
+            with open(DEVICE_ERROR_FILE, "w") as f:
+                f.write(reason + "\n")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"[led] warning: could not update {DEVICE_ERROR_FILE}: {e}")
+
+
+def _resolve_state(health: dict, now_mono: float, raw_state: "str | None" = None,
+                   ap_active: bool = False) -> str:
     """Precedence, highest to lowest:
+      0. AP mode (ap_active): "error" from any source below shows as "ap" — the
+         device is waiting for someone to set it up, and the error itself is
+         shown on the wizard's page instead (see DEVICE_ERROR_FILE).
       1. Independent health-check failure (health["unhealthy_until"]) — a
          watched service actually crashed. Always wins: that's a real
          internal problem regardless of registration/AP-mode.
@@ -300,6 +369,8 @@ def _resolve_state(health: dict, now_mono: float, raw_state: "str | None" = None
         state = "ap"
     if now_mono < health["unhealthy_until"]:
         state = "error"
+    if state == "error" and ap_active:
+        state = "ap"
     return state
 
 
@@ -533,7 +604,8 @@ def main() -> None:
     print(f"[led] breathe: perceptual (CIE L*) cosine, {OK_CYCLE_S}s; pulse {THINKING_CYCLE_S}s; "
           f"brightness x{BRIGHTNESS} (cap {PEAK_US}us of {WAVE_PERIOD_US}us), shape {BREATH_SHAPE_EXPONENT}")
 
-    health = {"unhealthy_until": 0.0}
+    health = {"unhealthy_until": 0.0, "reason": ""}
+    _publish_error(None)  # nothing known yet; never show a previous run's error
     threading.Thread(target=_health_monitor_loop, args=(health,), daemon=True).start()
 
     signal.signal(signal.SIGTERM, _on_sigterm)
@@ -549,6 +621,8 @@ def main() -> None:
     raw_state = _read_state()
     state_mtime = _state_file_mtime()
     last_heartbeat = time.monotonic()
+    ap_active = _ap_active()
+    last_reason = None
 
     try:
         while True:
@@ -557,7 +631,11 @@ def main() -> None:
             if mtime != state_mtime:
                 raw_state = _read_state()
                 state_mtime = mtime
-            state = _resolve_state(health, now_mono, raw_state)
+            state = _resolve_state(health, now_mono, raw_state, ap_active)
+            reason = _error_reason(health, now_mono)
+            if reason != last_reason:
+                _publish_error(reason)
+                last_reason = reason
             if state != last_state:
                 segments = _state_segments(state)
                 new_wave = _send_pattern(pi, pigpio, segments, wave_id)
@@ -569,7 +647,7 @@ def main() -> None:
                     wave_id = new_wave
                 print(f"[led] state {last_state} -> {state} "
                       f"(state file: {_read_state()}, health override: "
-                      f"{now_mono < health['unhealthy_until']}; "
+                      f"{now_mono < health['unhealthy_until']}, AP: {ap_active}; "
                       f"{len(segments)} pulses, {sum(us for _, us in segments) / 1e6:.2f}s cycle)")
                 last_state = state
             # Heartbeat: raises if pigpiod has gone away (crashed/restarted —
@@ -578,8 +656,13 @@ def main() -> None:
             if now_mono - last_heartbeat >= HEARTBEAT_S:
                 pi.get_current_tick()
                 last_heartbeat = now_mono
+                # Checked at heartbeat pace, not every poll: netwatch already
+                # writes "ap" to the state file the moment it brings the AP up,
+                # so this only decides how soon a later "error" is hidden.
+                ap_active = _ap_active()
             time.sleep(STATE_POLL_S)
     finally:
+        _publish_error(None)
         _shutdown_led(pi)
 
 

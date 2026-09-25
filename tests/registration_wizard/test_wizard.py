@@ -373,3 +373,67 @@ async def test_index_ap_mode_explains_identity_mismatch(net, identity):
 
     assert resp.status_code == 200
     assert "registered on a different SchoolAir device" in resp.body.decode()
+
+
+# ── Device error notice (led_status.py's DEVICE_ERROR_FILE) ──────────────────
+#
+# In AP mode the LED shows "ap" even when a service is down, so the pages say
+# what's wrong instead.
+
+@pytest.fixture
+def device_error(monkeypatch, tmp_path):
+    path = tmp_path / "device-error"
+    monkeypatch.setattr(wizard, "DEVICE_ERROR_FILE", str(path))
+    monkeypatch.setattr(wizard.device_identity, "MISMATCH_FILE", str(tmp_path / "no-mismatch"))
+    return path
+
+
+def test_device_error_html_empty_without_error(device_error):
+    assert wizard._device_error_html() == ""
+
+
+def test_device_error_html_shows_escaped_reason(device_error):
+    device_error.write_text("The sensor service is not running. <b>\n")
+    html = wizard._device_error_html()
+    assert "Device error:" in html
+    assert "The sensor service is not running. &lt;b&gt;" in html
+
+
+def test_device_error_html_prefers_identity_mismatch(device_error, tmp_path, monkeypatch):
+    device_error.write_text("The air-quality monitoring service is not running.\n")
+    flag = tmp_path / "mismatch"
+    flag.write_text("x")
+    monkeypatch.setattr(wizard.device_identity, "MISMATCH_FILE", str(flag))
+    html = wizard._device_error_html()
+    assert "registered on a different SchoolAir device" in html
+    assert "not running" not in html
+
+
+async def test_index_ap_mode_shows_device_error(net, device_error):
+    net._ap_is_active = AsyncMock(return_value=True)
+    device_error.write_text("The sensor service is not running.\n")
+    request = MagicMock()
+    request.headers.get.return_value = ""
+    request.args.get.return_value = None
+    resp = await wizard.index(request)
+    assert "The sensor service is not running." in resp.body.decode()
+
+
+async def test_landing_page_shows_device_error(net, device_error, monkeypatch):
+    device_error.write_text("The sensor service is not running.\n")
+    monkeypatch.setattr(wizard, "read_wizard_registration", lambda: {})
+    request = MagicMock()
+    request.headers.get.return_value = "schoolair.local"
+    resp = await wizard.index(request)
+    body = resp.body.decode()
+    assert "SchoolAir Device" in body and "The sensor service is not running." in body
+    assert "[[device_error]]" not in body
+
+
+async def test_landing_page_without_error_has_no_notice(net, device_error, monkeypatch):
+    monkeypatch.setattr(wizard, "read_wizard_registration", lambda: {})
+    request = MagicMock()
+    request.headers.get.return_value = "schoolair.local"
+    body = (await wizard.index(request)).body.decode()
+    assert "Device error" not in body and "[[device_error]]" not in body
+
