@@ -96,6 +96,7 @@ def net(monkeypatch, tmp_path):
     monkeypatch.setattr(wizard, "write_error", MagicMock())
     monkeypatch.setattr(wizard, "_write_auth_token", MagicMock())
     monkeypatch.setattr(wizard, "_write_new_auth_token", MagicMock())
+    monkeypatch.setattr(wizard, "_bind_identity", MagicMock())
     monkeypatch.setattr(wizard, "_get_mac_address", MagicMock(return_value="AA:BB:CC"))
     monkeypatch.setattr(wizard, "_get_cpu_serial", MagicMock(return_value="1234"))
     monkeypatch.setattr(wizard, "STAGING_FILE", str(tmp_path / "staging.json"))
@@ -312,3 +313,63 @@ async def test_delayed_management_shutdown_is_unconditional(monkeypatch):
 
     assert any("restart schoolair" in c for c in calls)
     wizard._telemetry_recently_restarted.assert_not_awaited()
+
+
+# ── Device identity binding (see device_identity.py) ─────────────────────────
+#
+# A successful registration ties the card to this Pi and lifts the mismatch
+# lockout that main.py leaves behind when a card is moved to another Pi.
+
+async def test_successful_registration_binds_identity(net):
+    sess_tok = _new_setup_session()
+    await wizard.run_registration(sess_tok)
+    assert wizard.reg_state["state"] == "success"
+    wizard._bind_identity.assert_called_once()
+
+
+async def test_failed_registration_does_not_bind_identity(net):
+    net._post_heartbeat = AsyncMock(return_value=(False, "boom", ""))
+    await wizard.run_registration(_new_setup_session())
+    wizard._bind_identity.assert_not_called()
+
+
+@pytest.fixture
+def identity(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("NEW_AUTH_TOKEN=x\nDEVICE_CPU_SERIAL=old\nDEVICE_MAC=old\n")
+    flag = tmp_path / "identity-mismatch"
+    flag.write_text("mismatch\n")
+    monkeypatch.setattr(wizard, "PI_MAIN_ENV_PATH", str(env))
+    monkeypatch.setattr(wizard.device_identity, "MISMATCH_FILE", str(flag))
+    monkeypatch.setattr(wizard.device_identity, "read_cpu_serial", lambda: "newserial")
+    monkeypatch.setattr(wizard.device_identity, "read_mac", lambda: "b8:27:eb:00:00:02")
+    return env, flag
+
+
+def test_bind_identity_saves_this_pi_and_clears_lockout(identity):
+    env, flag = identity
+    wizard._bind_identity()
+    content = env.read_text()
+    assert "DEVICE_CPU_SERIAL=newserial" in content
+    assert "DEVICE_MAC=b8:27:eb:00:00:02" in content
+    assert "NEW_AUTH_TOKEN=x" in content
+    assert not flag.exists()
+
+
+def test_bind_identity_keeps_lockout_if_save_fails(identity, monkeypatch):
+    _, flag = identity
+    monkeypatch.setattr(wizard.device_identity, "save", MagicMock(side_effect=OSError("ro fs")))
+    wizard._bind_identity()
+    assert flag.exists()
+
+
+async def test_index_ap_mode_explains_identity_mismatch(net, identity):
+    net._ap_is_active = AsyncMock(return_value=True)
+    request = MagicMock()
+    request.headers.get.return_value = ""
+    request.args.get.return_value = None
+
+    resp = await wizard.index(request)
+
+    assert resp.status_code == 200
+    assert "registered on a different SchoolAir device" in resp.body.decode()

@@ -1,6 +1,7 @@
 """main.py
 
-Entrypoint. Validates registration then starts:
+Entrypoint. Checks this card belongs to this Pi (device_identity.enforce —
+exits with EXIT_MISMATCH if not), validates registration, then starts:
   - Ingest job (reads sensors, checks alerts & posts measurements)
   - Microdot   (local web server: real-time dashboard + WebSocket)
 
@@ -16,10 +17,12 @@ import json
 import os
 import signal
 import socket
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import db.queue as queue
+import device_identity
 from dotenv import load_dotenv
 from microdot import Microdot, Response
 from microdot.websocket import with_websocket
@@ -154,6 +157,8 @@ async def main():
 
 
 if __name__ == "__main__":
+    if not device_identity.enforce():
+        sys.exit(device_identity.EXIT_MISMATCH)
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, asyncio.CancelledError):

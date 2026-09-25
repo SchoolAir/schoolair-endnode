@@ -24,6 +24,7 @@ import pwd
 import random
 import re
 import secrets
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -48,6 +49,11 @@ from config import (
     STATUS_FILE,
     VALIDATE_URL,
 )
+
+# device_identity.py lives in the app root (one level up) and is shared with
+# main.py, so both read the hardware identity the exact same way.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import device_identity  # noqa: E402
 
 LEGACY_URL   = "https://data.schoolair.org/node/aqc/register"
 TEMP_PROFILE = "school-air-temp"
@@ -1063,6 +1069,22 @@ def _write_new_auth_token(token: str) -> None:
     _write_env_key("NEW_SERVER_URL", NEW_SERVER_BASE_URL)
 
 
+def _bind_identity() -> None:
+    """Tie the card to this Pi after a successful registration: save its CPU
+    serial + MAC into .env (main.py checks them on every start — see
+    device_identity.py) and lift any mismatch lockout. The lockout is only
+    lifted once the new identity is safely on disk, else main.py would just
+    flag the mismatch again."""
+    try:
+        serial, mac = device_identity.save(PI_MAIN_ENV_PATH)
+        _fix_owner(PI_MAIN_ENV_PATH)
+        print(f"[wizard] Device identity saved (serial={serial} mac={mac})")
+    except Exception as e:
+        print(f"[wizard] Warning: could not save device identity: {e}")
+        return
+    device_identity.clear_mismatch()
+
+
 def _ensure_dir() -> None:
     created = not os.path.exists(CONFIG_DIR)
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -1715,6 +1737,8 @@ async def run_registration(sess_tok: str) -> None:
             except Exception as e:
                 print(f"[wizard] Warning: could not write AUTH_TOKEN: {e}")
 
+        _bind_identity()
+
         try:
             os.remove(STAGING_FILE)
         except FileNotFoundError:
@@ -1776,6 +1800,7 @@ async def run_management_update(sess_tok: str) -> None:
             _write_new_auth_token(device_auth_token)
         except Exception as e:
             print(f"[wizard] Warning: could not write NEW_AUTH_TOKEN: {e}")
+    _bind_identity()
 
     wifi_sessions.pop(sess_tok, None)
     _set("success", "Device updated successfully.")
@@ -1945,6 +1970,12 @@ async def index(request):
                 '<div class="notice notice-err">'
                 '<strong>Last attempt failed:</strong> '
                 f'{_html.escape(reg_state["message"])}</div>'
+            )
+        elif device_identity.mismatch_detected():
+            last_error_banner = (
+                '<div class="notice notice-err">'
+                '<strong>This SD card was registered on a different SchoolAir device.</strong> '
+                'Monitoring is stopped until this device is registered again below.</div>'
             )
         body = _render(STEP1_HTML, raw={
             "wizard_emoji":       _wizard_emoji("m"),

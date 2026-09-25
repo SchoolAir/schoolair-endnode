@@ -31,8 +31,9 @@ done
 # ── 2. Device identity & registration state ───────────────────────────────────
 step "Removing device identity"
 # Reset .env: copy from .env.example (drops any appended device-specific keys
-# like NEW_AUTH_TOKEN and NEW_SERVER_URL that the wizard appends).
-# Fallback sed path clears all three auth keys individually.
+# like NEW_AUTH_TOKEN, NEW_SERVER_URL and the DEVICE_CPU_SERIAL / DEVICE_MAC
+# identity binding that the wizard appends).
+# Fallback sed path clears them individually.
 if [ -f "${SCHOOLAIR_DIR}/.env.example" ]; then
     cp "${SCHOOLAIR_DIR}/.env.example" "${SCHOOLAIR_DIR}/.env"
     ok ".env reset to defaults from .env.example"
@@ -41,8 +42,10 @@ elif [ -f "${SCHOOLAIR_DIR}/.env" ]; then
         -e 's/^AUTH_TOKEN=.*/AUTH_TOKEN=/' \
         -e '/^NEW_AUTH_TOKEN=/d' \
         -e '/^NEW_SERVER_URL=/d' \
+        -e '/^DEVICE_CPU_SERIAL=/d' \
+        -e '/^DEVICE_MAC=/d' \
         "${SCHOOLAIR_DIR}/.env"
-    ok "AUTH_TOKEN / NEW_AUTH_TOKEN / NEW_SERVER_URL cleared from .env"
+    ok "AUTH_TOKEN / NEW_AUTH_TOKEN / NEW_SERVER_URL / device identity cleared from .env"
 fi
 # Old-style wizard state (backwards-compatible with install_files-based deployments)
 rm -f "${ADMIN_HOME}/.device_token"

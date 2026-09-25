@@ -14,6 +14,7 @@
 #   NETWATCH_POLL       seconds between connectivity checks  (default 30)
 #   NETWATCH_GRACE      seconds of loss before entering ap   (default 120)
 #   NETWATCH_RECONNECT  seconds between reconnect probes     (default 300)
+#   NETWATCH_IDENTITY_FILE  identity-mismatch flag path  (default /run/schoolair/identity-mismatch)
 
 set -euo pipefail
 
@@ -30,6 +31,11 @@ WIZARD_BUSY_FILE="/run/schoolair-wizard-busy"
 # owns "thinking"/"error"/"ok" for the states it actually knows about, and
 # jobs/ingest.py owns "ok"/"no_sensor"/"error" during normal operation.
 LED_STATE_FILE="/run/schoolair-led-state"
+# Left by main.py (device_identity.py) when this card was registered on a
+# different Pi — e.g. two endnodes' uSD cards swapped. schoolair refuses to run,
+# so we force AP mode + the wizard and hold it there (no reconnect probes, no
+# closing the AP on uplink) until a re-registration removes the file.
+IDENTITY_MISMATCH_FILE="${NETWATCH_IDENTITY_FILE:-/run/schoolair/identity-mismatch}"
 
 POLL_INTERVAL="${NETWATCH_POLL:-30}"
 GRACE_SECS="${NETWATCH_GRACE:-120}"
@@ -53,6 +59,10 @@ ap_is_up() {
 saved_sta_profiles() {
     nmcli -t -f NAME,TYPE con show 2>/dev/null \
         | awk -F: '$2=="802-11-wireless" && $1!="'"$AP_CONN"'" {print $1}'
+}
+
+identity_mismatch() {
+    [ -f "$IDENTITY_MISMATCH_FILE" ]
 }
 
 ap_has_clients() {
@@ -186,6 +196,14 @@ fi
 while true; do
     sleep "$POLL_INTERVAL"
 
+    if identity_mismatch && [ "$state" != "ap" ]; then
+        log "Card registered on a different Pi ($(cat "$IDENTITY_MISMATCH_FILE" 2>/dev/null)) — forcing AP mode for re-registration"
+        bring_up_ap
+        state="ap"
+        last_reconnect=$(date +%s)
+        continue
+    fi
+
     case "$state" in
 
         online)
@@ -208,7 +226,12 @@ while true; do
             ;;
 
         ap)
-            if has_uplink; then
+            if identity_mismatch; then
+                # Hold the AP until the wizard re-registers this Pi (it
+                # removes the file on success; its busy file covers the
+                # uplink it brings up meanwhile).
+                :
+            elif has_uplink; then
                 if [ -f "$WIZARD_BUSY_FILE" ]; then
                     # The wizard brought this uplink up itself and is still
                     # mid-registration — let it finish and do its own cleanup
