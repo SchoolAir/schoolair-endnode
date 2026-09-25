@@ -22,16 +22,27 @@ if [[ "$*" == *"con show --active"* ]]; then
 fi
 exit 0
 """
+# Same, but the AP is already up too (the wizard brought it up) — the uplink
+# is still reported so the hold is what keeps netwatch from closing it.
+FAKE_NMCLI_AP_UP = """#!/bin/bash
+echo "nmcli $*" >> "$CALLS"
+if [[ "$*" == *"NAME,TYPE,STATE con show --active"* ]]; then
+    echo "HomeWifi:802-11-wireless:activated"
+elif [[ "$*" == *"NAME,STATE con show --active"* ]]; then
+    echo "SchoolAir_AP:activated"
+fi
+exit 0
+"""
 FAKE_LOGGER = """#!/bin/bash
 echo "$(basename "$0") $*" >> "$CALLS"
 exit 0
 """
 
 
-def _run(tmp_path, flag_present: bool) -> tuple[str, str]:
+def _run(tmp_path, flag_present: bool, nmcli: str = FAKE_NMCLI) -> tuple[str, str]:
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
-    (fakebin / "nmcli").write_text(FAKE_NMCLI)
+    (fakebin / "nmcli").write_text(nmcli)
     for name in ("systemctl", "iw", "iptables"):
         (fakebin / name).write_text(FAKE_LOGGER)
     for f in fakebin.iterdir():
@@ -58,7 +69,7 @@ def _run(tmp_path, flag_present: bool) -> tuple[str, str]:
 
 def test_mismatch_forces_ap_despite_uplink_and_holds_it(tmp_path):
     log, calls = _run(tmp_path, flag_present=True)
-    assert "forcing AP mode" in log
+    assert "holding AP mode" in log
     assert "nmcli con up SchoolAir_AP" in calls
     assert "systemctl start schoolair-wizard" in calls
     # Held: the uplink never makes netwatch close the AP or restart schoolair.
@@ -72,3 +83,13 @@ def test_no_flag_leaves_online_device_alone(tmp_path):
     assert "Initial state: online" in log
     assert "con up SchoolAir_AP" not in calls
     assert "start schoolair-wizard" not in calls
+
+
+def test_mismatch_with_ap_already_up_holds_it_without_reactivating(tmp_path):
+    """The wizard normally has the AP up before netwatch polls; bringing it up
+    again would drop whoever is already connected to it."""
+    log, calls = _run(tmp_path, flag_present=True, nmcli=FAKE_NMCLI_AP_UP)
+    assert "con up SchoolAir_AP" not in calls
+    assert "nmcli con down SchoolAir_AP" not in calls
+    assert "systemctl restart schoolair" not in calls
+

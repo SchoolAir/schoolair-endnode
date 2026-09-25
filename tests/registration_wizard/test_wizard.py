@@ -437,3 +437,48 @@ async def test_landing_page_without_error_has_no_notice(net, device_error, monke
     body = (await wizard.index(request)).body.decode()
     assert "Device error" not in body and "[[device_error]]" not in body
 
+# ── Identity mismatch: the wizard brings the AP up itself ────────────────────
+#
+# jobs/ingest.py starts the wizard when it finds the card belongs to another
+# Pi; the wizard must then bring up the AP + captive portal right away, and
+# leave an AP that's already up (netwatch/launcher started it) alone.
+
+@pytest.fixture
+def mismatch(monkeypatch, tmp_path):
+    flag = tmp_path / "identity-mismatch"
+    monkeypatch.setattr(wizard.device_identity, "MISMATCH_FILE", str(flag))
+    monkeypatch.setattr(wizard, "LED_STATE_FILE", str(tmp_path / "led"))
+    calls = []
+    async def fake_cmd(cmd):
+        calls.append(cmd)
+        return 0, "", ""
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    return flag, calls
+
+
+async def test_mismatch_brings_up_ap_and_captive_portal(mismatch, monkeypatch, tmp_path):
+    flag, calls = mismatch
+    flag.write_text("x")
+    monkeypatch.setattr(wizard, "_ap_is_active", AsyncMock(return_value=False))
+    await wizard._ap_for_identity_mismatch()
+    assert any(f'nmcli con up "{wizard.AP_CONNECTION_NAME}"' in c for c in calls)
+    for port in (80, 443):
+        assert any(f"--dport {port}" in c and "iptables -t nat -C PREROUTING" in c
+                   and "|| iptables -t nat -A PREROUTING" in c for c in calls)
+    assert (tmp_path / "led").read_text() == "ap"
+
+
+async def test_mismatch_leaves_an_ap_that_is_already_up(mismatch, monkeypatch):
+    flag, calls = mismatch
+    flag.write_text("x")
+    monkeypatch.setattr(wizard, "_ap_is_active", AsyncMock(return_value=True))
+    await wizard._ap_for_identity_mismatch()
+    assert calls == []
+
+
+async def test_no_mismatch_no_ap(mismatch, monkeypatch):
+    _, calls = mismatch
+    monkeypatch.setattr(wizard, "_ap_is_active", AsyncMock(return_value=False))
+    await wizard._ap_for_identity_mismatch()
+    assert calls == []
+

@@ -1,17 +1,20 @@
 """device_identity.py
 
-Binds this uSD card to the Pi it was registered on.
+Binds this uSD card to the Pi it runs on.
 
-The registration wizard saves the Pi's CPU serial and MAC address into .env
-(DEVICE_CPU_SERIAL / DEVICE_MAC) next to the auth tokens. Every time
-schoolair.service starts (boot or restart), main.py calls enforce(), which
-compares them with the hardware it's actually running on. On a mismatch —
-e.g. the cards of two endnodes were swapped — main.py refuses to run and
-leaves MISMATCH_FILE behind, which makes netwatch.sh hold the device in AP
-mode with the wizard up, so it can be re-registered on the spot. A successful
-registration saves the new identity and removes MISMATCH_FILE.
+The Pi's CPU serial and MAC address are kept in .env (DEVICE_CPU_SERIAL /
+DEVICE_MAC). Every time schoolair.service starts (boot or restart),
+jobs/ingest.py calls enforce() before its first contact with the server:
+  - nothing saved yet → save this Pi's; carry on.
+  - saved and matching → carry on.
+  - saved and different (e.g. the cards of two endnodes were swapped) →
+    ingest keeps reading the sensor but stops talking to the server, and
+    MISMATCH_FILE makes the wizard/netwatch.sh put the device in AP mode so
+    it can be re-registered on the spot.
+Once saved, only a successful registration (wizard, valid token) may replace
+the saved identity with the current one — see the wizard's _bind_identity().
 
-Stdlib-only: imported both by main.py (venv) and by the wizard (system python).
+Stdlib-only: imported both by jobs/ingest.py (venv) and by the wizard (system python).
 """
 
 import os
@@ -24,10 +27,6 @@ ENV_PATH = Path(__file__).resolve().parent / ".env"
 # service restarts) — so it can never survive a reboot stale: every boot starts
 # clean and enforce() re-decides.
 MISMATCH_FILE = "/run/schoolair/identity-mismatch"
-
-# main.py's exit status on a mismatch. schoolair.service lists it in
-# RestartPreventExitStatus so systemd doesn't restart it every 10s for nothing.
-EXIT_MISMATCH = 78  # EX_CONFIG
 
 SERIAL_KEY = "DEVICE_CPU_SERIAL"
 MAC_KEY    = "DEVICE_MAC"
@@ -126,33 +125,22 @@ def _flag_mismatch(detail: str) -> None:
 
 
 def enforce(env_path: Path = ENV_PATH) -> bool:
-    """Compare the saved identity with the live hardware.
-
-    Returns True if schoolair may run, False on a mismatch (after flagging it
-    for netwatch.sh). Cases:
-      - not registered (no token)         → nothing to protect; run.
-      - registered, no saved identity     → a card registered before this
-        check existed: trust-on-first-use, record the current hardware; run.
-      - saved identity matches hardware   → run.
-      - anything else                     → mismatch; don't run.
-    """
+    """Compare the saved identity with the live hardware. Returns True if this
+    card may talk to the server as this device, False on a mismatch (after
+    flagging it in MISMATCH_FILE). Registration doesn't matter here: an
+    unregistered card is bound to the first Pi it runs on just the same."""
     env = _read_env(Path(env_path))
-    registered = bool(env.get("NEW_AUTH_TOKEN") or env.get("AUTH_TOKEN"))
     saved_serial = env.get(SERIAL_KEY, "").lower()
     saved_mac    = env.get(MAC_KEY, "").lower()
     serial, mac  = read_cpu_serial(), read_mac()
 
-    if not registered:
-        clear_mismatch()
-        return True
-
     if not saved_serial and not saved_mac:
         if serial == UNKNOWN or mac == UNKNOWN:
             print(f"[identity] WARNING: can't read hardware identity "
-                  f"(serial={serial} mac={mac}) — not recording it yet")
+                  f"(serial={serial} mac={mac}) — not saving it yet")
         else:
             _write_env_keys(Path(env_path), {SERIAL_KEY: serial, MAC_KEY: mac})
-            print(f"[identity] No saved identity — recorded this Pi "
+            print(f"[identity] No saved identity — saved this Pi "
                   f"(serial={serial} mac={mac})")
         clear_mismatch()
         return True
@@ -163,7 +151,7 @@ def enforce(env_path: Path = ENV_PATH) -> bool:
 
     detail = (f"saved serial={saved_serial or '-'} mac={saved_mac or '-'} / "
               f"this Pi serial={serial} mac={mac}")
-    print(f"[identity] MISMATCH — this card was registered on a different Pi ({detail}). "
-          f"Refusing to run; re-register this device via the wizard (AP mode).")
+    print(f"[identity] MISMATCH — this card belongs to a different Pi ({detail}). "
+          f"Not contacting the server; re-register this device via the wizard (AP mode).")
     _flag_mismatch(detail)
     return False

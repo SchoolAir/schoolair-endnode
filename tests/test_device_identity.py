@@ -1,7 +1,8 @@
 """tests/test_device_identity.py
 
-device_identity.enforce() decides on every schoolair start whether this uSD
-card belongs to the Pi it's running on (see device_identity.py's docstring).
+device_identity.enforce() decides on every schoolair start, before ingest's
+first server contact, whether this uSD card belongs to the Pi it's running on
+(see device_identity.py's docstring).
 The hardware readers are patched out; the .env and mismatch flag live in
 tmp_path.
 """
@@ -33,12 +34,29 @@ def _env(path):
     return di._read_env(path)
 
 
-def test_unregistered_runs_and_records_nothing(pi):
+def test_unregistered_card_is_bound_too(pi):
+    """Saving doesn't depend on registration: the first Pi a card runs on."""
     env, _ = pi
     env.write_text("AUTH_TOKEN=\nPORT=8080\n")
     assert di.enforce(env) is True
-    assert di.SERIAL_KEY not in _env(env)
+    saved = _env(env)
+    assert (saved[di.SERIAL_KEY], saved[di.MAC_KEY]) == PI_A
+    assert saved["PORT"] == "8080"
     assert not di.mismatch_detected()
+
+
+def test_unregistered_card_moved_to_another_pi_is_refused(pi):
+    env, set_hw = pi
+    env.write_text("AUTH_TOKEN=\n")
+    di.enforce(env)
+    set_hw(*PI_B)
+    assert di.enforce(env) is False
+
+
+def test_no_env_file_at_all_is_created_with_identity(pi):
+    env, _ = pi
+    assert di.enforce(env) is True
+    assert (_env(env)[di.SERIAL_KEY], _env(env)[di.MAC_KEY]) == PI_A
 
 
 def test_registered_without_identity_records_current_pi(pi):
@@ -121,12 +139,11 @@ def test_flag_write_failure_still_refuses(pi, monkeypatch, tmp_path):
     assert di.enforce(env) is False
 
 
-def test_schoolair_unit_matches_module_constants():
-    """schoolair.service must not restart-loop on the mismatch exit, and must
-    provide the /run directory the flag lives in."""
+def test_schoolair_unit_provides_the_flag_directory():
+    """schoolair.service (User=admin) must provide the /run directory the flag
+    lives in, and keep it across restarts."""
     from pathlib import Path
     unit = (Path(di.__file__).parent / "deploy" / "schoolair.service").read_text()
-    assert f"RestartPreventExitStatus={di.EXIT_MISMATCH}" in unit
     assert di.MISMATCH_FILE.startswith("/run/schoolair/")
     assert "RuntimeDirectory=schoolair" in unit
     assert "RuntimeDirectoryPreserve=yes" in unit

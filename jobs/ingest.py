@@ -16,6 +16,11 @@ Write-through pipeline with local fallback and server-controlled backlog drain:
   NTP task    — monitors wall-clock divergence from the monotonic projection.
                 On first NTP step fires a one-time bulk timestamp correction
                 on SQLite readings taken before sync was established.
+
+Before anything talks to the server, ingest_loop() checks that this card
+belongs to this Pi (device_identity.enforce). If it doesn't, readings go on
+(kept in SQLite) but nothing is sent, and the wizard is started in AP mode so
+the device can be re-registered.
 """
 
 import asyncio
@@ -29,6 +34,7 @@ import httpx
 from dotenv import load_dotenv
 from services.sensor import read_sensor, extract_metric, probe_aux_sensors, read_aux_sensor
 import db.queue as queue
+import device_identity
 import jobs.aggregate as aggregate
 import state
 
@@ -145,6 +151,12 @@ _alert_buffer:        list[dict]         = []
 ALERT_BUFFER_CAPACITY = int(os.getenv("ALERT_BUFFER_CAPACITY", 50))
 alert_cooldown:       dict[str, datetime] = {}
 _verifying:           set[str]           = set()
+
+# ── Identity lockout ──────────────────────────────────────────────────────────
+
+# Set by ingest_loop() when this card belongs to a different Pi: from then on
+# nothing is sent to the server until a re-registration restarts the service.
+_identity_locked = False
 
 # ── OTA state ─────────────────────────────────────────────────────────────────
 
@@ -372,7 +384,9 @@ async def _send_or_queue_alert(
     }
 
     token = os.getenv("NEW_AUTH_TOKEN", "").strip()
-    if token:
+    if _identity_locked:
+        print(f"[verify/{metric}] identity lockout — queuing alert")
+    elif token:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.post(
@@ -581,6 +595,8 @@ async def _try_post(
       backlog_readings — count still in SQLite after this batch (0 = no backlog)
       bytes_per_reading — serialised size of one reading; present only when backlog > 0
     """
+    if _identity_locked:
+        return None
     body: dict = {"readings": readings, "backlog_readings": backlog_count}
     if backlog_count > 0 and bpr is not None:
         body["bytes_per_reading"] = bpr
@@ -649,7 +665,7 @@ async def _startup_connectivity_ping() -> bool:
     waiting for its first live reading to trigger a drain, which can itself
     be minutes away outside the active window."""
     token = os.getenv("NEW_AUTH_TOKEN", "").strip()
-    if not token or not _PRIMARY_SERVER_URL:
+    if _identity_locked or not token or not _PRIMARY_SERVER_URL:
         return False
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -1128,6 +1144,11 @@ async def _upload_loop() -> None:
         if entry is None:
             continue
 
+        if _identity_locked:
+            queue.enqueue(entry["data"], entry["recorded_at"])
+            print("[upload] identity lockout — reading kept in SQLite, not sent")
+            continue
+
         token = os.getenv("NEW_AUTH_TOKEN", "").strip()
         if not token:
             queue.enqueue(entry["data"], entry["recorded_at"])
@@ -1183,6 +1204,29 @@ async def _read_loop(active_sensors: list):
         await _wait_for_boundary(delay)
 
 
+async def _enter_identity_lockout() -> None:
+    """This card belongs to a different Pi: stop all server contact (the
+    _identity_locked checks) and start the wizard, which brings up the AP when
+    it sees device_identity.MISMATCH_FILE — right away, not on netwatch.sh's
+    next poll. admin may start the wizard through sudoers (see
+    schoolair_setup.sh); -n so a missing rule fails instead of hanging."""
+    global _identity_locked
+    _identity_locked = True
+    _set_led_state("ap")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "systemctl", "start", "schoolair-wizard",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        if proc.returncode != 0:
+            print(f"[identity] could not start the wizard (rc={proc.returncode}) "
+                  f"— netwatch will bring up the AP on its next poll")
+    except OSError as e:
+        print(f"[identity] could not start the wizard: {e}")
+
+
 async def ingest_loop():
     """Initialise SQLite, probe aux sensors, run read / upload / NTP tasks."""
     global _settings, _settings_event
@@ -1197,7 +1241,11 @@ async def ingest_loop():
         f"write-through with SQLite fallback"
         + (f" | aux sensors: {', '.join(s['name'] for s in active_sensors)}" if active_sensors else "")
     )
-    asyncio.create_task(_connectivity_ping_loop())
+    # First thing before any server contact (the boot ping just below).
+    if not device_identity.enforce():
+        await _enter_identity_lockout()
+    else:
+        asyncio.create_task(_connectivity_ping_loop())
     await asyncio.gather(
         _read_loop(active_sensors),
         _upload_loop(),

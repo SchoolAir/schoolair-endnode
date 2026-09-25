@@ -31,10 +31,11 @@ WIZARD_BUSY_FILE="/run/schoolair-wizard-busy"
 # owns "thinking"/"error"/"ok" for the states it actually knows about, and
 # jobs/ingest.py owns "ok"/"no_sensor"/"error" during normal operation.
 LED_STATE_FILE="/run/schoolair-led-state"
-# Left by main.py (device_identity.py) when this card was registered on a
-# different Pi — e.g. two endnodes' uSD cards swapped. schoolair refuses to run,
-# so we force AP mode + the wizard and hold it there (no reconnect probes, no
-# closing the AP on uplink) until a re-registration removes the file.
+# Left by jobs/ingest.py (device_identity.py) when this card belongs to a
+# different Pi — e.g. two endnodes' uSD cards swapped. Ingest stops sending and
+# starts the wizard, which brings the AP up itself; we make sure AP mode happens
+# (in case that failed) and hold it there (no reconnect probes, no closing the
+# AP on uplink) until a re-registration removes the file.
 IDENTITY_MISMATCH_FILE="${NETWATCH_IDENTITY_FILE:-/run/schoolair/identity-mismatch}"
 
 POLL_INTERVAL="${NETWATCH_POLL:-30}"
@@ -197,8 +198,10 @@ while true; do
     sleep "$POLL_INTERVAL"
 
     if identity_mismatch && [ "$state" != "ap" ]; then
-        log "Card registered on a different Pi ($(cat "$IDENTITY_MISMATCH_FILE" 2>/dev/null)) — forcing AP mode for re-registration"
-        bring_up_ap
+        log "Card belongs to a different Pi ($(cat "$IDENTITY_MISMATCH_FILE" 2>/dev/null)) — holding AP mode for re-registration"
+        # The wizard normally has the AP up already; re-activating it would
+        # drop anyone already connected.
+        ap_is_up || bring_up_ap
         state="ap"
         last_reconnect=$(date +%s)
         continue

@@ -10,12 +10,8 @@ WorkingDirectory=/home/admin/schoolair
 ExecStart=/home/admin/schoolair/.venv/bin/python -u /home/admin/schoolair/main.py
 Restart=on-failure
 RestartSec=10
-# 78 = device_identity.EXIT_MISMATCH: this card was registered on a different
-# Pi. Restarting can't fix that — re-registering (wizard, AP mode) does.
-RestartPreventExitStatus=78
 # /run/schoolair (tmpfs, owned by admin) holds device_identity.MISMATCH_FILE for
-# netwatch.sh. Preserved across stop/restart so the flag outlives the exit above;
-# a reboot still wipes it.
+# the wizard and netwatch.sh. Preserved across stop/restart; a reboot wipes it.
 RuntimeDirectory=schoolair
 RuntimeDirectoryPreserve=yes
 Environment=PYTHONUNBUFFERED=1

@@ -51,7 +51,7 @@ from config import (
 )
 
 # device_identity.py lives in the app root (one level up) and is shared with
-# main.py, so both read the hardware identity the exact same way.
+# jobs/ingest.py, so both read the hardware identity the exact same way.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import device_identity  # noqa: E402
 
@@ -1077,9 +1077,9 @@ def _write_new_auth_token(token: str) -> None:
 
 def _bind_identity() -> None:
     """Tie the card to this Pi after a successful registration: save its CPU
-    serial + MAC into .env (main.py checks them on every start — see
+    serial + MAC into .env (jobs/ingest.py checks them on every start — see
     device_identity.py) and lift any mismatch lockout. The lockout is only
-    lifted once the new identity is safely on disk, else main.py would just
+    lifted once the new identity is safely on disk, else ingest would just
     flag the mismatch again."""
     try:
         serial, mac = device_identity.save(PI_MAIN_ENV_PATH)
@@ -1571,6 +1571,26 @@ def _set(state: str, message: str, redirect: str = "") -> None:
 async def _ap_is_active() -> bool:
     _, out, _ = await _cmd("nmcli -t -f NAME,STATE con show --active")
     return AP_CONNECTION_NAME in out
+
+
+async def _ap_for_identity_mismatch() -> None:
+    """On start: if this card belongs to a different Pi (jobs/ingest.py found
+    it and started us), bring up the AP + captive portal ourselves right away,
+    rather than wait up to a poll interval for netwatch.sh to. No-op when the
+    AP is already up (e.g. netwatch or the launcher started us)."""
+    if not device_identity.mismatch_detected() or await _ap_is_active():
+        return
+    print("[wizard] Card belongs to a different Pi — bringing up the AP for re-registration")
+    await _revert_to_ap()
+    for port in (80, 443):
+        # Captive portal, as launcher.sh/netwatch.sh install it (-C: only if not there yet)
+        spec = f"PREROUTING -i {AP_INTERFACE} -p tcp --dport {port} -j REDIRECT --to-port {port}"
+        await _cmd(f"iptables -t nat -C {spec} 2>/dev/null || iptables -t nat -A {spec} 2>/dev/null; true")
+    try:
+        with open(LED_STATE_FILE, "w") as f:
+            f.write("ap")
+    except OSError:
+        pass
 
 
 # ── Registration background tasks ─────────────────────────────────────────────
@@ -2328,6 +2348,7 @@ if __name__ == "__main__":
     _KEY  = os.path.join(_SCRIPT_DIR, "key.pem")
 
     async def _main():
+        await _ap_for_identity_mismatch()
         asyncio.create_task(_idle_watchdog())
         asyncio.create_task(_session_pruner())
         tasks = [app.start_server(host="0.0.0.0", port=SERVER_PORT, debug=False)]
