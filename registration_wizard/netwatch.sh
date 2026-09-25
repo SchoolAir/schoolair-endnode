@@ -59,6 +59,26 @@ ap_has_clients() {
     iw dev wlan0 station dump 2>/dev/null | grep -q '^Station'
 }
 
+# wizard.py's _delayed_shutdown() also restarts $TELEMETRY_SERVICE, unconditionally,
+# 6s after a successful registration — and it clears WIZARD_BUSY_FILE immediately on
+# success, not 6s later, so our own poll can land either before OR after its restart
+# depending on where in our POLL_INTERVAL cycle we happen to be when the busy file
+# clears. Skip our own restart if one already happened recently enough that it must
+# have picked up the fresh token: margin = POLL_INTERVAL + a small buffer, since that
+# bounds how late our own poll can land relative to any restart that already fired.
+# (The reverse direction — us firing before the wizard's fixed 6s delay — is guarded
+# on the wizard's own side, in _delayed_shutdown() specifically; the token is written
+# to disk before either path can act, so whichever restart happens first is sufficient
+# and the second one is always pure redundancy, not a correctness issue either way.)
+schoolair_recently_restarted() {
+    local margin=$(( POLL_INTERVAL + 5 ))
+    local started now
+    started=$(systemctl show "$TELEMETRY_SERVICE" -p ActiveEnterTimestampMonotonic --value 2>/dev/null) || return 1
+    [ -n "$started" ] && [ "$started" != "0" ] || return 1
+    now=$(awk '{print int($1*1000000)}' /proc/uptime)
+    [ $(( (now - started) / 1000000 )) -lt "$margin" ]
+}
+
 # ── AP control ─────────────────────────────────────────────────────────────────
 
 _install_captive_portal() {
@@ -199,7 +219,11 @@ while true; do
                     # wizard, or a previously-known network came back on its own.
                     log "Uplink detected while in AP mode — closing AP"
                     take_down_ap
-                    systemctl restart "$TELEMETRY_SERVICE" 2>/dev/null || true
+                    if schoolair_recently_restarted; then
+                        log "$TELEMETRY_SERVICE already restarted recently — skipping redundant restart"
+                    else
+                        systemctl restart "$TELEMETRY_SERVICE" 2>/dev/null || true
+                    fi
                     state="online"
                 fi
             elif [ $(( $(date +%s) - last_reconnect )) -ge "$RECONNECT_INTERVAL" ]; then

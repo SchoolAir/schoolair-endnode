@@ -222,3 +222,93 @@ async def test_retry_profile_connect_failure_erases_creds(net):
     assert wizard._last_good_wifi == {}
     wizard._revert_to_ap.assert_awaited_once()
     net._cmd.assert_any_call('nmcli con delete "school-air-saved-TestNet" 2>/dev/null; true')
+
+
+# ── _telemetry_recently_restarted / _delayed_shutdown's netwatch-race guard ────
+#
+# netwatch.sh's own 'ap' handler also restarts schoolair.service, on its own ~30s
+# poll cycle, and can beat _delayed_shutdown() to it since WIZARD_BUSY_FILE clears
+# the instant registration succeeds, not 6s later when _delayed_shutdown() actually
+# runs. These pin _telemetry_recently_restarted()'s time-window logic directly
+# (mocking _cmd's two systemctl/awk calls), then confirm _delayed_shutdown() honours
+# it — while _delayed_management_shutdown() stays unconditional, since nothing else
+# restarts schoolair for that flow.
+
+def _fake_cmd_for_restart_check(active_enter_us: str, uptime_us: int):
+    """_cmd side_effect matching _telemetry_recently_restarted()'s two calls, in order:
+    `systemctl show ... ActiveEnterTimestampMonotonic` then the /proc/uptime awk."""
+    calls = iter([(0, active_enter_us, ""), (0, str(uptime_us), "")])
+    async def fake_cmd(cmd):
+        return next(calls)
+    return fake_cmd
+
+
+async def test_telemetry_recently_restarted_true_just_after_a_restart(monkeypatch):
+    # restarted 3s ago (times in microseconds, as ActiveEnterTimestampMonotonic reports)
+    monkeypatch.setattr(wizard, "_cmd", _fake_cmd_for_restart_check("1_000_000", 4_000_000))
+    assert await wizard._telemetry_recently_restarted(margin_s=10) is True
+
+
+async def test_telemetry_recently_restarted_false_once_the_margin_has_passed(monkeypatch):
+    # restarted 15s ago, outside a 10s margin
+    monkeypatch.setattr(wizard, "_cmd", _fake_cmd_for_restart_check("1_000_000", 16_000_000))
+    assert await wizard._telemetry_recently_restarted(margin_s=10) is False
+
+
+async def test_telemetry_recently_restarted_false_when_never_started(monkeypatch):
+    # ActiveEnterTimestampMonotonic is "0" for a unit that has never been active
+    monkeypatch.setattr(wizard, "_cmd", _fake_cmd_for_restart_check("0", 4_000_000))
+    assert await wizard._telemetry_recently_restarted() is False
+
+
+async def test_telemetry_recently_restarted_false_when_systemctl_fails(monkeypatch):
+    async def fake_cmd(cmd):
+        return 1, "", "unit not found"
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    assert await wizard._telemetry_recently_restarted() is False
+
+
+async def test_delayed_shutdown_skips_restart_when_netwatch_already_did_it(monkeypatch):
+    calls = []
+    async def fake_cmd(cmd):
+        calls.append(cmd)
+        return 0, "", ""
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    monkeypatch.setattr(wizard, "_telemetry_recently_restarted", AsyncMock(return_value=True))
+    monkeypatch.setattr(wizard.asyncio, "sleep", AsyncMock())
+
+    await wizard._delayed_shutdown()
+
+    assert not any("restart schoolair" in c for c in calls)
+    assert any("stop schoolair-wizard" in c for c in calls)   # the rest of the sequence still runs
+
+
+async def test_delayed_shutdown_restarts_when_netwatch_has_not(monkeypatch):
+    calls = []
+    async def fake_cmd(cmd):
+        calls.append(cmd)
+        return 0, "", ""
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    monkeypatch.setattr(wizard, "_telemetry_recently_restarted", AsyncMock(return_value=False))
+    monkeypatch.setattr(wizard.asyncio, "sleep", AsyncMock())
+
+    await wizard._delayed_shutdown()
+
+    assert any("restart schoolair" in c for c in calls)
+
+
+async def test_delayed_management_shutdown_is_unconditional(monkeypatch):
+    """No netwatch race exists for this path (device was never in AP mode) — it
+    must always restart, regardless of _telemetry_recently_restarted."""
+    calls = []
+    async def fake_cmd(cmd):
+        calls.append(cmd)
+        return 0, "", ""
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    monkeypatch.setattr(wizard, "_telemetry_recently_restarted", AsyncMock(return_value=True))
+    monkeypatch.setattr(wizard.asyncio, "sleep", AsyncMock())
+
+    await wizard._delayed_management_shutdown()
+
+    assert any("restart schoolair" in c for c in calls)
+    wizard._telemetry_recently_restarted.assert_not_awaited()

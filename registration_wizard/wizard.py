@@ -1142,6 +1142,27 @@ async def _cmd(cmd: str) -> tuple:
     return proc.returncode, out.decode().strip(), err.decode().strip()
 
 
+async def _telemetry_recently_restarted(margin_s: int = 10) -> bool:
+    """netwatch.sh's own 'ap' state handler restarts schoolair too, whenever it next
+    polls (every ~30s) and finds WIZARD_BUSY_FILE gone with an uplink present — and
+    that file is removed the instant registration succeeds (see run_registration's
+    finally:), not when _delayed_shutdown() actually gets around to its own restart
+    6s later. So netwatch can act before us if its poll happens to land in that
+    window. The token is written to disk before the busy file clears either way, so
+    whichever restart happens first is sufficient; this just skips ours if netwatch's
+    already fired. margin_s only needs to cover our own fixed 6s delay (see the
+    caller) — the much longer reverse-direction gap is guarded on netwatch's side."""
+    rc, out, _ = await _cmd(
+        "systemctl show schoolair -p ActiveEnterTimestampMonotonic --value")
+    if rc != 0 or not out or out == "0":
+        return False
+    _, uptime_out, _ = await _cmd("awk '{print int($1*1000000)}' /proc/uptime")
+    try:
+        return (int(uptime_out) - int(out)) / 1_000_000 < margin_s
+    except ValueError:
+        return False
+
+
 def _display_ssid(name: str) -> str:
     """Fallback human-readable name when the real SSID can't be read.
 
@@ -1825,7 +1846,14 @@ async def _delayed_shutdown() -> None:
     await _cmd(f'nmcli con down "{AP_CONNECTION_NAME}" 2>/dev/null; true')
     await _cmd("systemctl stop hostapd 2>/dev/null; true")
     await _cmd("systemctl disable hostapd 2>/dev/null; true")
-    await _cmd("systemctl restart schoolair 2>/dev/null; true")
+    # netwatch.sh's own poll can beat us to this exact restart — see
+    # _telemetry_recently_restarted's docstring. Only relevant here, in the
+    # AP/setup path netwatch also reacts to; _delayed_management_shutdown()
+    # below is unconditional, since nothing else restarts schoolair for it.
+    if await _telemetry_recently_restarted():
+        print("[wizard] schoolair already restarted (netwatch beat us to it) — skipping")
+    else:
+        await _cmd("systemctl restart schoolair 2>/dev/null; true")
     await _cmd("systemctl stop schoolair-wizard 2>/dev/null; true")
 
 
