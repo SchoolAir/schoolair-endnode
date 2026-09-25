@@ -70,3 +70,36 @@ async def test_graceful_shutdown_empty_state_is_noop(tmp_db):
 
     assert queue.count_pending() == 0
     assert queue.get_pending_alerts() == []
+
+
+# ── Device error on the dashboard (ws/sensors "error") ──────────────────────
+
+@pytest.fixture
+def device_state(monkeypatch, tmp_path):
+    err = tmp_path / "device-error"
+    flag = tmp_path / "identity-mismatch"
+    monkeypatch.setattr(main, "DEVICE_ERROR_FILE", str(err))
+    monkeypatch.setattr(main.device_identity, "MISMATCH_FILE", str(flag))
+    return err, flag
+
+
+def test_device_error_none_when_all_is_well(device_state):
+    assert main._device_error() is None
+
+
+def test_device_error_reports_led_status_problem(device_state):
+    err, _ = device_state
+    err.write_text("The sensor service is not running.\n")
+    assert main._device_error() == "The sensor service is not running."
+
+
+def test_device_error_identity_mismatch_comes_first(device_state):
+    err, flag = device_state
+    err.write_text("The sensor service is not running.\n")
+    flag.write_text("x")
+    msg = main._device_error()
+    # dashboard.html keys its "Register now" link on this phrase
+    assert "belongs to a different SchoolAir device" in msg
+    from pathlib import Path
+    html = (Path(main.__file__).parent / "static" / "dashboard.html").read_text()
+    assert "belongs to a different SchoolAir device" in html

@@ -35,7 +35,7 @@ forever. See _check_watched_services().
 While the setup hotspot is up (_ap_active), "ap" beats "error" from any
 source, the health check included: a person standing in front of the device
 must see that it's waiting for them. The error they'd otherwise have seen is
-written to DEVICE_ERROR_FILE, which the wizard's pages show instead.
+written to DEVICE_ERROR_FILE, which the device dashboard (main.py) shows instead.
 
 LED_STATE_FILE's "error" is downgraded to "ap" while the device isn't
 registered yet (see _is_registered/_resolve_state) — a networking/auth
@@ -57,7 +57,7 @@ GPIO_LED = 24
 LED_STATE_FILE = "/run/schoolair-led-state"
 # One line of plain text describing the current error, present only while there
 # is one. Written here (the one place that knows what the LED would say) and
-# shown by the wizard's pages, since AP mode hides "error" on the LED.
+# shown on the device dashboard (main.py), since AP mode hides "error" on the LED.
 DEVICE_ERROR_FILE = "/run/schoolair-device-error"
 # The setup hotspot's own address (registration_wizard/config.py AP_IP): wlan0
 # holds it only while the AP is up. A client of a school network never gets it,
@@ -138,7 +138,7 @@ _VALID_STATES = {"ok", "thinking", "ap", "error", "no_sensor"}
 # increase as evidence of a crash within that window, even if the service
 # happens to be up again by the time it's sampled.
 WATCHED_SERVICES = ("sen6x.service", "schoolair.service", "schoolair-netwatch.service")
-# How DEVICE_ERROR_FILE names them for whoever reads the wizard's page.
+# How DEVICE_ERROR_FILE names them for whoever reads the device dashboard.
 _SERVICE_NAMES = {
     "sen6x.service":              "The sensor service",
     "schoolair.service":          "The air-quality monitoring service",
@@ -352,7 +352,7 @@ def _resolve_state(health: dict, now_mono: float, raw_state: "str | None" = None
     """Precedence, highest to lowest:
       0. AP mode (ap_active): "error" from any source below shows as "ap" — the
          device is waiting for someone to set it up, and the error itself is
-         shown on the wizard's page instead (see DEVICE_ERROR_FILE).
+         shown on the device dashboard instead (see DEVICE_ERROR_FILE).
       1. Independent health-check failure (health["unhealthy_until"]) — a
          watched service actually crashed. Always wins: that's a real
          internal problem regardless of registration/AP-mode.
