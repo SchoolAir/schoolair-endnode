@@ -418,6 +418,15 @@ async def test_take_sample_publishes_locally_and_keeps_the_sample():
     assert ingest._samples == [{"sen6x": {"co2": 555}}]
 
 
+async def test_take_sample_publishes_the_error_when_the_read_fails():
+    with patch("jobs.ingest.read_sensor", side_effect=RuntimeError("Sensor script timed out")), \
+         patch("jobs.ingest.state") as mock_state:
+        assert ingest._take_sample([]) is None
+
+    assert mock_state.publish_error.call_args[0][0] == "Sensor script timed out"
+    assert ingest._samples == []
+
+
 async def test_sample_until_boundary_samples_every_interval_then_stops(monkeypatch):
     """With 200 s to the boundary and 60 s samples: samples at 60, 120, 180, then
     a 20 s wait to the boundary, where _run_read takes over."""

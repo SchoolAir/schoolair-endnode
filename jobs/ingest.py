@@ -1023,6 +1023,7 @@ def _take_sample(active_sensors: list, recorded_at: str | None = None) -> dict |
     except RuntimeError as e:
         print(f"Sensor read failed: {e}")
         _set_led_state("no_sensor")
+        state.publish_error(str(e), recorded_at)
         return None
 
     for sensor in active_sensors:

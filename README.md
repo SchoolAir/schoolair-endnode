@@ -103,6 +103,14 @@ valid value for is `null`:
 {"data": {"sen6x": {"co2": 742, "pm25": 0.8, "temp": 28.5, ...}}, "recorded_at": "2026-09-28T21:31:43+00:00"}
 ```
 
+If a read fails altogether, the file says so instead of keeping the last good
+reading, so a consumer can react at once rather than wait for the reading to go
+stale:
+
+```json
+{"data": null, "recorded_at": "2026-09-29T21:40:00+00:00", "error": "Sensor script failed: ..."}
+```
+
 This is the interface for other services on the same Pi that need the current
 reading without opening `queue.db` (whose rows disappear as they upload) or
 talking to the sensor. It lives on tmpfs, so it costs no SD-card writes and is
