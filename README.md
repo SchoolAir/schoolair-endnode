@@ -95,11 +95,20 @@ schoolair-netwatch       Persistent — monitors WiFi after boot. On uplink loss
 
 ### Latest reading file
 
-Every reading the telemetry process takes is also written, atomically, to
-`/run/schoolair/latest.json`:
+Every sample the telemetry process takes (once a minute, `SAMPLE_INTERVAL`) is
+written, atomically, to `/run/schoolair/latest.json`. A metric the sensor had no
+valid value for is `null`:
 
 ```json
 {"data": {"sen6x": {"co2": 742, "pm25": 0.8, "temp": 28.5, ...}}, "recorded_at": "2026-09-28T21:31:43+00:00"}
+```
+
+If a read fails altogether, the file says so instead of keeping the last good
+reading, so a consumer can react at once rather than wait for the reading to go
+stale:
+
+```json
+{"data": null, "recorded_at": "2026-09-29T21:40:00+00:00", "error": "Sensor script failed: ..."}
 ```
 
 This is the interface for other services on the same Pi that need the current
@@ -159,9 +168,12 @@ only when its pin changed. Both first wait for any move in progress to finish
 
 `main.py` runs two concurrent coroutines:
 
-- **Ingest loop** — reads the sensor on a clock-aligned schedule (5 min during
-  the active window, 15 min outside it), buffers readings in RAM, and drains
-  them to the server in batches. When a reading breaches a threshold it launches
+- **Ingest loop** — samples the sensor every minute and publishes each sample
+  locally (see *Latest reading file*). On a clock-aligned schedule (5 min during
+  the active window, 15 min outside it) the mean of that interval's samples
+  becomes one reading, which is uploaded at once or kept in SQLite and drained
+  to the server in batches. SEN6x "no valid value" codes (CO2 32766/32767,
+  PM 6553.5, …) are recorded as `null` and left out of the mean. When a reading breaches a threshold it launches
   a shared two-stage verification task (see below) to distinguish spikes from
   real events before sending an alert.
 
@@ -341,8 +353,9 @@ Pi reads and drains at the higher cadence (school hours).
 
 | Env var                  | Default   | Meaning                        |
 |--------------------------|-----------|--------------------------------|
-| `READ_INTERVAL_ACTIVE`   | `300` s   | 5 min — sensor read cadence inside the window  |
-| `READ_INTERVAL_IDLE`     | `900` s   | 15 min — sensor read cadence outside the window |
+| `SAMPLE_INTERVAL`        | `60` s    | 1 min — local sensor read and `latest.json` cadence |
+| `READ_INTERVAL_ACTIVE`   | `300` s   | 5 min — upload cadence inside the window (mean of its samples) |
+| `READ_INTERVAL_IDLE`     | `900` s   | 15 min — upload cadence outside the window (mean of its samples) |
 | `DRAIN_INTERVAL_ACTIVE`  | `1800` s  | 30 min — max time between drains inside the window |
 | `DRAIN_INTERVAL_IDLE`    | `7200` s  | 2 hr — max time between drains outside the window  |
 
