@@ -57,3 +57,14 @@ def test_apt_disable_runs_in_update_mode_too():
 def test_apt_upgrade_service_is_never_stopped():
     """Stopping it could interrupt a dpkg run in progress mid-OTA."""
     assert "stop apt-daily-upgrade.service" not in TEXT
+
+
+def test_pigpiod_restarts_only_when_its_drop_in_changed():
+    """A pigpiod restart also restarts schoolair-flower (PartOf) and costs a re-home
+    if the flower is moving, so an update that doesn't touch pigpiod leaves it alone."""
+    assert 'cmp -s "${DEPLOY_DIR}/pigpiod-early.conf"' in TEXT
+    assert TEXT.index("PIGPIOD_CONF_CHANGED=1") < TEXT.index("install_with_backup \"${DEPLOY_DIR}/pigpiod-early.conf\"")
+    restart = TEXT.index("systemctl restart pigpiod.service")
+    guard = TEXT.rindex('if [ "$PIGPIOD_CONF_CHANGED" = 1 ]', 0, restart)
+    assert "/run/schoolair-flower/moving" in TEXT[guard:restart]
+    assert TEXT.count("systemctl restart pigpiod") == 1

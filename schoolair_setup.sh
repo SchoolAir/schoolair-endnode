@@ -572,8 +572,14 @@ done
 # pigpiod (indoor units) must start at the very beginning of boot so the
 # status LED can light early — see the header of deploy/pigpiod-early.conf.
 # Harmless on outdoor units, where pigpiod doesn't exist.
+# Remember whether the drop-in actually changed: only then does the update
+# below need to restart pigpiod (see there).
+PIGPIOD_CONF_CHANGED=0
 if [ -f "${DEPLOY_DIR}/pigpiod-early.conf" ]; then
     mkdir -p /etc/systemd/system/pigpiod.service.d
+    if ! cmp -s "${DEPLOY_DIR}/pigpiod-early.conf" /etc/systemd/system/pigpiod.service.d/schoolair-early.conf; then
+        PIGPIOD_CONF_CHANGED=1
+    fi
     install_with_backup "${DEPLOY_DIR}/pigpiod-early.conf" /etc/systemd/system/pigpiod.service.d/schoolair-early.conf
     ok "pigpiod early-start drop-in installed"
 fi
@@ -686,11 +692,21 @@ if [[ "$MODE" == "--update" ]]; then
     # *next* boot, it does not start it now. restart (not start) also
     # correctly picks up new led_status.py code on devices where it was
     # already running.
-    # pigpiod first: its command-line (deploy/pigpiod-early.conf, e.g. the 1us sample
-    # rate led_status.py relies on) only takes effect on restart, and led_status.py
-    # reads the resolution once at startup. Harmless if pigpiod isn't installed
-    # (outdoor units). The LED goes dark for a moment.
-    if systemctl cat pigpiod.service &>/dev/null; then
+    # pigpiod first, but only when its drop-in changed: its command-line
+    # (deploy/pigpiod-early.conf, e.g. the 1us sample rate led_status.py relies
+    # on) only takes effect on restart, and led_status.py reads the resolution
+    # once at startup. Otherwise leave it running: restarting pigpiod also
+    # restarts schoolair-flower (PartOf=pigpiod.service) and cuts any move in
+    # progress, which loses the flower's position and costs a full re-home.
+    # When it must restart, wait (up to 150 s) for a flower move to finish;
+    # /run/schoolair-flower/moving exists only during a move. The longest move,
+    # a blind home (65 mm down at ~1.5 s/mm), takes about 100 s. Harmless if
+    # pigpiod isn't installed (outdoor units). The LED goes dark for a moment.
+    if [ "$PIGPIOD_CONF_CHANGED" = 1 ] && systemctl cat pigpiod.service &>/dev/null; then
+        for _ in $(seq 1 150); do
+            [ -e /run/schoolair-flower/moving ] || break
+            sleep 1
+        done
         systemctl restart pigpiod.service    || warn "pigpiod.service restart failed"
     fi
     systemctl restart schoolair-led.service      || warn "schoolair-led.service restart failed"
