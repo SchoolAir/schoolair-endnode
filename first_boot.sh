@@ -82,3 +82,10 @@ configure_unit_type() {
 }
 
 configure_unit_type
+
+# Indoor units: is a wilting flower fitted? detect_flower.sh reads the dock's
+# strap and sets /etc/schoolair-flower-fitted; offline and instant, like the
+# rest of this script. The flower itself starts once pigpiod is installed.
+if grep -qs indoor /etc/schoolair-unit-type && [ -x /home/admin/schoolair/detect_flower.sh ]; then
+    /home/admin/schoolair/detect_flower.sh || true
+fi

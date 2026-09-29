@@ -66,5 +66,5 @@ def test_pigpiod_restarts_only_when_its_drop_in_changed():
     assert TEXT.index("PIGPIOD_CONF_CHANGED=1") < TEXT.index("install_with_backup \"${DEPLOY_DIR}/pigpiod-early.conf\"")
     restart = TEXT.index("systemctl restart pigpiod.service")
     guard = TEXT.rindex('if [ "$PIGPIOD_CONF_CHANGED" = 1 ]', 0, restart)
-    assert "/run/schoolair-flower/moving" in TEXT[guard:restart]
+    assert "wait_for_flower_move" in TEXT[guard:restart]   # see test_flower_install.py
     assert TEXT.count("systemctl restart pigpiod") == 1
