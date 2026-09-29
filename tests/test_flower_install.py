@@ -140,4 +140,4 @@ def test_golden_images_do_not_carry_the_marker():
 
 def test_first_boot_detects_the_flower_after_the_unit_type():
     fb = (ROOT / "first_boot.sh").read_text()
-    assert fb.rindex("configure_unit_type") < fb.index("detect_flower.sh")
+    assert fb.rindex("configure_unit_type") < fb.index("/home/admin/schoolair/detect_flower.sh ||")
