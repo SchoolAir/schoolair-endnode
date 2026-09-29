@@ -15,6 +15,8 @@ import json
 import uuid
 import httpx
 from pathlib import Path
+
+from atomic_file import write_atomic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -70,7 +72,7 @@ def write_env_token(token: str):
         content = re.sub(r"^AUTH_TOKEN=.*$", f"AUTH_TOKEN={token}", content, flags=re.MULTILINE)
     else:
         content += f"\nAUTH_TOKEN={token}\n"
-    ENV_PATH.write_text(content)
+    write_atomic(ENV_PATH, content)
     
 # ----------------------- Registration flow -----------------------
 

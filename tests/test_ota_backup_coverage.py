@@ -57,7 +57,9 @@ def test_no_direct_cp_to_protected_paths_outside_backup_helpers():
         # .env preservation is a different, intentional mechanism (keeping
         # the device's own local file across an update, not installing new
         # content that came from the update) — not what this test guards.
-        if ".env" in line:
+        # DEVICE_CONFIG_KEEP is the same mechanism for config/settings.json
+        # and config/criteria.json (see test_ota_device_config.py).
+        if ".env" in line or "DEVICE_CONFIG_KEEP" in line:
             continue
         if any(re.search(pat, line) for pat in PROTECTED_PATH_PATTERNS):
             violations.append(f"line {lineno}: {stripped}")

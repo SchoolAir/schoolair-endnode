@@ -13,6 +13,8 @@ import re
 import sys
 from pathlib import Path
 
+from atomic_file import write_atomic
+
 ENV_PATH = Path(__file__).parent / ".env"
 
 # New wizard format (non-LEGACY registrations)
@@ -50,7 +52,7 @@ def write_token(token: str) -> None:
         content = re.sub(r"^AUTH_TOKEN=.*$", f"AUTH_TOKEN={token}", content, flags=re.MULTILINE)
     else:
         content += f"\nAUTH_TOKEN={token}\n"
-    ENV_PATH.write_text(content)
+    write_atomic(ENV_PATH, content)
 
 
 if __name__ == "__main__":

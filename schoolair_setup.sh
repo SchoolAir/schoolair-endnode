@@ -320,6 +320,21 @@ mkdir -p "$SCHOOLAIR_DIR"
 _PRE_UPDATE_VERSION=""
 [ -f "${SCHOOLAIR_DIR}/jobs/ingest.py" ] \
     && _PRE_UPDATE_VERSION="$(grep -m1 '^VERSION' "${SCHOOLAIR_DIR}/jobs/ingest.py" | sed -nE 's/.*"([^"]+)".*/\1/p')"
+# Device-local state that lives in the app directory but is also tracked in the
+# repo as a default: config/settings.json (this device's upload offset
+# drain_jitter_seconds, ntp_clock_corrected, the server-pushed active window)
+# and config/criteria.json (the server-pushed alert criteria). Copying the repo
+# over them on every update drew a fresh random upload offset (undoing the
+# stagger across devices), dropped ntp_clock_corrected, and put the window and
+# criteria back to the repo defaults until the server sent them again. They are
+# kept like .env. install_dir_with_backup's backup still holds them, so a
+# rollback restores them too; a fresh install gets the repo defaults.
+DEVICE_CONFIG_KEEP="$(mktemp -d)"
+for f in settings.json criteria.json; do
+    if [ -f "${SCHOOLAIR_DIR}/config/${f}" ]; then
+        cp -p "${SCHOOLAIR_DIR}/config/${f}" "${DEVICE_CONFIG_KEEP}/${f}"
+    fi
+done
 if [ -f "${SCHOOLAIR_DIR}/.env" ]; then
     cp "${SCHOOLAIR_DIR}/.env" /tmp/schoolair-env.bak
     install_dir_with_backup "$REPO_DIR" "$SCHOOLAIR_DIR"
@@ -330,6 +345,13 @@ else
     cp "${SCHOOLAIR_DIR}/.env.example" "${SCHOOLAIR_DIR}/.env"
     ok "App deployed + .env created from .env.example"
 fi
+for f in settings.json criteria.json; do
+    if [ -f "${DEVICE_CONFIG_KEEP}/${f}" ]; then
+        mv "${DEVICE_CONFIG_KEEP}/${f}" "${SCHOOLAIR_DIR}/config/${f}"
+        ok "config/${f} kept (device's own copy)"
+    fi
+done
+rm -rf "$DEVICE_CONFIG_KEEP"
 chown -R "${ADMIN_USER}:${ADMIN_USER}" "$SCHOOLAIR_DIR"
 rm -rf "$REPO_DIR"
 
@@ -597,52 +619,45 @@ if [ -f "${DEPLOY_DIR}/pigpiod-early.conf" ]; then
 fi
 
 # ── Wilting flower (indoor units) ─────────────────────────────────────────────
-# The flower's motor control lives in its own repository, SchoolAir/
-# Flower-End-node, pinned to one commit by deploy/flower.ref. It is installed on
-# every indoor unit (a few tens of KB), so a golden image carries it; the
-# drop-in deploy/schoolair-flower-fitted.conf lets it run only where
-# detect_flower.sh found the dock's strap and pigpiod is installed. Everything
-# it replaces goes through install_with_backup, so an OTA rollback restores the
-# previous flower too. None of this may fail an update: without the network or
-# the pinned commit, the installed flower stays as it is.
+# The flower's motor control is developed in SchoolAir/Flower-End-node (private)
+# and bundled here at release time by scripts/vendor_flower.sh: flower/ holds
+# the files a unit needs at one pinned commit, recorded in flower/SOURCE. So
+# installing it needs no network and no GitHub access. It is installed on every
+# indoor unit (a few tens of KB), so a golden image carries it; the drop-in
+# deploy/schoolair-flower-fitted.conf lets it run only where detect_flower.sh
+# found the dock's strap and pigpiod is installed. Everything it replaces goes
+# through install_with_backup, so an OTA rollback restores the previous flower
+# too.
 FLOWER_CHANGED=0
 FLOWER_DIR="${ADMIN_HOME}/flower"
-FLOWER_REPO_URL="https://github.com/SchoolAir/Flower-End-node.git"
-FLOWER_REF="$(grep -v '^#' "${DEPLOY_DIR}/flower.ref" 2>/dev/null | tr -d '[:space:]')"
+FLOWER_SRC="${SCHOOLAIR_DIR}/flower"
+FLOWER_REF="$(sed -n 's/^commit //p' "${FLOWER_SRC}/SOURCE" 2>/dev/null)"
 if grep -qs indoor /etc/schoolair-unit-type && [ -n "$FLOWER_REF" ]; then
     bash "${SCHOOLAIR_DIR}/detect_flower.sh" || true
     if [ "$(cat "${FLOWER_DIR}/.installed-ref" 2>/dev/null)" = "$FLOWER_REF" ]; then
         ok "Wilting flower ${FLOWER_REF:0:7} already installed"
     else
-        FLOWER_TMP="$(mktemp -d)"
-        if git -C "$FLOWER_TMP" init -q \
-            && git -C "$FLOWER_TMP" fetch -q --depth 1 "$FLOWER_REPO_URL" "$FLOWER_REF" \
-            && git -C "$FLOWER_TMP" checkout -q FETCH_HEAD; then
-            mkdir -p "$FLOWER_DIR" /etc/systemd/system/schoolair-flower.service.d
-            for f in flower_service.py step.py; do
-                install_with_backup "${FLOWER_TMP}/${f}" "${FLOWER_DIR}/${f}"
-                chmod 755 "${FLOWER_DIR}/${f}"
-            done
-            # calibration.json holds this unit's position and any measured
-            # positions: only ever created, never replaced.
-            if [ ! -f "${FLOWER_DIR}/calibration.json" ]; then
-                install_with_backup "${FLOWER_TMP}/calibration.example.json" "${FLOWER_DIR}/calibration.json"
-            fi
-            echo "$FLOWER_REF" > "${FLOWER_TMP}/.installed-ref"
-            install_with_backup "${FLOWER_TMP}/.installed-ref" "${FLOWER_DIR}/.installed-ref"
-            chown -R "${ADMIN_USER}:${ADMIN_USER}" "$FLOWER_DIR"
-            install_with_backup "${FLOWER_TMP}/deploy/schoolair-flower.service" /etc/systemd/system/schoolair-flower.service
-            FLOWER_CHANGED=1
-            ok "Wilting flower ${FLOWER_REF:0:7} installed  →  ${FLOWER_DIR}"
-        else
-            warn "Could not fetch Flower-End-node ${FLOWER_REF:0:7} — installed flower left as it is"
+        mkdir -p "$FLOWER_DIR"
+        for f in flower_service.py step.py; do
+            install_with_backup "${FLOWER_SRC}/${f}" "${FLOWER_DIR}/${f}"
+            chmod 755 "${FLOWER_DIR}/${f}"
+        done
+        # calibration.json holds this unit's position and any measured
+        # positions: only ever created, never replaced.
+        if [ ! -f "${FLOWER_DIR}/calibration.json" ]; then
+            install_with_backup "${FLOWER_SRC}/calibration.example.json" "${FLOWER_DIR}/calibration.json"
         fi
-        rm -rf "$FLOWER_TMP"
+        FLOWER_REF_TMP="$(mktemp)"
+        echo "$FLOWER_REF" > "$FLOWER_REF_TMP"
+        install_with_backup "$FLOWER_REF_TMP" "${FLOWER_DIR}/.installed-ref"
+        rm -f "$FLOWER_REF_TMP"
+        chown -R "${ADMIN_USER}:${ADMIN_USER}" "$FLOWER_DIR"
+        install_with_backup "${FLOWER_SRC}/schoolair-flower.service" /etc/systemd/system/schoolair-flower.service
+        FLOWER_CHANGED=1
+        ok "Wilting flower ${FLOWER_REF:0:7} installed  →  ${FLOWER_DIR}"
     fi
-    if [ -f /etc/systemd/system/schoolair-flower.service ]; then
-        mkdir -p /etc/systemd/system/schoolair-flower.service.d
-        install_with_backup "${DEPLOY_DIR}/schoolair-flower-fitted.conf" /etc/systemd/system/schoolair-flower.service.d/schoolair-flower-fitted.conf
-    fi
+    mkdir -p /etc/systemd/system/schoolair-flower.service.d
+    install_with_backup "${DEPLOY_DIR}/schoolair-flower-fitted.conf" /etc/systemd/system/schoolair-flower.service.d/schoolair-flower-fitted.conf
 fi
 
 # An earlier revision drove GPIO24 high from firmware start via config.txt.

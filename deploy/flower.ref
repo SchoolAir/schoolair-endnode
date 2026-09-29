@@ -1,5 +1,0 @@
-# The SchoolAir/Flower-End-node commit that setup and OTA install on indoor
-# units. Bump it deliberately, like a dependency pin, after testing that commit
-# on a bench unit. It must exist on GitHub: an unpushed commit can't be fetched,
-# and the update then keeps whatever flower version is already installed.
-4ec6f615f8ea1b9b319ed11db83fe433c60d00f4
