@@ -112,6 +112,21 @@ minute and drives a stepper so a silk flower stands or droops with CO₂ and
 PM2.5. That service owns the flower mechanics; this one owns the data. Neither
 imports the other, and removing either leaves the other working.
 
+### Sharing pigpiod with the flower
+
+pigpiod has a single wave transmitter, and starting a wave replaces the one
+playing. The status LED breathes with waves; the wilting-flower service drives
+its stepper with waves too, and it has no position sensor, so a wave that cuts a
+move mid-way loses the flower's position. The two agree on one file:
+`/run/schoolair-flower/moving`, which the flower service creates before every
+move and removes after it. While it exists `led_status.py` sends no waves and
+holds a steady glow on plain PWM (timed independently by pigpiod); when it goes,
+the LED resends its current pattern. The unit's `ExecStopPost` and the daemon's
+own cleanup skip `wave_tx_stop`/`wave_clear` while the flag exists, for the same
+reason. The flower side waits 1.5 s after raising the flag, watches
+`wave_tx_at()` during the move, and treats a replaced or overdue wave as an
+interruption (position unknown, re-home).
+
 ### Telemetry process
 
 `main.py` runs two concurrent coroutines:
