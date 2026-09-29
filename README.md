@@ -127,6 +127,34 @@ reason. The flower side waits 1.5 s after raising the flag, watches
 `wave_tx_at()` during the move, and treats a replaced or overdue wave as an
 interruption (position unknown, re-home).
 
+### Installing the flower
+
+The flower's code lives in `SchoolAir/Flower-End-node`. `deploy/flower.ref`
+pins the commit this firmware installs. Setup and every OTA update fetch that
+commit on indoor units and install it into `~/flower`, backing up what they
+replace so a rollback restores the previous flower too. `calibration.json` is
+created once and never replaced. A pin that is already installed is skipped, and
+a failed fetch only warns. To ship a new flower version, test it on a bench
+unit, push it, and bump `deploy/flower.ref`.
+
+The service is installed and enabled on every indoor unit. A drop-in
+(`deploy/schoolair-flower-fitted.conf`) lets it start only when both of these
+are true:
+
+- **A flower is fitted.** The AQU dock's harness ties GPIO26 (physical pin 37)
+  to ground (pin 39). `detect_flower.sh` switches on the pull-up and reads the
+  pin: low means a strap, and it creates `/etc/schoolair-flower-fitted`. It runs
+  at a clone's first boot and on every setup/update. `prepare_image.sh` removes
+  the marker from golden images. A unit without the harness (the bench unit) is
+  marked by hand: `sudo touch /etc/schoolair-flower-fitted`.
+- **pigpiod is installed** (`/var/lib/schoolair-pigpio-installed`). On a new
+  unit that happens only once the network is up. `schoolair-pigpio-setup.service`
+  then starts the flower.
+
+Updates restart pigpiod only when its drop-in changed, and restart the flower
+only when its pin changed. Both first wait for any move in progress to finish
+(`wait_for_flower_move`).
+
 ### Telemetry process
 
 `main.py` runs two concurrent coroutines:
