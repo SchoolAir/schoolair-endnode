@@ -773,9 +773,21 @@ async def test_handle_response_saves_criteria():
     """Criteria list in response is persisted to disk."""
     criteria = [{"metric": "co2", "threshold": 1000, "condition": "above", "severity": "warning"}]
     with patch("jobs.ingest.save_criteria") as mock_save, \
+         patch("jobs.ingest.load_criteria", return_value=[]), \
          patch("jobs.ingest._drain_alerts", new_callable=AsyncMock):
         await _handle_response({"criteria": criteria})
     mock_save.assert_called_once_with(criteria)
+
+
+async def test_handle_response_does_not_rewrite_unchanged_criteria():
+    """Every upload response carries the criteria — rewriting the same file on
+    each one was the app's most frequent routine SD write."""
+    criteria = [{"metric": "co2", "threshold": 1000, "condition": "above", "severity": "warning"}]
+    with patch("jobs.ingest.save_criteria") as mock_save, \
+         patch("jobs.ingest.load_criteria", return_value=list(criteria)), \
+         patch("jobs.ingest._drain_alerts", new_callable=AsyncMock):
+        await _handle_response({"criteria": criteria})
+    mock_save.assert_not_called()
 
 
 async def test_handle_response_schedules_update_when_min_version_newer():

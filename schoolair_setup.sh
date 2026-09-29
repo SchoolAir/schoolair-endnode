@@ -250,27 +250,8 @@ if [[ "$MODE" == "setup" ]]; then
     step "2 / System packages"
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades
-    ok "git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades"
-
-    # Security-only automatic updates — reboot at 03:00 if needed (outside school hours)
-    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-EOF
-
-    cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
-Unattended-Upgrade::Origins-Pattern {
-    "origin=Debian,codename=${distro_codename},label=Debian-Security";
-    "origin=Raspbian,codename=${distro_codename},label=Raspbian";
-    "origin=Raspberry Pi Foundation,codename=${distro_codename},label=Raspberry Pi Foundation";
-};
-Unattended-Upgrade::Package-Blacklist {};
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "true";
-Unattended-Upgrade::Automatic-Reboot-Time "03:00";
-EOF
-    ok "unattended-upgrades: security-only, auto-reboot at 03:00"
+        git python3-pip i2c-tools nginx avahi-daemon gcc make
+    ok "git python3-pip i2c-tools nginx avahi-daemon gcc make"
 
     systemctl disable nginx 2>/dev/null || true
     systemctl stop    nginx 2>/dev/null || true
@@ -297,6 +278,24 @@ systemctl disable dphys-swapfile 2>/dev/null || true
 systemctl stop    dphys-swapfile 2>/dev/null || true
 dphys-swapfile swapoff           2>/dev/null || true
 ok "swap: disabled"
+
+# No automatic apt runs: security updates ship through OTA instead. The daily
+# `apt update` (+ unattended-upgrades) was the biggest routine SD writer, and a
+# power cut mid-dpkg (schools unplug things) can leave the OS unbootable.
+# 20auto-upgrades "0" makes apt.systemd.daily a no-op even if a timer fires;
+# the timers are stopped BEFORE masking, as for e2scrub below. Only the timers
+# are stopped, never apt-daily-upgrade.service itself: that could interrupt a
+# dpkg run in progress. unattended-upgrades.service (existing devices) is only
+# disabled, taking effect from the next boot.
+cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl mask apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl reset-failed apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl disable unattended-upgrades.service 2>/dev/null || true
+ok "automatic apt runs: disabled (security updates via OTA)"
 
 # ── 3. Clone / update SchoolAir app ───────────────────────────────────────────
 step "3 / Clone SchoolAir app  →  ${SCHOOLAIR_DIR}"
@@ -510,9 +509,11 @@ step "13 / nginx  (configured, disabled until registration)"
 CERT_FILE="${SCHOOLAIR_DIR}/registration_wizard/cert.pem"
 KEY_FILE="${SCHOOLAIR_DIR}/registration_wizard/key.pem"
 cat > /etc/nginx/sites-available/default << NGINXEOF
+# access_log off: a line on the SD card per dashboard request — nobody reads it.
 server {
     listen 80;
     server_name _;
+    access_log off;
     location / {
         proxy_pass http://127.0.0.1:${TELEMETRY_PORT};
         proxy_http_version 1.1;
@@ -525,6 +526,7 @@ server {
 server {
     listen 443 ssl;
     server_name _;
+    access_log off;
     ssl_certificate     ${CERT_FILE};
     ssl_certificate_key ${KEY_FILE};
     location / {
@@ -818,7 +820,7 @@ chk() {
 }
 
 chk "hostname is schoolair-*"              bash -c '[[ "$(hostname)" == schoolair-* ]]'
-chk "unattended-upgrades configured"      test -f /etc/apt/apt.conf.d/50unattended-upgrades
+chk "automatic apt runs disabled"        grep -q 'Unattended-Upgrade "0"' /etc/apt/apt.conf.d/20auto-upgrades
 chk "journald volatile"                   grep -q "Storage=volatile" /etc/systemd/journald.conf.d/00-schoolair.conf
 chk "swap disabled"                       bash -c "! systemctl is-enabled dphys-swapfile 2>/dev/null"
 chk "microdot importable"                  python3 -c "import microdot"
