@@ -1,0 +1,24 @@
+[Unit]
+Description=SchoolAir wilting flower: moves the stem to match CO2 and PM2.5
+# Needs the pigpio daemon for step timing and the endnode's queue.db for readings.
+After=pigpiod.service schoolair.service network.target
+Wants=pigpiod.service
+# A pigpiod restart (the firmware's OTA update does one) kills our socket and
+# any move in progress: stop and start with it, so the position is marked
+# unknown by our own SIGTERM handler and re-homed, instead of crashing mid-move.
+PartOf=pigpiod.service
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/flower
+ExecStart=/usr/bin/python3 /home/admin/flower/flower_service.py
+Restart=on-failure
+RestartSec=10
+# /run/schoolair-flower holds the boot marker: absent on the first start after
+# power-up, so the cold-boot self-test runs once per power cycle, not per restart.
+RuntimeDirectory=schoolair-flower
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target
