@@ -37,7 +37,8 @@ from datetime import datetime, timezone, timedelta, time
 from pathlib import Path
 import httpx
 from dotenv import load_dotenv
-from services.sensor import read_sensor, extract_metric, average_readings, probe_aux_sensors, read_aux_sensor
+from services.sensor import (read_sensor, extract_metric, average_readings, probe_aux_sensors,
+                             read_aux_sensor, set_temperature_offset)
 import db.queue as queue
 import device_identity
 from atomic_file import write_atomic
@@ -98,7 +99,7 @@ def _confirm_update_if_pending() -> None:
     except OSError as e:
         print(f"[OTA] Warning: could not clear pending-update marker: {e}")
 
-VERSION = "2.3.13"
+VERSION = "2.3.14"
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
@@ -217,6 +218,22 @@ def load_settings() -> dict:
     except json.JSONDecodeError:
         print("settings.json is malformed — using defaults")
         return dict(DEFAULT_SETTINGS)
+
+
+TEMP_OFFSET_KEY = "temp_offset_c"
+
+
+def _temperature_offset(settings: dict) -> float:
+    """This unit's SEN6x temperature correction in °C: settings.json
+    "temp_offset_c" (e.g. -4.7 when the sensor reads 4.7 °C high in its dock),
+    default 0. settings.json survives updates, so it is set once per unit:
+    edit the file and restart schoolair. Anything that isn't a number between
+    -20 and 20 is ignored (0), so a typo can't wreck the readings."""
+    value = settings.get(TEMP_OFFSET_KEY, 0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not -20 <= value <= 20:
+        print(f"[settings] {TEMP_OFFSET_KEY}={value!r} ignored — needs a number of °C between -20 and 20")
+        return 0.0
+    return float(value)
 
 
 def _ensure_drain_jitter(settings: dict) -> int:
@@ -1303,6 +1320,9 @@ async def ingest_loop():
     _settings = load_settings()
     validate_settings(_settings)
     _settings_event = asyncio.Event()
+    # Always sent, 0 included: an offset set earlier survives a service
+    # restart on the sensor, so changing it back to 0 must reach it too.
+    set_temperature_offset(_temperature_offset(_settings))
     active_sensors = probe_aux_sensors()
     print(
         f"Ingest started — "

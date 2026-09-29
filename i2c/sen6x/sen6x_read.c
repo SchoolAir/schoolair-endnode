@@ -12,10 +12,16 @@
  *                       sample).  Run once at boot by sen6x.service before
  *                       the telemetry service starts.
  *
+ *   sen6x_read --temp-offset <C>
+ *                       Set the sensor's temperature offset (self-heating in
+ *                       the enclosure), e.g. -4.7. Volatile; see
+ *                       do_temp_offset(). Prints {"temp_offset_c": ...}.
+ *
  * Exit codes:
  *   0   Success — valid JSON on stdout.
  *   1   I2C / sensor communication error.
  *   2   Sensor not ready after all retries.
+ *   3   Bad --temp-offset argument.
  *
  * JSON output:
  *   {"sen6x": {"measured_at": "2026-06-24T12:05:01Z", "temp": 22.50, ...}}
@@ -196,6 +202,39 @@ static int do_read(sensor_type_t type) {
 }
 
 
+/* ── --temp-offset path ─────────────────────────────────────────────────── */
+
+/* Correct the sensor's temperature for self-heating in its enclosure (the dock
+ * sits next to the Pi): T_compensated = T + offset. The sensor applies it
+ * itself and also uses the compensated temperature for its humidity reading,
+ * which subtracting in software could not do. Allowed while measuring. It is
+ * volatile (a sensor reset clears it), so services/sensor.py sends it at every
+ * telemetry start and after every re-init. Offset slot 0, slope 0, applied at
+ * once (time constant 0).
+ *
+ * Prints {"temp_offset_c": <value>} on stdout when the sensor accepted it, so
+ * the caller can tell this binary from an older one that doesn't know the
+ * option (that one would just print a reading). */
+static int do_temp_offset(sensor_type_t type, const char *arg) {
+    char *end = NULL;
+    double c = strtod(arg, &end);
+    if (end == arg || *end != '\0' || c < -20.0 || c > 20.0) {
+        fprintf(stderr, "[sen6x_read] --temp-offset needs a number of degrees C between -20 and 20\n");
+        return 3;
+    }
+    int16_t scaled = (int16_t)(c * 200.0 + (c >= 0 ? 0.5 : -0.5));   /* datasheet: value / 200 = degrees C */
+    int16_t error = (type == SEN63C)
+        ? sen63c_set_temperature_offset_parameters(scaled, 0, 0, 0)
+        : sen65_set_temperature_offset_parameters(scaled, 0, 0, 0);
+    if (error != NO_ERROR) {
+        fprintf(stderr, "[sen6x_read] set temperature offset failed: I2C error %d\n", error);
+        return 1;
+    }
+    printf("{\"temp_offset_c\": %.3f}\n", scaled / 200.0);
+    return 0;
+}
+
+
 /* ── Entry point ────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
@@ -212,5 +251,12 @@ int main(int argc, char *argv[]) {
     if (type == SEN65)
         sen65_init(0x6b);
 
+    if (argc > 1 && strcmp(argv[1], "--temp-offset") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "usage: sen6x_read --temp-offset <degrees C>\n");
+            return 3;
+        }
+        return do_temp_offset(type, argv[2]);
+    }
     return init_mode ? do_init(type) : do_read(type);
 }

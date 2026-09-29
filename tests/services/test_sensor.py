@@ -55,6 +55,45 @@ def _proc(stdout="", returncode=0, stderr=""):
     return m
 
 
+# ── Temperature offset ────────────────────────────────────────────────────────
+# The SEN6x corrects itself (and its humidity) when told; it forgets on reset.
+
+def test_set_temperature_offset_sends_it_to_the_sensor(monkeypatch):
+    monkeypatch.setattr(sensor, "_REINIT_BIN", "/bin/sen6x_read")
+    with patch("subprocess.run", return_value=_proc('{"temp_offset_c": -4.700}')) as run:
+        assert sensor.set_temperature_offset(-4.7) is True
+    assert run.call_args[0][0] == ["/bin/sen6x_read", "--temp-offset", "-4.7"]
+
+
+def test_an_older_sen6x_read_is_not_taken_as_success(monkeypatch):
+    """An old binary ignores the option and prints a reading, exit 0."""
+    monkeypatch.setattr(sensor, "_REINIT_BIN", "/bin/sen6x_read")
+    with patch("subprocess.run", return_value=_proc('{"sen6x": {"temp": 28.8}}')):
+        assert sensor.set_temperature_offset(-4.7) is False
+
+
+def test_a_rejected_offset_is_reported_not_raised(monkeypatch):
+    monkeypatch.setattr(sensor, "_REINIT_BIN", "/bin/sen6x_read")
+    with patch("subprocess.run", return_value=_proc("", returncode=1, stderr="I2C error")):
+        assert sensor.set_temperature_offset(-4.7) is False
+
+
+def test_no_offset_is_sent_in_mock_mode(monkeypatch):
+    monkeypatch.setattr(sensor, "_REINIT_BIN", "")
+    with patch("subprocess.run") as run:
+        assert sensor.set_temperature_offset(-4.7) is False
+    run.assert_not_called()
+
+
+def test_a_reinit_sends_the_offset_again(monkeypatch):
+    """A re-init may reset the sensor, which clears the offset."""
+    monkeypatch.setattr(sensor, "_REINIT_BIN", "/bin/sen6x_read")
+    monkeypatch.setattr(sensor, "_temp_offset_c", -4.7)
+    with patch("subprocess.run", side_effect=[_proc("{}"), _proc('{"temp_offset_c": -4.7}')]) as run:
+        sensor._try_reinit()
+    assert [c[0][0][1] for c in run.call_args_list] == ["--init", "--temp-offset"]
+
+
 # ── "No valid value" codes ────────────────────────────────────────────────────
 
 def test_drop_no_value_codes_replaces_sentinels_with_none():
