@@ -95,11 +95,20 @@ schoolair-netwatch       Persistent — monitors WiFi after boot. On uplink loss
 
 ### Latest reading file
 
-Every reading the telemetry process takes is also written, atomically, to
-`/run/schoolair/latest.json`:
+Every sample the telemetry process takes (once a minute, `SAMPLE_INTERVAL`) is
+written, atomically, to `/run/schoolair/latest.json`. A metric the sensor had no
+valid value for is `null`:
 
 ```json
 {"data": {"sen6x": {"co2": 742, "pm25": 0.8, "temp": 28.5, ...}}, "recorded_at": "2026-09-28T21:31:43+00:00"}
+```
+
+If a read fails altogether, the file says so instead of keeping the last good
+reading, so a consumer can react at once rather than wait for the reading to go
+stale:
+
+```json
+{"data": null, "recorded_at": "2026-09-29T21:40:00+00:00", "error": "Sensor script failed: ..."}
 ```
 
 This is the interface for other services on the same Pi that need the current
@@ -135,13 +144,44 @@ holds, and deletes it when it has a reading again. That request can only turn
 refreshed for 5 minutes is ignored. It has its own file because the shared
 `/run/schoolair-led-state` is rewritten to "ok" by every upload.
 
+### Installing the flower
+
+The flower's code lives in `SchoolAir/Flower-End-node`. `deploy/flower.ref`
+pins the commit this firmware installs. Setup and every OTA update fetch that
+commit on indoor units and install it into `~/flower`, backing up what they
+replace so a rollback restores the previous flower too. `calibration.json` is
+created once and never replaced. A pin that is already installed is skipped, and
+a failed fetch only warns. To ship a new flower version, test it on a bench
+unit, push it, and bump `deploy/flower.ref`.
+
+The service is installed and enabled on every indoor unit. A drop-in
+(`deploy/schoolair-flower-fitted.conf`) lets it start only when both of these
+are true:
+
+- **A flower is fitted.** The AQU dock's harness ties GPIO26 (physical pin 37)
+  to ground (pin 39). `detect_flower.sh` switches on the pull-up and reads the
+  pin: low means a strap, and it creates `/etc/schoolair-flower-fitted`. It runs
+  at a clone's first boot and on every setup/update. `prepare_image.sh` removes
+  the marker from golden images. A unit without the harness (the bench unit) is
+  marked by hand: `sudo touch /etc/schoolair-flower-fitted`.
+- **pigpiod is installed** (`/var/lib/schoolair-pigpio-installed`). On a new
+  unit that happens only once the network is up. `schoolair-pigpio-setup.service`
+  then starts the flower.
+
+Updates restart pigpiod only when its drop-in changed, and restart the flower
+only when its pin changed. Both first wait for any move in progress to finish
+(`wait_for_flower_move`).
+
 ### Telemetry process
 
 `main.py` runs two concurrent coroutines:
 
-- **Ingest loop** — reads the sensor on a clock-aligned schedule (5 min during
-  the active window, 15 min outside it), buffers readings in RAM, and drains
-  them to the server in batches. When a reading breaches a threshold it launches
+- **Ingest loop** — samples the sensor every minute and publishes each sample
+  locally (see *Latest reading file*). On a clock-aligned schedule (5 min during
+  the active window, 15 min outside it) the mean of that interval's samples
+  becomes one reading, which is uploaded at once or kept in SQLite and drained
+  to the server in batches. SEN6x "no valid value" codes (CO2 32766/32767,
+  PM 6553.5, …) are recorded as `null` and left out of the mean. When a reading breaches a threshold it launches
   a shared two-stage verification task (see below) to distinguish spikes from
   real events before sending an alert.
 
@@ -321,8 +361,9 @@ Pi reads and drains at the higher cadence (school hours).
 
 | Env var                  | Default   | Meaning                        |
 |--------------------------|-----------|--------------------------------|
-| `READ_INTERVAL_ACTIVE`   | `300` s   | 5 min — sensor read cadence inside the window  |
-| `READ_INTERVAL_IDLE`     | `900` s   | 15 min — sensor read cadence outside the window |
+| `SAMPLE_INTERVAL`        | `60` s    | 1 min — local sensor read and `latest.json` cadence |
+| `READ_INTERVAL_ACTIVE`   | `300` s   | 5 min — upload cadence inside the window (mean of its samples) |
+| `READ_INTERVAL_IDLE`     | `900` s   | 15 min — upload cadence outside the window (mean of its samples) |
 | `DRAIN_INTERVAL_ACTIVE`  | `1800` s  | 30 min — max time between drains inside the window |
 | `DRAIN_INTERVAL_IDLE`    | `7200` s  | 2 hr — max time between drains outside the window  |
 

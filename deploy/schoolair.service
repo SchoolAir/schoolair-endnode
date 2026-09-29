@@ -10,13 +10,11 @@ WorkingDirectory=/home/admin/schoolair
 ExecStart=/home/admin/schoolair/.venv/bin/python -u /home/admin/schoolair/main.py
 Restart=on-failure
 RestartSec=10
-# /run/schoolair (tmpfs, owned by admin) holds device_identity.MISMATCH_FILE for
-# the wizard and netwatch.sh. Preserved across stop/restart; a reboot wipes it.
-RuntimeDirectory=schoolair
-RuntimeDirectoryPreserve=yes
 Environment=PYTHONUNBUFFERED=1
-# /run/schoolair (tmpfs) holds latest.json, the current reading published for
-# other local services such as the wilting-flower actuator. See state.py.
+# /run/schoolair (tmpfs, owned by admin) holds device_identity.MISMATCH_FILE for
+# the wizard and netwatch.sh, and latest.json, the current reading published
+# for other local services such as the wilting flower (see state.py).
+# Preserved across stop/restart; a reboot wipes it.
 RuntimeDirectory=schoolair
 RuntimeDirectoryPreserve=yes
 Environment=LATEST_READING_FILE=/run/schoolair/latest.json

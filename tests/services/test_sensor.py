@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 import services.sensor as sensor
-from services.sensor import extract_metric, read_sensor
+from services.sensor import extract_metric, read_sensor, drop_no_value_codes, average_readings
 
 
 # ── extract_metric ─────────────────────────────────────────────────────────────
@@ -53,6 +53,73 @@ def _proc(stdout="", returncode=0, stderr=""):
     m = MagicMock()
     m.stdout, m.returncode, m.stderr = stdout, returncode, stderr
     return m
+
+
+# ── "No valid value" codes ────────────────────────────────────────────────────
+
+def test_drop_no_value_codes_replaces_sentinels_with_none():
+    """CO2 32766 wilted the bench flower four times on 2026-09-29."""
+    data = {"sen6x": {"co2": 32766, "pm25": 6553.5, "pm10": 6553.5, "temp": 163.83,
+                      "humidity": 327.67, "measured_at": "2026-09-29T12:05:00Z"}}
+    drop_no_value_codes(data)
+    assert data["sen6x"] == {"co2": None, "pm25": None, "pm10": None, "temp": None,
+                             "humidity": None, "measured_at": "2026-09-29T12:05:00Z"}
+
+
+def test_drop_no_value_codes_catches_32767_and_voc_nox():
+    data = {"sen6x": {"co2": 32767, "voc": 3276.7, "nox": 3276.7}}
+    drop_no_value_codes(data)
+    assert data["sen6x"] == {"co2": None, "voc": None, "nox": None}
+
+
+def test_drop_no_value_codes_keeps_real_values():
+    """Stuffy classrooms and smoky days are data, not faults."""
+    real = {"co2": 5000, "pm25": 450.3, "temp": 38.5, "humidity": 99.9, "voc": 500.0}
+    data = {"sen6x": dict(real)}
+    drop_no_value_codes(data)
+    assert data["sen6x"] == real
+
+
+def test_drop_no_value_codes_leaves_aux_sensors_alone():
+    data = {"sen6x": {"co2": 700}, "o3": {"o3": 6553.5}}
+    drop_no_value_codes(data)
+    assert data["o3"] == {"o3": 6553.5}
+
+
+def test_read_sensor_returns_none_for_no_value_codes():
+    payload = {"sen6x": {"co2": 32766, "pm25": 3.1}}
+    with patch("subprocess.run", return_value=_proc(json.dumps(payload))):
+        assert read_sensor() == {"sen6x": {"co2": None, "pm25": 3.1}}
+
+
+# ── average_readings ──────────────────────────────────────────────────────────
+
+def test_average_readings_means_each_field_and_keeps_the_shape():
+    samples = [
+        {"sen6x": {"co2": 700, "pm25": 1.0, "measured_at": "t1"}},
+        {"sen6x": {"co2": 801, "pm25": 2.5, "measured_at": "t2"}},
+    ]
+    assert average_readings(samples) == {"sen6x": {"co2": 750, "pm25": 1.75, "measured_at": "t2"}}
+
+
+def test_average_readings_skips_none_instead_of_counting_it():
+    samples = [{"sen6x": {"co2": 600}}, {"sen6x": {"co2": None}}, {"sen6x": {"co2": 800}}]
+    assert average_readings(samples) == {"sen6x": {"co2": 700}}
+
+
+def test_average_readings_all_none_stays_none():
+    samples = [{"sen6x": {"co2": None, "pm25": 1.0}}, {"sen6x": {"co2": None, "pm25": 3.0}}]
+    assert average_readings(samples) == {"sen6x": {"co2": None, "pm25": 2.0}}
+
+
+def test_average_readings_includes_fields_present_in_some_samples_only():
+    samples = [{"sen6x": {"co2": 600}}, {"sen6x": {"co2": 600}, "o3": {"o3": 12.5}}]
+    assert average_readings(samples) == {"sen6x": {"co2": 600}, "o3": {"o3": 12.5}}
+
+
+def test_average_readings_of_one_sample_is_that_sample():
+    sample = {"sen6x": {"co2": 400, "temp": 21.37, "measured_at": "t"}}
+    assert average_readings([sample]) == sample
 
 
 def test_read_sensor_parses_json_output():
