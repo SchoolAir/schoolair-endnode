@@ -128,6 +128,13 @@ step "Resetting hostname"
 sudo bash "${ADMIN_HOME}/set_hostname.sh" "schoolair-template" > /dev/null
 ok "Hostname → schoolair-template  (Pi Imager can override per-device when flashing)"
 
+# ── 8b. Wilting flower marker ─────────────────────────────────────────────────
+step "Removing the flower-fitted marker"
+# detect_flower.sh re-creates it at each clone's first boot if its dock has
+# the strap; left here, every clone of this image would think it has a flower.
+sudo rm -f /etc/schoolair-flower-fitted
+ok "/etc/schoolair-flower-fitted removed — each clone checks its own strap"
+
 # ── 9. SSH host keys ──────────────────────────────────────────────────────────
 step "Removing SSH host keys"
 sudo rm -f /etc/ssh/ssh_host_*

@@ -2,9 +2,14 @@
 
 Write-through pipeline with local fallback and server-controlled backlog drain:
 
-  Read loop   — collects a sensor reading every READ_ACTIVE_SECONDS (active
-                window) or READ_IDLE_SECONDS (outside window), aligned to the
-                device's upload offset, and signals _live_event.
+  Read loop   — samples the sensors every SAMPLE_SECONDS and publishes each
+                sample locally (state.set → /run/schoolair/latest.json), so
+                services on this Pi such as the wilting flower follow the room
+                within a minute. Every READ_ACTIVE_SECONDS (active window) or
+                READ_IDLE_SECONDS (outside it), aligned to the device's upload
+                offset, the mean of that interval's samples becomes the one
+                reading to upload, and _live_event is signalled. Sampling faster
+                does not upload more often.
 
   Upload loop — on each live reading: POSTs immediately to the server with
                 the current backlog count; falls back to SQLite on failure.
@@ -32,7 +37,7 @@ from datetime import datetime, timezone, timedelta, time
 from pathlib import Path
 import httpx
 from dotenv import load_dotenv
-from services.sensor import read_sensor, extract_metric, probe_aux_sensors, read_aux_sensor
+from services.sensor import read_sensor, extract_metric, average_readings, probe_aux_sensors, read_aux_sensor
 import db.queue as queue
 import device_identity
 import jobs.aggregate as aggregate
@@ -92,7 +97,7 @@ def _confirm_update_if_pending() -> None:
     except OSError as e:
         print(f"[OTA] Warning: could not clear pending-update marker: {e}")
 
-VERSION = "2.3.11"
+VERSION = "2.3.12"
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
@@ -114,9 +119,16 @@ _SECONDARY_AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
 ALERT_NEAR_PCT        = float(os.getenv("ALERT_NEAR_PCT", 10))
 ALERT_COOLDOWN_HRS    = float(os.getenv("ALERT_COOLDOWN_HOURS", 1))
 
-# Read intervals (not user-configurable; env vars for testing only)
+# Upload intervals: one reading goes to the server per interval (not
+# user-configurable; env vars for testing only). The names predate sampling,
+# when every read was also an upload.
 READ_ACTIVE_SECONDS   = int(os.getenv("READ_INTERVAL_ACTIVE",  300))   # 5 min
 READ_IDLE_SECONDS     = int(os.getenv("READ_INTERVAL_IDLE",    900))   # 15 min
+
+# Local sample interval: how often the sensor is read and latest.json updated.
+# Samples between two uploads are averaged into that upload. At or above the
+# upload interval, every sample is an upload again (the original behaviour).
+SAMPLE_SECONDS        = int(os.getenv("SAMPLE_INTERVAL",        60))   # 1 min
 
 # Drain interval constants kept as reference (no longer drive a timer)
 DRAIN_ACTIVE_SECONDS  = int(os.getenv("DRAIN_INTERVAL_ACTIVE", 1800))
@@ -135,6 +147,7 @@ NTP_STEP_THRESHOLD_S = 30  # divergence above this (seconds) indicates an NTP st
 
 # ── Upload state ──────────────────────────────────────────────────────────────
 
+_samples:           list[dict]    = []     # this upload interval's samples, oldest first
 _pending_live:      dict | None   = None   # reading ready to POST (set by _run_read)
 _live_event:        asyncio.Event | None = None  # signalled when _pending_live is ready
 _credit_bytes:      int   = 0              # server-granted byte budget; always overwritten
@@ -921,7 +934,8 @@ def _maybe_trigger_update(response: dict) -> None:
 
 async def _handle_response(response: dict) -> None:
     """Process server directives from any successful ingest response."""
-    if response.get("criteria"):
+    # Every successful upload carries the criteria; only a change is worth an SD write.
+    if response.get("criteria") and response["criteria"] != load_criteria():
         save_criteria(response["criteria"])
     _maybe_trigger_update(response)
     schedule = response.get("schedule")
@@ -998,17 +1012,19 @@ async def _ntp_correction_task():
 # ── Read step ─────────────────────────────────────────────────────────────────
 
 
-async def _run_read(settings: dict, active_sensors: list):
-    """Read one sensor sample, check for breaches, signal the upload loop."""
-    global _pending_live
-
-    recorded_at = datetime.now(timezone.utc).isoformat()
+def _take_sample(active_sensors: list, recorded_at: str | None = None) -> dict | None:
+    """Read the sensors once, publish the result locally and keep it for the
+    next upload's mean. Returns the reading, or None if the SEN6x read failed
+    (aux sensors are optional: a failed one is just missing from the reading)."""
+    if recorded_at is None:
+        recorded_at = datetime.now(timezone.utc).isoformat()
     try:
         data = read_sensor()
     except RuntimeError as e:
         print(f"Sensor read failed: {e}")
         _set_led_state("no_sensor")
-        return
+        state.publish_error(str(e), recorded_at)
+        return None
 
     for sensor in active_sensors:
         reading = read_aux_sensor(sensor)
@@ -1016,10 +1032,30 @@ async def _run_read(settings: dict, active_sensors: list):
             data.update(reading)
 
     state.set(data, recorded_at)
-    entry = {"data": data, "recorded_at": recorded_at, "severity": 0}
+    _samples.append(data)
+    return data
 
-    criteria = load_criteria()
+
+async def _run_read(settings: dict, active_sensors: list):
+    """Upload boundary: take one more sample, check it for breaches, and hand
+    the mean of this interval's samples to the upload loop.
+
+    Alerts look at the boundary sample itself, as they did when it was the only
+    read: a mean would dilute the spike that verification then re-checks. If
+    that sample fails, the interval's earlier samples are still uploaded."""
+    global _pending_live, _samples
+
+    recorded_at = datetime.now(timezone.utc).isoformat()
+    data = _take_sample(active_sensors, recorded_at)
+    samples, _samples = _samples, []
+    if not samples:
+        return  # no successful read this interval: nothing to send
+
+    entry = {"data": average_readings(samples), "recorded_at": recorded_at, "severity": 0}
+
+    criteria = load_criteria() if data is not None else []
     if criteria:
+        sample_entry = {"data": data, "recorded_at": recorded_at, "severity": 0}
         now = datetime.now(timezone.utc)
         breaching: list[tuple[str, dict]] = []
         for criterion in criteria:
@@ -1045,7 +1081,7 @@ async def _run_read(settings: dict, active_sensors: list):
         if breaching:
             for metric, _ in breaching:
                 _verifying.add(metric)
-            asyncio.create_task(_verify_all(breaching, entry))
+            asyncio.create_task(_verify_all(breaching, sample_entry))
 
     # Signal upload loop — overwrites any previous unsent reading
     _pending_live = entry
@@ -1215,8 +1251,25 @@ async def _read_loop(active_sensors: list):
         offset   = _get_upload_offset(_settings)  # re-read in case settings changed
         delay    = _seconds_to_next_boundary(interval, offset)
         mode     = "active" if curr_active else "idle"
-        print(f"[read/{mode}] next in {delay:.0f}s (offset={offset}s)")
-        await _wait_for_boundary(delay)
+        print(f"[read/{mode}] next upload in {delay:.0f}s (offset={offset}s), sampling every {SAMPLE_SECONDS}s")
+        await _sample_until_boundary(delay, active_sensors)
+
+
+async def _sample_until_boundary(seconds: float, active_sensors: list) -> None:
+    """Between two uploads: take a sample every SAMPLE_SECONDS until the next
+    upload boundary, `seconds` from now. Returns at the boundary, or early when
+    the active window changes (the read loop then uploads at once, as before).
+    Samples are not logged: one line a minute would only wear the SD card."""
+    deadline = _time_mod.monotonic() + seconds
+    while True:
+        remaining = deadline - _time_mod.monotonic()
+        if remaining <= SAMPLE_SECONDS:
+            await _wait_for_boundary(remaining)
+            return
+        await _wait_for_boundary(SAMPLE_SECONDS)
+        if _settings_event is not None and _settings_event.is_set():
+            return
+        _take_sample(active_sensors)
 
 
 async def _enter_identity_lockout() -> None:
@@ -1252,7 +1305,7 @@ async def ingest_loop():
     active_sensors = probe_aux_sensors()
     print(
         f"Ingest started — "
-        f"reads {READ_ACTIVE_SECONDS}s/{READ_IDLE_SECONDS}s (active/idle) | "
+        f"samples every {SAMPLE_SECONDS}s, uploads {READ_ACTIVE_SECONDS}s/{READ_IDLE_SECONDS}s (active/idle) | "
         f"write-through with SQLite fallback"
         + (f" | aux sensors: {', '.join(s['name'] for s in active_sensors)}" if active_sensors else "")
     )

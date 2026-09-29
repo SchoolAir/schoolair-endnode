@@ -163,6 +163,18 @@ install_dir_with_backup() {
     cp -r "${src}/." "${dst}/"
 }
 
+wait_for_flower_move() {
+    # Restarting pigpiod or schoolair-flower mid-move loses the flower's
+    # position and costs a full re-home. /run/schoolair-flower/moving exists
+    # only during a move; the longest, a blind home (65 mm down at ~1.5 s/mm),
+    # takes about 100 s. Give up after 150 s: the flower then re-homes, safely.
+    local i
+    for i in $(seq 1 150); do
+        [ -e /run/schoolair-flower/moving ] || return 0
+        sleep 1
+    done
+}
+
 restore_from_backup() {
     # Inline fallback used only if ~/schoolair_rollback.sh doesn't exist yet
     # (the very first rollout of this mechanism) — same logic as that
@@ -250,27 +262,8 @@ if [[ "$MODE" == "setup" ]]; then
     step "2 / System packages"
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades
-    ok "git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades"
-
-    # Security-only automatic updates — reboot at 03:00 if needed (outside school hours)
-    cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-EOF
-
-    cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
-Unattended-Upgrade::Origins-Pattern {
-    "origin=Debian,codename=${distro_codename},label=Debian-Security";
-    "origin=Raspbian,codename=${distro_codename},label=Raspbian";
-    "origin=Raspberry Pi Foundation,codename=${distro_codename},label=Raspberry Pi Foundation";
-};
-Unattended-Upgrade::Package-Blacklist {};
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "true";
-Unattended-Upgrade::Automatic-Reboot-Time "03:00";
-EOF
-    ok "unattended-upgrades: security-only, auto-reboot at 03:00"
+        git python3-pip i2c-tools nginx avahi-daemon gcc make
+    ok "git python3-pip i2c-tools nginx avahi-daemon gcc make"
 
     systemctl disable nginx 2>/dev/null || true
     systemctl stop    nginx 2>/dev/null || true
@@ -297,6 +290,24 @@ systemctl disable dphys-swapfile 2>/dev/null || true
 systemctl stop    dphys-swapfile 2>/dev/null || true
 dphys-swapfile swapoff           2>/dev/null || true
 ok "swap: disabled"
+
+# No automatic apt runs: security updates ship through OTA instead. The daily
+# `apt update` (+ unattended-upgrades) was the biggest routine SD writer, and a
+# power cut mid-dpkg (schools unplug things) can leave the OS unbootable.
+# 20auto-upgrades "0" makes apt.systemd.daily a no-op even if a timer fires;
+# the timers are stopped BEFORE masking, as for e2scrub below. Only the timers
+# are stopped, never apt-daily-upgrade.service itself: that could interrupt a
+# dpkg run in progress. unattended-upgrades.service (existing devices) is only
+# disabled, taking effect from the next boot.
+cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl mask apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl reset-failed apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl disable unattended-upgrades.service 2>/dev/null || true
+ok "automatic apt runs: disabled (security updates via OTA)"
 
 # ── 3. Clone / update SchoolAir app ───────────────────────────────────────────
 step "3 / Clone SchoolAir app  →  ${SCHOOLAIR_DIR}"
@@ -326,7 +337,7 @@ rm -rf "$REPO_DIR"
 # executable bit on scripts systemd invokes directly. netwatch.sh was once
 # committed non-executable and every OTA silently reproduced the crash-loop
 # until this was added.
-chmod +x "${WIZARD_DIR}/launcher.sh" "${WIZARD_DIR}/netwatch.sh" 2>/dev/null || true
+chmod +x "${WIZARD_DIR}/launcher.sh" "${WIZARD_DIR}/netwatch.sh" "${SCHOOLAIR_DIR}/detect_flower.sh" 2>/dev/null || true
 
 # ── 4. Python dependencies ─────────────────────────────────────────────────────
 step "4 / Python dependencies"
@@ -510,9 +521,11 @@ step "13 / nginx  (configured, disabled until registration)"
 CERT_FILE="${SCHOOLAIR_DIR}/registration_wizard/cert.pem"
 KEY_FILE="${SCHOOLAIR_DIR}/registration_wizard/key.pem"
 cat > /etc/nginx/sites-available/default << NGINXEOF
+# access_log off: a line on the SD card per dashboard request — nobody reads it.
 server {
     listen 80;
     server_name _;
+    access_log off;
     location / {
         proxy_pass http://127.0.0.1:${TELEMETRY_PORT};
         proxy_http_version 1.1;
@@ -525,6 +538,7 @@ server {
 server {
     listen 443 ssl;
     server_name _;
+    access_log off;
     ssl_certificate     ${CERT_FILE};
     ssl_certificate_key ${KEY_FILE};
     location / {
@@ -570,10 +584,65 @@ done
 # pigpiod (indoor units) must start at the very beginning of boot so the
 # status LED can light early — see the header of deploy/pigpiod-early.conf.
 # Harmless on outdoor units, where pigpiod doesn't exist.
+# Remember whether the drop-in actually changed: only then does the update
+# below need to restart pigpiod (see there).
+PIGPIOD_CONF_CHANGED=0
 if [ -f "${DEPLOY_DIR}/pigpiod-early.conf" ]; then
     mkdir -p /etc/systemd/system/pigpiod.service.d
+    if ! cmp -s "${DEPLOY_DIR}/pigpiod-early.conf" /etc/systemd/system/pigpiod.service.d/schoolair-early.conf; then
+        PIGPIOD_CONF_CHANGED=1
+    fi
     install_with_backup "${DEPLOY_DIR}/pigpiod-early.conf" /etc/systemd/system/pigpiod.service.d/schoolair-early.conf
     ok "pigpiod early-start drop-in installed"
+fi
+
+# ── Wilting flower (indoor units) ─────────────────────────────────────────────
+# The flower's motor control lives in its own repository, SchoolAir/
+# Flower-End-node, pinned to one commit by deploy/flower.ref. It is installed on
+# every indoor unit (a few tens of KB), so a golden image carries it; the
+# drop-in deploy/schoolair-flower-fitted.conf lets it run only where
+# detect_flower.sh found the dock's strap and pigpiod is installed. Everything
+# it replaces goes through install_with_backup, so an OTA rollback restores the
+# previous flower too. None of this may fail an update: without the network or
+# the pinned commit, the installed flower stays as it is.
+FLOWER_CHANGED=0
+FLOWER_DIR="${ADMIN_HOME}/flower"
+FLOWER_REPO_URL="https://github.com/SchoolAir/Flower-End-node.git"
+FLOWER_REF="$(grep -v '^#' "${DEPLOY_DIR}/flower.ref" 2>/dev/null | tr -d '[:space:]')"
+if grep -qs indoor /etc/schoolair-unit-type && [ -n "$FLOWER_REF" ]; then
+    bash "${SCHOOLAIR_DIR}/detect_flower.sh" || true
+    if [ "$(cat "${FLOWER_DIR}/.installed-ref" 2>/dev/null)" = "$FLOWER_REF" ]; then
+        ok "Wilting flower ${FLOWER_REF:0:7} already installed"
+    else
+        FLOWER_TMP="$(mktemp -d)"
+        if git -C "$FLOWER_TMP" init -q \
+            && git -C "$FLOWER_TMP" fetch -q --depth 1 "$FLOWER_REPO_URL" "$FLOWER_REF" \
+            && git -C "$FLOWER_TMP" checkout -q FETCH_HEAD; then
+            mkdir -p "$FLOWER_DIR" /etc/systemd/system/schoolair-flower.service.d
+            for f in flower_service.py step.py; do
+                install_with_backup "${FLOWER_TMP}/${f}" "${FLOWER_DIR}/${f}"
+                chmod 755 "${FLOWER_DIR}/${f}"
+            done
+            # calibration.json holds this unit's position and any measured
+            # positions: only ever created, never replaced.
+            if [ ! -f "${FLOWER_DIR}/calibration.json" ]; then
+                install_with_backup "${FLOWER_TMP}/calibration.example.json" "${FLOWER_DIR}/calibration.json"
+            fi
+            echo "$FLOWER_REF" > "${FLOWER_TMP}/.installed-ref"
+            install_with_backup "${FLOWER_TMP}/.installed-ref" "${FLOWER_DIR}/.installed-ref"
+            chown -R "${ADMIN_USER}:${ADMIN_USER}" "$FLOWER_DIR"
+            install_with_backup "${FLOWER_TMP}/deploy/schoolair-flower.service" /etc/systemd/system/schoolair-flower.service
+            FLOWER_CHANGED=1
+            ok "Wilting flower ${FLOWER_REF:0:7} installed  →  ${FLOWER_DIR}"
+        else
+            warn "Could not fetch Flower-End-node ${FLOWER_REF:0:7} — installed flower left as it is"
+        fi
+        rm -rf "$FLOWER_TMP"
+    fi
+    if [ -f /etc/systemd/system/schoolair-flower.service ]; then
+        mkdir -p /etc/systemd/system/schoolair-flower.service.d
+        install_with_backup "${DEPLOY_DIR}/schoolair-flower-fitted.conf" /etc/systemd/system/schoolair-flower.service.d/schoolair-flower-fitted.conf
+    fi
 fi
 
 # An earlier revision drove GPIO24 high from firmware start via config.txt.
@@ -651,6 +720,8 @@ systemctl enable schoolair-first-boot.service 2>/dev/null || true
 systemctl enable schoolair-pigpio-setup.service 2>/dev/null || true
 systemctl enable schoolair-led.service 2>/dev/null || true
 systemctl enable schoolair-update-watchdog.timer 2>/dev/null || true
+# Enabled wherever it is installed; its drop-in decides whether it runs.
+[ -f /etc/systemd/system/schoolair-flower.service ] && systemctl enable schoolair-flower.service 2>/dev/null || true
 systemctl start  schoolair-update-watchdog.timer 2>/dev/null || true
 ok "Services enabled"
 
@@ -684,16 +755,28 @@ if [[ "$MODE" == "--update" ]]; then
     # *next* boot, it does not start it now. restart (not start) also
     # correctly picks up new led_status.py code on devices where it was
     # already running.
-    # pigpiod first: its command-line (deploy/pigpiod-early.conf, e.g. the 1us sample
-    # rate led_status.py relies on) only takes effect on restart, and led_status.py
-    # reads the resolution once at startup. Harmless if pigpiod isn't installed
-    # (outdoor units). The LED goes dark for a moment.
-    if systemctl cat pigpiod.service &>/dev/null; then
+    # pigpiod first, but only when its drop-in changed: its command-line
+    # (deploy/pigpiod-early.conf, e.g. the 1us sample rate led_status.py relies
+    # on) only takes effect on restart, and led_status.py reads the resolution
+    # once at startup. Otherwise leave it running: restarting pigpiod also
+    # restarts schoolair-flower (PartOf=pigpiod.service) and cuts any move in
+    # progress, which loses the flower's position and costs a full re-home.
+    # When it must restart, wait for a flower move to finish first
+    # (wait_for_flower_move). Harmless if
+    # pigpiod isn't installed (outdoor units). The LED goes dark for a moment.
+    if [ "$PIGPIOD_CONF_CHANGED" = 1 ] && systemctl cat pigpiod.service &>/dev/null; then
+        wait_for_flower_move
         systemctl restart pigpiod.service    || warn "pigpiod.service restart failed"
     fi
     systemctl restart schoolair-led.service      || warn "schoolair-led.service restart failed"
     systemctl restart sen6x.service           || warn "sen6x.service restart failed"
     systemctl restart schoolair.service       || warn "schoolair.service restart failed"
+    # New flower code only takes effect on restart; same wait as for pigpiod.
+    # try-restart: leaves it stopped on units where its drop-in keeps it off.
+    if [ "$FLOWER_CHANGED" = 1 ]; then
+        wait_for_flower_move
+        systemctl try-restart schoolair-flower.service || warn "schoolair-flower.service restart failed"
+    fi
     # schoolair-netwatch.service is a long-running bash process — cp'ing a new
     # netwatch.sh to disk does NOT make its already-running interpreter pick up
     # the change; it keeps executing the old in-memory script until restarted.
@@ -818,7 +901,7 @@ chk() {
 }
 
 chk "hostname is schoolair-*"              bash -c '[[ "$(hostname)" == schoolair-* ]]'
-chk "unattended-upgrades configured"      test -f /etc/apt/apt.conf.d/50unattended-upgrades
+chk "automatic apt runs disabled"        grep -q 'Unattended-Upgrade "0"' /etc/apt/apt.conf.d/20auto-upgrades
 chk "journald volatile"                   grep -q "Storage=volatile" /etc/systemd/journald.conf.d/00-schoolair.conf
 chk "swap disabled"                       bash -c "! systemctl is-enabled dphys-swapfile 2>/dev/null"
 chk "microdot importable"                  python3 -c "import microdot"

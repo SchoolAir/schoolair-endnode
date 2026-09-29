@@ -46,6 +46,93 @@ def _try_reinit() -> None:
         print("[sensor] re-init timed out after 90 s")
 
 
+# ── "No valid value" codes ────────────────────────────────────────────────────
+#
+# When the SEN6x has no valid value for a quantity it does not report an error:
+# it returns the top of that register's range (0xFFFF for the unsigned PM
+# registers, 0x7FFF for the signed ones). After scaling those arrive here as
+# ordinary-looking numbers: PM 6553.5, humidity 327.67, temperature 163.83,
+# VOC/NOx 3276.7, CO2 32767 (32766 was also seen on a SEN63C on 2026-09-29,
+# four times in one day). No room produces anything near these values, so at or
+# above them the value is replaced with None: "no value". JSON writes it as
+# null, the server stores NULL, and every local consumer (alerts, the dashboard,
+# averages, the wilting flower) already skips a missing metric.
+NO_VALUE_AT_OR_ABOVE = {
+    "co2":      32766,
+    "pm10":     6553.5,
+    "pm25":     6553.5,
+    "pm40":     6553.5,
+    "pm100":    6553.5,
+    "humidity": 327.67,
+    "temp":     163.83,
+    "voc":      3276.7,
+    "nox":      3276.7,
+}
+_last_dropped: list[str] = []   # fields replaced in the previous reading, for logging
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def drop_no_value_codes(data: dict) -> dict:
+    """Replace the SEN6x's "no valid value" codes with None, in place.
+
+    Only the "sen6x" block is checked; auxiliary sensors have their own
+    conventions. Returns `data` for convenience.
+    """
+    global _last_dropped
+    sen = data.get("sen6x")
+    if not isinstance(sen, dict):
+        return data
+    dropped = []
+    for key, limit in NO_VALUE_AT_OR_ABOVE.items():
+        value = sen.get(key)
+        if _is_number(value) and value >= limit:
+            sen[key] = None
+            dropped.append(key)
+    # Log changes only: a sensor stuck without CO2 would otherwise print once a minute.
+    if dropped != _last_dropped:
+        if dropped:
+            print(f"[sensor] SEN6x has no valid value for {', '.join(dropped)} — recorded as null")
+        else:
+            print(f"[sensor] SEN6x values valid again ({', '.join(_last_dropped)})")
+        _last_dropped = dropped
+    return data
+
+
+def average_readings(samples: list[dict]) -> dict:
+    """Mean of several nested readings, in the same nested shape.
+
+    Numbers are averaged per sensor and field over the samples that have one;
+    None (no valid value) is left out rather than dragging the mean. A field
+    with no number in any sample stays None. Whole-number fields such as co2
+    stay whole; the rest are rounded to 2 decimals. Anything else (e.g. the
+    sensor's measured_at string) keeps its newest value.
+    """
+    merged: dict = {}
+    numbers: dict[tuple[str, str], list] = {}
+    for sample in samples:
+        for sensor, fields in sample.items():
+            if not isinstance(fields, dict):
+                merged[sensor] = fields
+                continue
+            target = merged.setdefault(sensor, {})
+            for key, value in fields.items():
+                if _is_number(value):
+                    numbers.setdefault((sensor, key), []).append(value)
+                    target.setdefault(key, None)
+                elif value is None:
+                    target.setdefault(key, None)
+                else:
+                    target[key] = value
+    for (sensor, key), values in numbers.items():
+        mean = sum(values) / len(values)
+        whole = all(isinstance(v, int) for v in values)
+        merged[sensor][key] = int(round(mean)) if whole else round(mean, 2)
+    return merged
+
+
 def extract_metric(data: dict, metric: str) -> float | None:
     """Extract a named metric from a nested sensor reading.
 
@@ -64,6 +151,7 @@ def extract_metric(data: dict, metric: str) -> float | None:
 def read_sensor() -> dict:
     """Execute the sensor script and return its raw nested JSON payload.
 
+    SEN6x "no valid value" codes come back as None (see NO_VALUE_AT_OR_ABOVE).
     Raises RuntimeError if the script fails or output is not valid JSON.
     After _REINIT_AFTER consecutive failures, calls sen6x_read --init to
     recover from mid-run sensor resets (power-cycle, I2C lockup, swap).
@@ -82,7 +170,7 @@ def read_sensor() -> dict:
         if result.returncode != 0:
             error = RuntimeError(f"Sensor script failed: {result.stderr.strip()}")
         else:
-            data = json.loads(result.stdout)
+            data = drop_no_value_codes(json.loads(result.stdout))
             _consecutive_failures = 0
             return data
     except json.JSONDecodeError as e:

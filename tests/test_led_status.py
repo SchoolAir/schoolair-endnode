@@ -366,6 +366,58 @@ def test_resolve_state_uses_provided_raw_state_without_reading_file(monkeypatch)
 
 
 
+
+# ── The wilting flower's LED request ─────────────────────────────────────────
+# The flower used to write "thinking" into LED_STATE_FILE while it held for
+# want of a valid reading; ingest's ping loop turned it back into "ok" within
+# 15 s. It now has its own file, which may only turn "ok" into "thinking".
+
+def test_resolve_state_flower_request_turns_ok_into_thinking(monkeypatch):
+    monkeypatch.setattr(led_status, "_is_registered", lambda: True)
+    assert led_status._resolve_state(_healthy(), 0.0, raw_state="ok",
+                                      flower_request="thinking") == "thinking"
+
+
+@pytest.mark.parametrize("raw", ["error", "no_sensor", "ap"])
+def test_resolve_state_flower_request_never_hides_a_problem(monkeypatch, raw):
+    monkeypatch.setattr(led_status, "_is_registered", lambda: True)
+    assert led_status._resolve_state(_healthy(), 0.0, raw_state=raw,
+                                     flower_request="thinking") == raw
+
+
+def test_resolve_state_health_check_beats_flower_request(monkeypatch):
+    monkeypatch.setattr(led_status, "_is_registered", lambda: True)
+    assert led_status._resolve_state({"unhealthy_until": 100.0}, 50.0, raw_state="ok",
+                                     flower_request="thinking") == "error"
+
+
+def test_flower_request_fresh_file_is_read(tmp_path, monkeypatch):
+    f = tmp_path / "led-request"
+    f.write_text("thinking\n")
+    monkeypatch.setattr(led_status, "FLOWER_LED_REQUEST_FILE", str(f))
+    mtime = led_status._flower_request_mtime()
+    assert led_status._flower_request(mtime, mtime / 1e9 + 60) == "thinking"
+
+
+def test_flower_request_stale_file_is_ignored(tmp_path, monkeypatch):
+    """A flower service that stopped refreshing it must not hold the LED."""
+    f = tmp_path / "led-request"
+    f.write_text("thinking")
+    monkeypatch.setattr(led_status, "FLOWER_LED_REQUEST_FILE", str(f))
+    mtime = led_status._flower_request_mtime()
+    assert led_status._flower_request(mtime, mtime / 1e9 + led_status.FLOWER_REQUEST_MAX_AGE_S + 1) is None
+
+
+def test_flower_request_other_words_and_missing_file_are_none(tmp_path, monkeypatch):
+    f = tmp_path / "led-request"
+    f.write_text("error")              # the flower may not raise errors on the LED
+    monkeypatch.setattr(led_status, "FLOWER_LED_REQUEST_FILE", str(f))
+    mtime = led_status._flower_request_mtime()
+    assert led_status._flower_request(mtime, mtime / 1e9) is None
+    f.unlink()
+    assert led_status._flower_request_mtime() is None
+    assert led_status._flower_request(None, 0.0) is None
+
 # ── pigpio wave patterns ─────────────────────────────────────────────────────
 # The LED animation is played by pigpiod's DMA engine from precomputed pulse
 # lists, not driven tick-by-tick from Python, so it stays smooth under CPU

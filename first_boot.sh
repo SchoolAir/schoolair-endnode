@@ -32,8 +32,9 @@ echo "[schoolair-first-boot] Template hostname detected — assigning unique hos
 NEW_HN=$(bash "${SCRIPT_DIR}/set_hostname.sh")
 echo "[schoolair-first-boot] Hostname is now: ${NEW_HN}"
 
-# ── Unit-type detection: indoor (SEN63C) units get a flower actuator on
-# GPIO14, outdoor (SEN65) units don't. Same detect-by-getProductName()
+# ── Unit-type detection: indoor (SEN63C) units may carry a wilting flower
+# (stepper on GPIO17/27/22/23; see detect_flower.sh below), outdoor (SEN65)
+# units don't. Same detect-by-getProductName()
 # technique sen6x_read.c already uses internally — we just read its JSON
 # output rather than duplicating the I2C probe. Golden-image clones inherit
 # I2C already enabled and sen6x_read already built from the source device,
@@ -68,9 +69,12 @@ configure_unit_type() {
         # Free GPIO14 from the serial console (local edit, works offline;
         # takes effect after the reboot that normally follows first boot
         # anyway — see schoolair_setup.sh's own "after rebooting" notes).
+        # GPIO14 was for the flower's servo, retired in Rev H; the stepper
+        # doesn't need it. Kept because it is harmless and changing the boot
+        # console on units in the field is not worth the risk.
         if grep -q "console=serial0" /boot/firmware/cmdline.txt 2>/dev/null; then
             sed -i 's/console=serial0,[0-9]* //' /boot/firmware/cmdline.txt
-            echo "[schoolair-first-boot] Serial console disabled (GPIO14 freed for flower actuator)"
+            echo "[schoolair-first-boot] Serial console disabled (GPIO14 free)"
         fi
         echo "[schoolair-first-boot] pigpiod install deferred to schoolair-pigpio-setup.service (needs network)"
     elif echo "$reading" | grep -q '"voc"'; then
@@ -82,3 +86,10 @@ configure_unit_type() {
 }
 
 configure_unit_type
+
+# Indoor units: is a wilting flower fitted? detect_flower.sh reads the dock's
+# strap and sets /etc/schoolair-flower-fitted; offline and instant, like the
+# rest of this script. The flower itself starts once pigpiod is installed.
+if grep -qs indoor /etc/schoolair-unit-type && [ -x /home/admin/schoolair/detect_flower.sh ]; then
+    /home/admin/schoolair/detect_flower.sh || true
+fi
