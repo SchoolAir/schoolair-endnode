@@ -146,13 +146,18 @@ refreshed for 5 minutes is ignored. It has its own file because the shared
 
 ### Installing the flower
 
-The flower's code lives in `SchoolAir/Flower-End-node`. `deploy/flower.ref`
-pins the commit this firmware installs. Setup and every OTA update fetch that
-commit on indoor units and install it into `~/flower`, backing up what they
-replace so a rollback restores the previous flower too. `calibration.json` is
-created once and never replaced. A pin that is already installed is skipped, and
-a failed fetch only warns. To ship a new flower version, test it on a bench
-unit, push it, and bump `deploy/flower.ref`.
+The flower's code is developed in `SchoolAir/Flower-End-node`, which is
+private, and units have no GitHub credentials. So the files a unit needs are
+bundled here, in `flower/`, at one pinned commit. `flower/SOURCE` records that
+commit and a checksum per file. Setup and every OTA update install them on
+indoor units into `~/flower`, offline, backing up what they replace so a
+rollback restores the previous flower too. `calibration.json` is created once
+and never replaced. A commit that is already installed is skipped.
+
+To ship a new flower version: test it on a bench unit, then, on a machine with
+access to `Flower-End-node`, run `scripts/vendor_flower.sh <commit>`, run the
+tests, and commit `flower/`. Don't edit the files in `flower/` by hand; a test
+fails if they no longer match `flower/SOURCE`.
 
 The service is installed and enabled on every indoor unit. A drop-in
 (`deploy/schoolair-flower-fitted.conf`) lets it start only when both of these

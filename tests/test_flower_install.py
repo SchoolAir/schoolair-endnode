@@ -1,14 +1,15 @@
 """tests/test_flower_install.py
 
 How the endnode installs the wilting flower (SchoolAir/Flower-End-node):
-detect_flower.sh reads the dock's strap, schoolair_setup.sh installs the pinned
-flower commit on indoor units with backups, and a drop-in lets the service run
-only where a flower is fitted and pigpiod exists.
+detect_flower.sh reads the dock's strap, schoolair_setup.sh installs the flower
+bundled in flower/ (scripts/vendor_flower.sh) on indoor units with backups, and
+a drop-in lets the service run only where a flower is fitted and pigpiod exists.
 
 detect_flower.sh is run for real with a fake `pinctrl`; the rest are static
 checks on the scripts, in the style of test_setup_units.py.
 """
 
+import hashlib
 import os
 import re
 import subprocess
@@ -70,16 +71,44 @@ def _flower_block() -> str:
     return SETUP[start:SETUP.index("# An earlier revision drove GPIO24", start)]
 
 
-def test_flower_ref_is_a_full_commit_sha():
-    lines = [l for l in (ROOT / "deploy/flower.ref").read_text().splitlines()
-             if l.strip() and not l.startswith("#")]
-    assert len(lines) == 1 and re.fullmatch(r"[0-9a-f]{40}", lines[0])
+def _source():
+    lines = (ROOT / "flower/SOURCE").read_text().splitlines()
+    commit = next(l.split()[1] for l in lines if l.startswith("commit "))
+    sums = {l.split()[2]: l.split()[1] for l in lines if l.startswith("sha256 ")}
+    return commit, sums
+
+
+def test_bundled_flower_records_a_full_commit_sha():
+    commit, _ = _source()
+    assert re.fullmatch(r"[0-9a-f]{40}", commit)
+
+
+def test_bundled_flower_files_match_their_recorded_checksums():
+    """A hand edit in flower/ must not drift silently away from the pinned commit:
+    change Flower-End-node and re-run scripts/vendor_flower.sh instead."""
+    _, sums = _source()
+    assert set(sums) == {"flower_service.py", "step.py", "schoolair-flower.service",
+                         "calibration.example.json"}
+    for name, expected in sums.items():
+        assert hashlib.sha256((ROOT / "flower" / name).read_bytes()).hexdigest() == expected, name
+
+
+def test_bundled_flower_scripts_are_executable():
+    for name in ("flower_service.py", "step.py"):
+        assert os.access(ROOT / "flower" / name, os.X_OK), name
+
+
+def test_installing_the_flower_needs_no_network():
+    """Flower-End-node is private and units have no GitHub credentials."""
+    block = _flower_block()
+    assert "git " not in block and "curl" not in block
+    assert 'FLOWER_SRC="${SCHOOLAIR_DIR}/flower"' in block
 
 
 def test_flower_is_installed_on_indoor_units_only_and_after_detection():
     block = _flower_block()
     assert "grep -qs indoor /etc/schoolair-unit-type" in block
-    assert block.index("detect_flower.sh") < block.index("git -C")
+    assert block.index("detect_flower.sh") < block.index("install_with_backup")
 
 
 def test_flower_files_go_through_the_backup_helper():
@@ -97,10 +126,8 @@ def test_calibration_is_created_but_never_replaced():
     assert 'if [ ! -f "${FLOWER_DIR}/calibration.json" ]; then' in block
 
 
-def test_a_failed_fetch_never_fails_the_update():
-    block = _flower_block()
-    assert "die " not in block
-    assert 'warn "Could not fetch Flower-End-node' in block
+def test_a_flower_problem_never_fails_the_update():
+    assert "die " not in _flower_block()
 
 
 def test_same_pin_is_not_reinstalled():

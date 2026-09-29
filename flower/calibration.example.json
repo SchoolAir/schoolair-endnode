@@ -1,0 +1,136 @@
+{
+  "measured_on": "2026-09-28",
+  "motor": "28BYJ-48 5V via ULN2003, half-step, 4096 half-steps per output turn",
+  "pins_bcm": {
+    "IN1": 17,
+    "IN2": 27,
+    "IN3": 22,
+    "IN4": 23
+  },
+  "pins_physical": {
+    "IN1": 11,
+    "IN2": 13,
+    "IN3": 15,
+    "IN4": 16,
+    "plus": 2,
+    "minus": 9
+  },
+  "sequence_forward_is": "down",
+  "lead_screw": "Tr8x8",
+  "mm_per_turn": 8.0,
+  "mm_per_turn_measured": 8.1,
+  "us_per_halfstep": 2000,
+  "speed_mm_per_s": 1.0,
+  "travel_stop_to_stop_mm": 80.0,
+  "working_min_mm": 25.0,
+  "working_max_mm": 70.0,
+  "top_margin_mm": 17.5,
+  "holds_position_unpowered": true,
+  "homing": {
+    "overshoot_mm": 10,
+    "note": "drive down travel + overshoot; the gearbox stalls at the bottom stop; that is 0 mm",
+    "stop_position_mm": 0.0,
+    "stop_position_note": "0 on the original lid. Set to 25 once stop_spacer.stl (or the Rev H+ 32.5 mm post) is fitted; positions and tables stay as measured.",
+    "known_overshoot_mm": 3.0,
+    "known_overshoot_note": "margin past the expected stop when the position is known; the full overshoot_mm only applies to a blind home"
+  },
+  "working_max_note": "62.5 mm proposed 2026-09-28 evening: clean and looks good; 3 mm under the 65.5 ceiling where the vase stopped seating. Earlier 55.5 limit came from a jam now attributed to the stem tube standing proud of the collar.",
+  "bottom_stop_mm": 0.0,
+  "bottom_stop_note": "Mechanical bottom stop of the original lid, the frame all positions are measured in. On it the flower folds well past horizontal, so wilted sits at 25 mm and the lid carries a stop at that height (spacer or Rev H+ post, see homing.stop_position_mm). Physical top is about 75 mm; working range 25 to 70.",
+  "worst_air_mm": 25.0,
+  "worst_air_note": "25 mm = fully wilted, past horizontal, chosen 2026-09-28 evening as the more convincing wilt (30 mm = exactly horizontal). Bottom stop at 0 is only the homing reference.",
+  "positions": {
+    "erect": 70.0,
+    "leaning": 45.5,
+    "horizontal": 30.0,
+    "wilted": 25.0
+  },
+  "positions_note": "mm above the bottom stop, from the bench on 2026-09-28: erect = 12 on the clock with a slight curve; leaning = 11; horizontal = 9 (the guideline line on the dashboard chart); wilted = past horizontal, the more convincing wilt.",
+  "mapping": {
+    "tables": {
+      "co2": [
+        [
+          600,
+          "erect"
+        ],
+        [
+          800,
+          "leaning"
+        ],
+        [
+          1000,
+          "horizontal"
+        ],
+        [
+          1500,
+          "wilted"
+        ]
+      ],
+      "pm25": [
+        [
+          5,
+          "erect"
+        ],
+        [
+          10,
+          "leaning"
+        ],
+        [
+          15,
+          "horizontal"
+        ],
+        [
+          25,
+          "wilted"
+        ]
+      ]
+    },
+    "combine": "min (the worse metric wins)",
+    "hysteresis_mm": 2.0,
+    "max_reading_age_min": 30,
+    "poll_seconds": 60,
+    "note": "CO2 1000 ppm = classroom ventilation guideline (no WHO value exists for CO2); PM2.5 15 = WHO 24-h guideline, 25 = WHO interim target 4, 5 = WHO annual. Values between rows interpolate linearly. Edit and restart schoolair-flower.",
+    "valid_range": {
+      "co2": [
+        250,
+        10000
+      ],
+      "pm25": [
+        0,
+        1000
+      ]
+    },
+    "valid_range_note": "Outside these bounds a reading is a sensor fault (SEN6x sends CO2 32766 or PM 6553.5 for 'no valid value'): the flower holds and the LED shows thinking."
+  },
+  "moves": {
+    "down_us": 3000,
+    "up_us": 5000,
+    "up_full_step": true,
+    "note": "up in two-coil full steps at 5 ms: clean under the stem load; down in half steps at 3 ms",
+    "recovery": {
+      "up_to_mm": 30.0,
+      "up_us": 6000,
+      "note": "after homing, climb out of the stop to 30 mm in full steps at 6 ms; the stem is folded hardest down there"
+    }
+  },
+  "current_position_mm": null,
+  "unit": "fill in: hostname of the endnode this calibration was measured on",
+  "position_state": "unknown",
+  "heartbeat": {
+    "enabled": true,
+    "every_min": 60,
+    "dip_mm": 15.0,
+    "hours": "08:00-17:00",
+    "weekdays_only": true,
+    "requires_fresh_reading": true,
+    "note": "a small dip-and-return so people can see the flower is alive; skipped when the last reading is stale, so a still flower means something has stopped",
+    "repeats": 1
+  },
+  "self_test": {
+    "on_cold_boot": true,
+    "boot_marker": "/run/schoolair-flower/booted",
+    "led_state_when_no_reading": "thinking",
+    "note": "first start after power-up: home, rise to erect, then go to the reading. Without a reading: hold last known (or erect) and ask the LED for thinking; never park at wilted without a reading.",
+    "led_request_file": "/run/schoolair-flower/led-request"
+  }
+}
