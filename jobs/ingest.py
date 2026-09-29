@@ -40,6 +40,7 @@ from dotenv import load_dotenv
 from services.sensor import read_sensor, extract_metric, average_readings, probe_aux_sensors, read_aux_sensor
 import db.queue as queue
 import device_identity
+from atomic_file import write_atomic
 import jobs.aggregate as aggregate
 import state
 
@@ -230,7 +231,7 @@ def _ensure_drain_jitter(settings: dict) -> int:
     jitter = random.randint(0, DRAIN_JITTER_MAX)
     settings["drain_jitter_seconds"] = jitter
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+    write_atomic(SETTINGS_PATH, json.dumps(settings, indent=2))
     print(f"[upload] jitter slot assigned: {jitter}s — saved to {SETTINGS_PATH}")
     return jitter
 
@@ -292,7 +293,7 @@ def _seconds_to_next_boundary(interval: int, offset: int = 0, now: datetime | No
 
 def save_criteria(criteria: list[dict]):
     CRITERIA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CRITERIA_PATH.write_text(json.dumps(criteria, indent=4))
+    write_atomic(CRITERIA_PATH, json.dumps(criteria, indent=4))
 
 
 def load_criteria() -> list[dict]:
@@ -804,7 +805,7 @@ def _load_wifi_state() -> dict:
 
 
 def _save_wifi_state(s: dict) -> None:
-    Path(_WIFI_STATE_FILE).write_text(json.dumps(s, indent=2))
+    write_atomic(_WIFI_STATE_FILE, json.dumps(s, indent=2))
 
 
 async def _nmcli_run(*args: str) -> bool:
@@ -903,7 +904,7 @@ def _apply_window_update(new_window: dict) -> bool:
         return False
     _settings["active_window"] = new_window
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(_settings, indent=2))
+    write_atomic(SETTINGS_PATH, json.dumps(_settings, indent=2))
     print(f"[settings] active_window updated: {new_window['start']}–{new_window['end']}")
     return True
 
@@ -970,7 +971,7 @@ async def _ntp_correction_task():
         if b"NTPSynchronized=yes" in stdout:
             settings_data[NTP_CORRECTED_KEY] = True
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS_PATH.write_text(json.dumps(settings_data, indent=2))
+            write_atomic(SETTINGS_PATH, json.dumps(settings_data, indent=2))
             print("[ntp] already synced at startup — no correction needed")
             return
     except Exception:
@@ -1004,7 +1005,7 @@ async def _ntp_correction_task():
         current = load_settings()
         current[NTP_CORRECTED_KEY] = True
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_PATH.write_text(json.dumps(current, indent=2))
+        write_atomic(SETTINGS_PATH, json.dumps(current, indent=2))
 
         _ntp_fake_wall = None  # exit loop
 

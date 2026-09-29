@@ -21,6 +21,8 @@ import os
 import re
 from pathlib import Path
 
+from atomic_file import write_atomic
+
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 
 # Under schoolair.service's RuntimeDirectory (tmpfs, owned by admin, kept across
@@ -73,8 +75,8 @@ def _read_env(path: Path) -> dict:
 
 
 def _write_env_keys(path: Path, values: dict) -> None:
-    """Set keys in .env in place (appending missing ones). Written to a temp
-    file then renamed, so a power cut mid-write can't truncate the tokens."""
+    """Set keys in .env in place (appending missing ones), atomically, so a
+    power cut mid-write can't truncate the tokens."""
     try:
         content = path.read_text()
     except FileNotFoundError:
@@ -87,14 +89,7 @@ def _write_env_keys(path: Path, values: dict) -> None:
             if content and not content.endswith("\n"):
                 content += "\n"
             content += f"{key}={value}\n"
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(content)
-    try:
-        st = path.stat()
-        os.chown(tmp, st.st_uid, st.st_gid)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+    write_atomic(path, content)
 
 
 def save(env_path: Path = ENV_PATH) -> tuple[str, str]:

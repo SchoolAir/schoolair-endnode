@@ -54,6 +54,7 @@ from config import (
 # jobs/ingest.py, so both read the hardware identity the exact same way.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import device_identity  # noqa: E402
+from atomic_file import write_atomic  # noqa: E402
 
 LEGACY_URL   = "https://data.schoolair.org/node/aqc/register"
 TEMP_PROFILE = "school-air-temp"
@@ -1054,8 +1055,7 @@ def _write_env_key(key: str, value: str) -> None:
         content = re.sub(pattern, f"{key}={value}", content, flags=re.MULTILINE)
     else:
         content += f"\n{key}={value}\n"
-    with open(PI_MAIN_ENV_PATH, "w") as f:
-        f.write(content)
+    write_atomic(PI_MAIN_ENV_PATH, content)  # holds the tokens: never half-written
     _fix_owner(PI_MAIN_ENV_PATH)
 
 
@@ -1103,10 +1103,7 @@ def _ensure_dir() -> None:
 
 def write_staging(data: dict) -> None:
     _ensure_dir()
-    tmp = STAGING_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, STAGING_FILE)
+    write_atomic(STAGING_FILE, json.dumps(data, indent=2))
     _fix_owner(STAGING_FILE)
 
 
@@ -1120,17 +1117,13 @@ def read_staging() -> dict:
 
 def write_status(data: dict) -> None:
     _ensure_dir()
-    tmp = STATUS_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, STATUS_FILE)
+    write_atomic(STATUS_FILE, json.dumps(data, indent=2))
     _fix_owner(STATUS_FILE)
 
 
 def write_error(message: str) -> None:
     _ensure_dir()
-    with open(ERROR_FILE, "w") as f:
-        f.write(f"{datetime.now(timezone.utc).isoformat()}  {message}\n")
+    write_atomic(ERROR_FILE, f"{datetime.now(timezone.utc).isoformat()}  {message}\n")
     _fix_owner(ERROR_FILE)
 
 
@@ -1758,8 +1751,7 @@ async def run_registration(sess_tok: str) -> None:
                 "device_id": legacy_resp.get("device_id", ""),
                 "nickname":  asset,
             }
-            with open(NODE_RED_TOKEN_FILE, "w") as _f:
-                json.dump(device_token, _f)
+            write_atomic(NODE_RED_TOKEN_FILE, json.dumps(device_token))
             _fix_owner(NODE_RED_TOKEN_FILE)
             try:
                 _write_auth_token(device_token_value)
