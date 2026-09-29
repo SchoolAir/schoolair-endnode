@@ -1103,8 +1103,19 @@ async def _run_read(settings: dict, active_sensors: list):
 
     # Signal upload loop — overwrites any previous unsent reading
     _pending_live = entry
-    if _live_event is not None:
-        _live_event.set()
+    _get_live_event().set()
+
+
+def _get_live_event() -> asyncio.Event:
+    """The event that tells _upload_loop a reading is ready, created by whichever
+    side needs it first. At startup the read loop takes its first reading before
+    the upload loop has run at all; when the upload loop created the event, that
+    first reading was signalled to nobody and never uploaded (one reading lost
+    per service start)."""
+    global _live_event
+    if _live_event is None:
+        _live_event = asyncio.Event()
+    return _live_event
 
 
 # ── Upload and drain ──────────────────────────────────────────────────────────
@@ -1201,13 +1212,11 @@ async def _drain_backlog() -> None:
 
 async def _upload_loop() -> None:
     """Send live readings immediately; drain backlog on server credit."""
-    global _live_event
-
-    _live_event = asyncio.Event()
+    live_event = _get_live_event()   # may already be set by the first reading
 
     while True:
-        await _live_event.wait()
-        _live_event.clear()
+        await live_event.wait()
+        live_event.clear()
 
         entry = _pending_live
         if entry is None:
