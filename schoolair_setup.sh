@@ -215,6 +215,41 @@ _rollback_on_failure() {
 }
 trap _rollback_on_failure EXIT
 
+# OS security updates, run at the very end of every OTA (step 15d). Deliberately
+# last: the app is already updated, restarted and health-checked by then, so
+# nothing here can trip _rollback_on_failure (the EXIT trap) — every failure is
+# only a warning, and the next OTA simply tries again.
+#  - dpkg --configure -a first: finishes whatever a power cut interrupted.
+#  - unattended-upgrade applies only the origins in 50unattended-upgrades
+#    (written in 2b), in minimal steps, skips packages whose conffile would
+#    prompt, and exits by itself if another package manager holds the lock.
+#    Run by hand it ignores APT::Periodic (which stays "0": no daily runs).
+#    If a package needs a reboot it schedules one for Automatic-Reboot-Time.
+#  - Idle CPU/IO priority: on a Pi Zero W this takes minutes, and the readings
+#    must keep coming meanwhile.
+_os_security_updates() {
+    local lowprio="nice -n 19 ionice -c3"
+    export DEBIAN_FRONTEND=noninteractive
+    $lowprio dpkg --configure -a || warn "dpkg --configure -a failed"
+    if ! $lowprio apt-get -o DPkg::Lock::Timeout=300 update -qq; then
+        warn "apt-get update failed — OS security updates skipped this time"
+        return 0
+    fi
+    if ! command -v unattended-upgrade >/dev/null 2>&1; then
+        $lowprio apt-get -o DPkg::Lock::Timeout=300 install -y -qq unattended-upgrades \
+            || { warn "could not install unattended-upgrades — OS security updates skipped"; return 0; }
+    fi
+    if $lowprio unattended-upgrade -v; then
+        ok "OS security updates applied"
+    else
+        warn "unattended-upgrade failed — see its log; the next OTA tries again"
+    fi
+    if [ -f /var/run/reboot-required ]; then
+        ok "a reboot is required — unattended-upgrades schedules it (Automatic-Reboot-Time)"
+    fi
+    return 0
+}
+
 if [[ "${MODE:-}" == "--update" ]]; then
     mkdir -p "$BACKUP_ROOT" "$(dirname "$BACKUP_MANIFEST")"
     : > "$BACKUP_MANIFEST"   # fresh manifest for this run — see install_*_with_backup()
@@ -262,8 +297,8 @@ if [[ "$MODE" == "setup" ]]; then
     step "2 / System packages"
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3-pip i2c-tools nginx avahi-daemon gcc make
-    ok "git python3-pip i2c-tools nginx avahi-daemon gcc make"
+        git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades
+    ok "git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades"
 
     systemctl disable nginx 2>/dev/null || true
     systemctl stop    nginx 2>/dev/null || true
@@ -291,9 +326,10 @@ systemctl stop    dphys-swapfile 2>/dev/null || true
 dphys-swapfile swapoff           2>/dev/null || true
 ok "swap: disabled"
 
-# No automatic apt runs: security updates ship through OTA instead. The daily
-# `apt update` (+ unattended-upgrades) was the biggest routine SD writer, and a
-# power cut mid-dpkg (schools unplug things) can leave the OS unbootable.
+# No automatic apt runs: security updates ship through OTA instead (step 15d
+# runs unattended-upgrade by hand). The daily `apt update` (+ unattended-upgrades)
+# was the biggest routine SD writer, and a power cut mid-dpkg (schools unplug
+# things) can leave the OS unbootable.
 # 20auto-upgrades "0" makes apt.systemd.daily a no-op even if a timer fires;
 # the timers are stopped BEFORE masking, as for e2scrub below. Only the timers
 # are stopped, never apt-daily-upgrade.service itself: that could interrupt a
@@ -308,6 +344,23 @@ systemctl mask apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 systemctl reset-failed apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 systemctl disable unattended-upgrades.service 2>/dev/null || true
 ok "automatic apt runs: disabled (security updates via OTA)"
+
+# What OTA's step 15d may install: security + the Raspberry Pi repos (kernel and
+# firmware come from there), as before. MinimalSteps: upgrade in small batches,
+# so a power cut mid-upgrade leaves at most one batch half-done.
+cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename},label=Debian-Security";
+    "origin=Raspbian,codename=${distro_codename},label=Raspbian";
+    "origin=Raspberry Pi Foundation,codename=${distro_codename},label=Raspberry Pi Foundation";
+};
+Unattended-Upgrade::Package-Blacklist {};
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+EOF
+ok "unattended-upgrades: security origins, minimal steps, reboot at 03:00 if needed"
 
 # ── 3. Clone / update SchoolAir app ───────────────────────────────────────────
 step "3 / Clone SchoolAir app  →  ${SCHOOLAIR_DIR}"
@@ -904,6 +957,9 @@ json.dump(
     else
         ok "Version unchanged (v${_NEW_VERSION}) — no rollback watchdog needed"
     fi
+
+    step "15d / OS security updates"
+    _os_security_updates
 fi
 
 # ── 16. Verification ───────────────────────────────────────────────────────────
@@ -917,6 +973,7 @@ chk() {
 
 chk "hostname is schoolair-*"              bash -c '[[ "$(hostname)" == schoolair-* ]]'
 chk "automatic apt runs disabled"        grep -q 'Unattended-Upgrade "0"' /etc/apt/apt.conf.d/20auto-upgrades
+chk "unattended-upgrade available"       command -v unattended-upgrade
 chk "journald volatile"                   grep -q "Storage=volatile" /etc/systemd/journald.conf.d/00-schoolair.conf
 chk "swap disabled"                       bash -c "! systemctl is-enabled dphys-swapfile 2>/dev/null"
 chk "microdot importable"                  python3 -c "import microdot"
