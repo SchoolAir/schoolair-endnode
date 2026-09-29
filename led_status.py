@@ -55,6 +55,13 @@ import time
 
 GPIO_LED = 24
 LED_STATE_FILE = "/run/schoolair-led-state"
+# Raised by the wilting-flower service (SchoolAir/Flower-End-node) for the
+# duration of every motor move. pigpiod has ONE wave transmitter for the whole
+# Pi, and starting a wave replaces whatever is playing, so while this file
+# exists the LED must not send waves: the stepper's step pattern is a wave, and
+# cutting it mid-move loses the flower's position (it has no sensor). The LED
+# holds a steady glow on plain PWM instead, which pigpiod times independently.
+FLOWER_MOVING_FLAG = "/run/schoolair-flower/moving"
 # One line of plain text describing the current error, present only while there
 # is one. Written here (the one place that knows what the LED would say) and
 # shown on the device dashboard (main.py), since AP mode hides "error" on the LED.
@@ -542,10 +549,22 @@ def _send_pattern(pi, pigpio, segments, prev_wave_id):
 def _steady_glow(pi) -> None:
     """Last-resort display if a wave can't be created: plain PWM at the cap."""
     pi.wave_tx_stop()
+    _hold_pwm(pi)
+
+
+def _hold_pwm(pi) -> None:
+    """Steady glow at the cap on pigpiod's PWM, which runs independently of the
+    wave transmitter. Deliberately never calls wave_tx_stop or wave_clear: this
+    is what the LED shows while the flower owns the waves (see FLOWER_MOVING_FLAG),
+    and either call would cut the flower's move."""
     pi.set_PWM_frequency(GPIO_LED, PWM_FREQ_HZ)
     real_range = pi.get_PWM_real_range(GPIO_LED)
     pi.set_PWM_range(GPIO_LED, real_range)
     pi.set_PWM_dutycycle(GPIO_LED, round(real_range * PEAK_US / WAVE_PERIOD_US))
+
+
+def _flower_moving() -> bool:
+    return os.path.exists(FLOWER_MOVING_FLAG)
 
 
 def _shutdown_led(pi) -> None:
@@ -553,8 +572,10 @@ def _shutdown_led(pi) -> None:
     its client dies (verified: kill -9 of the client leaves it running), so
     this must run on the way out or the LED stays frozen on its last pattern."""
     try:
-        pi.wave_tx_stop()
-        pi.wave_clear()
+        if not _flower_moving():          # the playing wave is the flower's, not ours
+            pi.wave_tx_stop()
+            pi.wave_clear()
+        pi.set_PWM_dutycycle(GPIO_LED, 0)
         pi.write(GPIO_LED, 0)
         pi.stop()
     except Exception:
@@ -612,6 +633,7 @@ def main() -> None:
 
     last_state = None
     wave_id = None
+    yielding = False   # True while the flower service owns the wave transmitter
     # Nothing here needs to be fast: the animation is played by pigpiod, so a
     # state change showing up within a second is plenty. Even so, the cheapest
     # way to check is os.stat() on the (tmpfs, i.e. RAM) state file — 56us versus
@@ -636,7 +658,20 @@ def main() -> None:
             if reason != last_reason:
                 _publish_error(reason)
                 last_reason = reason
-            if state != last_state:
+            moving = _flower_moving()
+            if moving and not yielding:
+                # The flower is about to send its step pattern (it raises the flag,
+                # then waits ~1.5s for us). Its wave_clear will delete our wave, so
+                # forget the id; show a steady glow on PWM until it is done.
+                _hold_pwm(pi)
+                wave_id = None
+                yielding = True
+                print("[led] flower moving — steady glow, waves are the flower's until it finishes")
+            elif yielding and not moving:
+                yielding = False
+                last_state = None      # force a resend of the current pattern below
+                print("[led] flower done — resuming patterns")
+            if state != last_state and not yielding:
                 segments = _state_segments(state)
                 new_wave = _send_pattern(pi, pigpio, segments, wave_id)
                 if new_wave is None:

@@ -35,7 +35,10 @@ ExecStartPre=-/bin/sh -c '/usr/bin/pigs pfs 24 100 && /usr/bin/pigs prs 24 2000 
 # LED frozen on its last pattern. systemd runs ExecStopPost after crashes too:
 # halt the wave and drive the pin low. (led_status.py's own SIGTERM cleanup
 # does the same; this covers the paths it can't.)
-ExecStopPost=-/bin/sh -c '/usr/bin/pigs wvhlt; /usr/bin/pigs w 24 0'
+# Unless the flower service is mid-move (/run/schoolair-flower/moving): the
+# playing wave is then the stepper's, and halting it would lose the flower's
+# position. led_status.py makes the same check in its own cleanup.
+ExecStopPost=-/bin/sh -c '[ -e /run/schoolair-flower/moving ] || /usr/bin/pigs wvhlt; /usr/bin/pigs w 24 0'
 ExecStart=/usr/bin/python3 -u /home/admin/schoolair/led_status.py
 Restart=on-failure
 RestartSec=2

@@ -939,3 +939,84 @@ def test_publish_error_writes_and_removes(monkeypatch, tmp_path):
     led_status._publish_error(None)
     assert not path.exists()
     led_status._publish_error(None)  # already gone: no error
+
+
+# ── yielding to the flower service ──────────────────────────────────────────
+# pigpiod has one wave transmitter; while /run/schoolair-flower/moving exists
+# the stepper owns it and the LED must hold a steady PWM glow, sending no wave.
+
+def _run_main_for(n_polls, monkeypatch, tmp_path, flag_exists_by_poll):
+    """Runs led_status.main() for n_polls loop iterations with a fake pigpio,
+    the flower flag present on the polls flag_exists_by_poll says. Returns
+    the fake pi."""
+    fake_pi = _wave_capable_pi()
+    fake_pigpio = MagicMock()
+    fake_pigpio.pi.return_value = fake_pi
+    unit_type_file = tmp_path / "schoolair-unit-type"
+    unit_type_file.write_text("indoor")
+    monkeypatch.setattr(led_status, "LED_STATE_FILE", str(tmp_path / "led-state"))
+    monkeypatch.setattr(led_status, "_read_state", lambda: "ok")
+    monkeypatch.setattr(led_status, "_health_monitor_loop", lambda health: None)
+    monkeypatch.setattr(__import__("threading"), "Thread", lambda *a, **k: MagicMock())
+    polls = {"n": 0}
+    monkeypatch.setattr(led_status, "_flower_moving", lambda: flag_exists_by_poll(polls["n"]))
+    real_open = open
+    def fake_open(path, *args, **kwargs):
+        if path == "/etc/schoolair-unit-type":
+            path = str(unit_type_file)
+        return real_open(path, *args, **kwargs)
+    handlers = {}
+    def fake_sleep(seconds):
+        polls["n"] += 1
+        if polls["n"] >= n_polls:
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+    with patch.dict(sys.modules, {"pigpio": fake_pigpio}), \
+         patch("builtins.open", side_effect=fake_open), \
+         patch("signal.signal", side_effect=lambda s, h: handlers.__setitem__(s, h)), \
+         patch("time.sleep", side_effect=fake_sleep):
+        with pytest.raises(SystemExit):
+            led_status.main()
+    return fake_pi
+
+
+def test_no_waves_while_flower_moves(monkeypatch, tmp_path):
+    """Flag present from the first poll: the LED never sends a wave, holds PWM,
+    and its cleanup leaves the (flower's) transmission alone."""
+    pi = _run_main_for(3, monkeypatch, tmp_path, lambda n: True)
+    pi.wave_send_repeat.assert_not_called()
+    pi.wave_chain.assert_not_called()
+    pi.wave_tx_stop.assert_not_called()
+    pi.wave_clear.assert_not_called()
+    duty = [c for c in pi.set_PWM_dutycycle.call_args_list if c.args[1] > 0]
+    assert duty, "expected a steady PWM glow while yielding"
+    assert pi.set_PWM_dutycycle.call_args_list[-1] == call(led_status.GPIO_LED, 0)
+    pi.write.assert_called_with(led_status.GPIO_LED, 0)
+
+
+def test_pattern_resent_when_flower_finishes(monkeypatch, tmp_path):
+    """Wave sent at start; flag on poll 1-2 stops waves; flag gone on poll 3
+    resends the current pattern even though the state never changed."""
+    pi = _run_main_for(5, monkeypatch, tmp_path, lambda n: n in (1, 2))
+    assert pi.wave_send_repeat.call_count == 2
+    # while yielding, the glow was on PWM
+    assert any(c.args[1] > 0 for c in pi.set_PWM_dutycycle.call_args_list)
+
+
+def test_state_change_during_move_is_deferred_not_sent(monkeypatch, tmp_path):
+    """A state change while the flag is up must not start a wave; it is shown
+    once the flag drops."""
+    states = iter(["ok", "ok", "error", "error", "error", "error"])
+    monkeypatch.setattr(led_status, "_resolve_state", lambda *a, **k: next(states, "error"))
+    pi = _run_main_for(5, monkeypatch, tmp_path, lambda n: n in (1, 2))
+    # first wave for "ok" at start, then exactly one more, for "error", after the flag drops
+    assert pi.wave_send_repeat.call_count == 2
+
+
+def test_shutdown_skips_wave_halt_while_flower_moves(monkeypatch):
+    pi = _wave_capable_pi()
+    monkeypatch.setattr(led_status, "_flower_moving", lambda: True)
+    led_status._shutdown_led(pi)
+    pi.wave_tx_stop.assert_not_called()
+    pi.wave_clear.assert_not_called()
+    pi.write.assert_called_with(led_status.GPIO_LED, 0)
+    pi.stop.assert_called_once()
