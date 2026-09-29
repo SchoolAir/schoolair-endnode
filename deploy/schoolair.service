@@ -15,6 +15,11 @@ RestartSec=10
 RuntimeDirectory=schoolair
 RuntimeDirectoryPreserve=yes
 Environment=PYTHONUNBUFFERED=1
+# /run/schoolair (tmpfs) holds latest.json, the current reading published for
+# other local services such as the wilting-flower actuator. See state.py.
+RuntimeDirectory=schoolair
+RuntimeDirectoryPreserve=yes
+Environment=LATEST_READING_FILE=/run/schoolair/latest.json
 
 [Install]
 WantedBy=multi-user.target

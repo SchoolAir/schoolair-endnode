@@ -93,6 +93,25 @@ schoolair-netwatch       Persistent — monitors WiFi after boot. On uplink loss
                          reconnect.
 ```
 
+### Latest reading file
+
+Every reading the telemetry process takes is also written, atomically, to
+`/run/schoolair/latest.json`:
+
+```json
+{"data": {"sen6x": {"co2": 742, "pm25": 0.8, "temp": 28.5, ...}}, "recorded_at": "2026-09-28T21:31:43+00:00"}
+```
+
+This is the interface for other services on the same Pi that need the current
+reading without opening `queue.db` (whose rows disappear as they upload) or
+talking to the sensor. It lives on tmpfs, so it costs no SD-card writes and is
+simply absent until the first reading after boot. The first consumer is the
+**wilting-flower actuator** (`schoolair-flower.service`, repository
+`SchoolAir/Flower-End-node`): a separate service that reads this file once a
+minute and drives a stepper so a silk flower stands or droops with CO₂ and
+PM2.5. That service owns the flower mechanics; this one owns the data. Neither
+imports the other, and removing either leaves the other working.
+
 ### Telemetry process
 
 `main.py` runs two concurrent coroutines:
@@ -301,6 +320,7 @@ See `.env.example` for the full list. Key ones:
 | `ALERT_NEAR_PCT`      | `10`                      | How close to a threshold counts as "near" during verification (%) |
 | `ALERT_COOLDOWN_HOURS`| `1`                       | Minimum hours between alerts for the same metric |
 | `BUFFER_CAPACITY`     | `500`                     | RAM buffer size (readings) before SQLite overflow |
+| `LATEST_READING_FILE` | `/run/schoolair/latest.json` | Where each new reading is published for other local services (see below) |
 
 ---
 
