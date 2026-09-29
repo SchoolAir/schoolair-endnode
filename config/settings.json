@@ -1,3 +1,4 @@
 {
-    "active_window": { "start": "07:00", "end": "16:00" }
+    "active_window": { "start": "07:00", "end": "16:00" },
+    "temp_offset_c": 0
 }

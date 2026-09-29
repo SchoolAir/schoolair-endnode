@@ -31,6 +31,49 @@ _REINIT_AFTER = 5  # consecutive failures before attempting re-init
 _consecutive_failures = 0
 
 
+# ── Temperature offset ────────────────────────────────────────────────────────
+#
+# The SEN6x warms itself and is warmed by the Pi next to it in the dock; on the
+# bench unit it read 4.7 °C above a room thermometer. The sensor can correct
+# this itself (sen6x_read --temp-offset), which also corrects its humidity
+# reading. The offset is volatile: a sensor reset clears it. So it is sent at
+# every telemetry start (jobs/ingest.py, from settings.json "temp_offset_c")
+# and again after every re-init below.
+
+_temp_offset_c: float = 0.0
+
+
+def set_temperature_offset(offset_c: float) -> bool:
+    """Tell the SEN6x to add offset_c °C to its temperature (negative for
+    self-heating), and remember it for re-inits. True if the sensor took it."""
+    global _temp_offset_c
+    _temp_offset_c = float(offset_c)
+    return _send_temperature_offset()
+
+
+def _send_temperature_offset() -> bool:
+    if not _REINIT_BIN:
+        return False   # mock/dev mode: no sensor to talk to
+    try:
+        r = subprocess.run(
+            [_REINIT_BIN, "--temp-offset", f"{_temp_offset_c:g}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"[sensor] temperature offset not sent: {e}")
+        return False
+    try:
+        confirmed = r.returncode == 0 and "temp_offset_c" in json.loads(r.stdout)
+    except (json.JSONDecodeError, TypeError):
+        confirmed = False   # e.g. an older sen6x_read that printed a reading instead
+    if not confirmed:
+        print(f"[sensor] temperature offset {_temp_offset_c:+g} °C not accepted "
+              f"(exit {r.returncode}): {r.stderr.strip() or r.stdout.strip()}")
+        return False
+    print(f"[sensor] temperature offset {_temp_offset_c:+g} °C set on the SEN6x")
+    return True
+
+
 def _try_reinit() -> None:
     print("[sensor] repeated failures — attempting re-init")
     try:
@@ -40,6 +83,7 @@ def _try_reinit() -> None:
         )
         if r.returncode == 0:
             print("[sensor] re-init succeeded")
+            _send_temperature_offset()   # a reset cleared it
         else:
             print(f"[sensor] re-init failed (exit {r.returncode}): {r.stderr.strip()}")
     except subprocess.TimeoutExpired:
