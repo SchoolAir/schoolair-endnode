@@ -358,6 +358,21 @@ async def test_run_read_no_signal_on_sensor_error():
     assert not ingest._live_event.is_set()
 
 
+# ── Temperature offset setting ────────────────────────────────────────────────
+
+def test_temperature_offset_defaults_to_zero():
+    assert ingest._temperature_offset({"active_window": S["active_window"]}) == 0.0
+
+
+def test_temperature_offset_is_read_from_settings():
+    assert ingest._temperature_offset({**S, "temp_offset_c": -4.7}) == -4.7
+
+
+def test_a_nonsense_temperature_offset_is_ignored():
+    for bad in ("-4.7", True, -35, None, [1]):
+        assert ingest._temperature_offset({**S, "temp_offset_c": bad}) == 0.0, bad
+
+
 # ── Sampling between uploads ──────────────────────────────────────────────────
 
 async def test_run_read_uploads_the_mean_of_the_intervals_samples():

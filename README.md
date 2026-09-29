@@ -361,6 +361,14 @@ Pi reads and drains at the higher cadence (school hours).
 
 - Window boundaries must be on a 15-minute mark (`:00`, `:15`, `:30`, `:45`).
 - Maximum window length is 9 hours.
+- `temp_offset_c` (default `0`): this unit's temperature correction in °C,
+  for a sensor warmed by its enclosure. Measure the unit against a room
+  thermometer and enter the difference, e.g. `-4.7` if it reads 4.7 °C high.
+  Then `sudo systemctl restart schoolair`. The SEN6x applies the offset itself,
+  so its humidity reading is corrected too. The offset is lost whenever the
+  sensor resets, so the telemetry service sends it at every start and after
+  every sensor re-init. Updates keep `settings.json`, so it is set once per
+  unit.
 - Read and drain intervals are fixed in source (`jobs/ingest.py`) and
   overridable via env vars for testing:
 
