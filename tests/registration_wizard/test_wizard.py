@@ -96,6 +96,7 @@ def net(monkeypatch, tmp_path):
     monkeypatch.setattr(wizard, "write_error", MagicMock())
     monkeypatch.setattr(wizard, "_write_auth_token", MagicMock())
     monkeypatch.setattr(wizard, "_write_new_auth_token", MagicMock())
+    monkeypatch.setattr(wizard, "_bind_identity", MagicMock())
     monkeypatch.setattr(wizard, "_get_mac_address", MagicMock(return_value="AA:BB:CC"))
     monkeypatch.setattr(wizard, "_get_cpu_serial", MagicMock(return_value="1234"))
     monkeypatch.setattr(wizard, "STAGING_FILE", str(tmp_path / "staging.json"))
@@ -222,3 +223,210 @@ async def test_retry_profile_connect_failure_erases_creds(net):
     assert wizard._last_good_wifi == {}
     wizard._revert_to_ap.assert_awaited_once()
     net._cmd.assert_any_call('nmcli con delete "school-air-saved-TestNet" 2>/dev/null; true')
+
+
+# ── _telemetry_recently_restarted / _delayed_shutdown's netwatch-race guard ────
+#
+# netwatch.sh's own 'ap' handler also restarts schoolair.service, on its own ~30s
+# poll cycle, and can beat _delayed_shutdown() to it since WIZARD_BUSY_FILE clears
+# the instant registration succeeds, not 6s later when _delayed_shutdown() actually
+# runs. These pin _telemetry_recently_restarted()'s time-window logic directly
+# (mocking _cmd's two systemctl/awk calls), then confirm _delayed_shutdown() honours
+# it — while _delayed_management_shutdown() stays unconditional, since nothing else
+# restarts schoolair for that flow.
+
+def _fake_cmd_for_restart_check(active_enter_us: str, uptime_us: int):
+    """_cmd side_effect matching _telemetry_recently_restarted()'s two calls, in order:
+    `systemctl show ... ActiveEnterTimestampMonotonic` then the /proc/uptime awk."""
+    calls = iter([(0, active_enter_us, ""), (0, str(uptime_us), "")])
+    async def fake_cmd(cmd):
+        return next(calls)
+    return fake_cmd
+
+
+async def test_telemetry_recently_restarted_true_just_after_a_restart(monkeypatch):
+    # restarted 3s ago (times in microseconds, as ActiveEnterTimestampMonotonic reports)
+    monkeypatch.setattr(wizard, "_cmd", _fake_cmd_for_restart_check("1_000_000", 4_000_000))
+    assert await wizard._telemetry_recently_restarted(margin_s=10) is True
+
+
+async def test_telemetry_recently_restarted_false_once_the_margin_has_passed(monkeypatch):
+    # restarted 15s ago, outside a 10s margin
+    monkeypatch.setattr(wizard, "_cmd", _fake_cmd_for_restart_check("1_000_000", 16_000_000))
+    assert await wizard._telemetry_recently_restarted(margin_s=10) is False
+
+
+async def test_telemetry_recently_restarted_false_when_never_started(monkeypatch):
+    # ActiveEnterTimestampMonotonic is "0" for a unit that has never been active
+    monkeypatch.setattr(wizard, "_cmd", _fake_cmd_for_restart_check("0", 4_000_000))
+    assert await wizard._telemetry_recently_restarted() is False
+
+
+async def test_telemetry_recently_restarted_false_when_systemctl_fails(monkeypatch):
+    async def fake_cmd(cmd):
+        return 1, "", "unit not found"
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    assert await wizard._telemetry_recently_restarted() is False
+
+
+async def test_delayed_shutdown_skips_restart_when_netwatch_already_did_it(monkeypatch):
+    calls = []
+    async def fake_cmd(cmd):
+        calls.append(cmd)
+        return 0, "", ""
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    monkeypatch.setattr(wizard, "_telemetry_recently_restarted", AsyncMock(return_value=True))
+    monkeypatch.setattr(wizard.asyncio, "sleep", AsyncMock())
+
+    await wizard._delayed_shutdown()
+
+    assert not any("restart schoolair" in c for c in calls)
+    assert any("stop schoolair-wizard" in c for c in calls)   # the rest of the sequence still runs
+
+
+async def test_delayed_shutdown_restarts_when_netwatch_has_not(monkeypatch):
+    calls = []
+    async def fake_cmd(cmd):
+        calls.append(cmd)
+        return 0, "", ""
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    monkeypatch.setattr(wizard, "_telemetry_recently_restarted", AsyncMock(return_value=False))
+    monkeypatch.setattr(wizard.asyncio, "sleep", AsyncMock())
+
+    await wizard._delayed_shutdown()
+
+    assert any("restart schoolair" in c for c in calls)
+
+
+async def test_delayed_management_shutdown_is_unconditional(monkeypatch):
+    """No netwatch race exists for this path (device was never in AP mode) — it
+    must always restart, regardless of _telemetry_recently_restarted."""
+    calls = []
+    async def fake_cmd(cmd):
+        calls.append(cmd)
+        return 0, "", ""
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    monkeypatch.setattr(wizard, "_telemetry_recently_restarted", AsyncMock(return_value=True))
+    monkeypatch.setattr(wizard.asyncio, "sleep", AsyncMock())
+
+    await wizard._delayed_management_shutdown()
+
+    assert any("restart schoolair" in c for c in calls)
+    wizard._telemetry_recently_restarted.assert_not_awaited()
+
+
+# ── Device identity binding (see device_identity.py) ─────────────────────────
+#
+# A successful registration ties the card to this Pi and lifts the mismatch
+# lockout that main.py leaves behind when a card is moved to another Pi.
+
+async def test_successful_registration_binds_identity(net):
+    sess_tok = _new_setup_session()
+    await wizard.run_registration(sess_tok)
+    assert wizard.reg_state["state"] == "success"
+    wizard._bind_identity.assert_called_once()
+
+
+async def test_failed_registration_does_not_bind_identity(net):
+    net._post_heartbeat = AsyncMock(return_value=(False, "boom", ""))
+    await wizard.run_registration(_new_setup_session())
+    wizard._bind_identity.assert_not_called()
+
+
+@pytest.fixture
+def identity(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("NEW_AUTH_TOKEN=x\nDEVICE_CPU_SERIAL=old\nDEVICE_MAC=old\n")
+    flag = tmp_path / "identity-mismatch"
+    flag.write_text("mismatch\n")
+    monkeypatch.setattr(wizard, "PI_MAIN_ENV_PATH", str(env))
+    monkeypatch.setattr(wizard.device_identity, "MISMATCH_FILE", str(flag))
+    monkeypatch.setattr(wizard.device_identity, "read_cpu_serial", lambda: "newserial")
+    monkeypatch.setattr(wizard.device_identity, "read_mac", lambda: "b8:27:eb:00:00:02")
+    return env, flag
+
+
+def test_bind_identity_saves_this_pi_and_clears_lockout(identity):
+    env, flag = identity
+    wizard._bind_identity()
+    content = env.read_text()
+    assert "DEVICE_CPU_SERIAL=newserial" in content
+    assert "DEVICE_MAC=b8:27:eb:00:00:02" in content
+    assert "NEW_AUTH_TOKEN=x" in content
+    assert not flag.exists()
+
+
+def test_bind_identity_keeps_lockout_if_save_fails(identity, monkeypatch):
+    _, flag = identity
+    monkeypatch.setattr(wizard.device_identity, "save", MagicMock(side_effect=OSError("ro fs")))
+    wizard._bind_identity()
+    assert flag.exists()
+
+
+async def test_index_ap_mode_explains_identity_mismatch(net, identity):
+    net._ap_is_active = AsyncMock(return_value=True)
+    request = MagicMock()
+    request.headers.get.return_value = ""
+    request.args.get.return_value = None
+
+    resp = await wizard.index(request)
+
+    assert resp.status_code == 200
+    assert "registered on a different SchoolAir device" in resp.body.decode()
+
+
+
+# ── Identity mismatch: the wizard brings the AP up itself ────────────────────
+#
+# jobs/ingest.py starts the wizard when it finds the card belongs to another
+# Pi; the wizard must then bring up the AP + captive portal right away, and
+# leave an AP that's already up (netwatch/launcher started it) alone.
+
+@pytest.fixture
+def mismatch(monkeypatch, tmp_path):
+    flag = tmp_path / "identity-mismatch"
+    monkeypatch.setattr(wizard.device_identity, "MISMATCH_FILE", str(flag))
+    monkeypatch.setattr(wizard, "LED_STATE_FILE", str(tmp_path / "led"))
+    calls = []
+    async def fake_cmd(cmd):
+        calls.append(cmd)
+        return 0, "", ""
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    return flag, calls
+
+
+async def test_mismatch_brings_up_ap_and_captive_portal(mismatch, monkeypatch, tmp_path):
+    flag, calls = mismatch
+    flag.write_text("x")
+    monkeypatch.setattr(wizard, "_ap_is_active", AsyncMock(return_value=False))
+    await wizard._ap_for_identity_mismatch()
+    assert any(f'nmcli con up "{wizard.AP_CONNECTION_NAME}"' in c for c in calls)
+    for port in (80, 443):
+        assert any(f"--dport {port}" in c and "iptables -t nat -C PREROUTING" in c
+                   and "|| iptables -t nat -A PREROUTING" in c for c in calls)
+    assert (tmp_path / "led").read_text() == "ap"
+
+
+async def test_mismatch_leaves_an_ap_that_is_already_up(mismatch, monkeypatch):
+    flag, calls = mismatch
+    flag.write_text("x")
+    monkeypatch.setattr(wizard, "_ap_is_active", AsyncMock(return_value=True))
+    await wizard._ap_for_identity_mismatch()
+    assert calls == []
+
+
+async def test_no_mismatch_no_ap(mismatch, monkeypatch):
+    _, calls = mismatch
+    monkeypatch.setattr(wizard, "_ap_is_active", AsyncMock(return_value=False))
+    await wizard._ap_for_identity_mismatch()
+    assert calls == []
+
+
+async def test_step1_without_mismatch_has_no_identity_banner(net, monkeypatch, tmp_path):
+    monkeypatch.setattr(wizard.device_identity, "MISMATCH_FILE", str(tmp_path / "none"))
+    net._ap_is_active = AsyncMock(return_value=True)
+    request = MagicMock()
+    request.headers.get.return_value = ""
+    request.args.get.return_value = None
+    body = (await wizard.index(request)).body.decode()
+    assert "different SchoolAir device" not in body

@@ -119,7 +119,13 @@
     <h1>🌿 SchoolAir — Air Quality</h1>
     <p class="subtitle" x-text="nickname ? nickname : 'Air quality monitor'"></p>
 
-    <div class="message" x-show="registered === false">
+    <div class="message" x-show="error">
+      ⚠️ <span x-text="error"></span>
+      <a href="#" @click.prevent="reRegister()" x-show="identityMismatch"
+         style="color:#991b1b;font-weight:600"> Register now →</a>
+    </div>
+
+    <div class="message" x-show="registered === false && !identityMismatch">
       ⚠️ This device is not registered. Cloud uploads are disabled.
       <a href="#" @click.prevent="reRegister()" style="color:#991b1b;font-weight:600"> Register now →</a>
     </div>
@@ -167,7 +173,12 @@
         lastSync:      '',
         registered:    true,
         nickname:      '',
+        error:         null,
         wizardLoading: false,
+
+        get identityMismatch() {
+          return !!this.error && this.error.includes('belongs to a different SchoolAir device');
+        },
 
         init() {
           this.connect();
@@ -183,6 +194,7 @@
             this.pm25       = d.pm25       ?? null;
             this.registered = d.registered ?? true;
             this.nickname   = d.nickname   || '';
+            this.error      = d.error      || null;
             if (d.sent_at) {
               this.lastSync = new Date(d.sent_at).toLocaleTimeString();
             }

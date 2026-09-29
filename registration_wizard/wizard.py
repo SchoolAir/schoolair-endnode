@@ -24,6 +24,7 @@ import pwd
 import random
 import re
 import secrets
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -48,6 +49,11 @@ from config import (
     STATUS_FILE,
     VALIDATE_URL,
 )
+
+# device_identity.py lives in the app root (one level up) and is shared with
+# jobs/ingest.py, so both read the hardware identity the exact same way.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import device_identity  # noqa: E402
 
 LEGACY_URL   = "https://data.schoolair.org/node/aqc/register"
 TEMP_PROFILE = "school-air-temp"
@@ -1063,6 +1069,31 @@ def _write_new_auth_token(token: str) -> None:
     _write_env_key("NEW_SERVER_URL", NEW_SERVER_BASE_URL)
 
 
+def _bind_identity() -> None:
+    """Tie the card to this Pi after a successful registration: save its CPU
+    serial + MAC into .env (jobs/ingest.py checks them on every start — see
+    device_identity.py) and lift any mismatch lockout. The lockout is only
+    lifted once the new identity is safely on disk, else ingest would just
+    flag the mismatch again."""
+    try:
+        serial, mac = device_identity.save(PI_MAIN_ENV_PATH)
+        _fix_owner(PI_MAIN_ENV_PATH)
+        print(f"[wizard] Device identity saved (serial={serial} mac={mac})")
+    except Exception as e:
+        print(f"[wizard] Warning: could not save device identity: {e}")
+        return
+    device_identity.clear_mismatch()
+
+
+def _identity_mismatch_html() -> str:
+    """Why the AP is up, when it's because this card belongs to another Pi."""
+    if not device_identity.mismatch_detected():
+        return ""
+    return ('<div class="notice notice-err">'
+            '<strong>This SD card was registered on a different SchoolAir device.</strong> '
+            'Readings are not being sent until this device is registered again below.</div>')
+
+
 def _ensure_dir() -> None:
     created = not os.path.exists(CONFIG_DIR)
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -1140,6 +1171,27 @@ async def _cmd(cmd: str) -> tuple:
     )
     out, err = await proc.communicate()
     return proc.returncode, out.decode().strip(), err.decode().strip()
+
+
+async def _telemetry_recently_restarted(margin_s: int = 10) -> bool:
+    """netwatch.sh's own 'ap' state handler restarts schoolair too, whenever it next
+    polls (every ~30s) and finds WIZARD_BUSY_FILE gone with an uplink present — and
+    that file is removed the instant registration succeeds (see run_registration's
+    finally:), not when _delayed_shutdown() actually gets around to its own restart
+    6s later. So netwatch can act before us if its poll happens to land in that
+    window. The token is written to disk before the busy file clears either way, so
+    whichever restart happens first is sufficient; this just skips ours if netwatch's
+    already fired. margin_s only needs to cover our own fixed 6s delay (see the
+    caller) — the much longer reverse-direction gap is guarded on netwatch's side."""
+    rc, out, _ = await _cmd(
+        "systemctl show schoolair -p ActiveEnterTimestampMonotonic --value")
+    if rc != 0 or not out or out == "0":
+        return False
+    _, uptime_out, _ = await _cmd("awk '{print int($1*1000000)}' /proc/uptime")
+    try:
+        return (int(uptime_out) - int(out)) / 1_000_000 < margin_s
+    except ValueError:
+        return False
 
 
 def _display_ssid(name: str) -> str:
@@ -1505,6 +1557,26 @@ async def _ap_is_active() -> bool:
     return AP_CONNECTION_NAME in out
 
 
+async def _ap_for_identity_mismatch() -> None:
+    """On start: if this card belongs to a different Pi (jobs/ingest.py found
+    it and started us), bring up the AP + captive portal ourselves right away,
+    rather than wait up to a poll interval for netwatch.sh to. No-op when the
+    AP is already up (e.g. netwatch or the launcher started us)."""
+    if not device_identity.mismatch_detected() or await _ap_is_active():
+        return
+    print("[wizard] Card belongs to a different Pi — bringing up the AP for re-registration")
+    await _revert_to_ap()
+    for port in (80, 443):
+        # Captive portal, as launcher.sh/netwatch.sh install it (-C: only if not there yet)
+        spec = f"PREROUTING -i {AP_INTERFACE} -p tcp --dport {port} -j REDIRECT --to-port {port}"
+        await _cmd(f"iptables -t nat -C {spec} 2>/dev/null || iptables -t nat -A {spec} 2>/dev/null; true")
+    try:
+        with open(LED_STATE_FILE, "w") as f:
+            f.write("ap")
+    except OSError:
+        pass
+
+
 # ── Registration background tasks ─────────────────────────────────────────────
 
 async def run_registration(sess_tok: str) -> None:
@@ -1694,6 +1766,8 @@ async def run_registration(sess_tok: str) -> None:
             except Exception as e:
                 print(f"[wizard] Warning: could not write AUTH_TOKEN: {e}")
 
+        _bind_identity()
+
         try:
             os.remove(STAGING_FILE)
         except FileNotFoundError:
@@ -1755,6 +1829,7 @@ async def run_management_update(sess_tok: str) -> None:
             _write_new_auth_token(device_auth_token)
         except Exception as e:
             print(f"[wizard] Warning: could not write NEW_AUTH_TOKEN: {e}")
+    _bind_identity()
 
     wifi_sessions.pop(sess_tok, None)
     _set("success", "Device updated successfully.")
@@ -1825,7 +1900,14 @@ async def _delayed_shutdown() -> None:
     await _cmd(f'nmcli con down "{AP_CONNECTION_NAME}" 2>/dev/null; true')
     await _cmd("systemctl stop hostapd 2>/dev/null; true")
     await _cmd("systemctl disable hostapd 2>/dev/null; true")
-    await _cmd("systemctl restart schoolair 2>/dev/null; true")
+    # netwatch.sh's own poll can beat us to this exact restart — see
+    # _telemetry_recently_restarted's docstring. Only relevant here, in the
+    # AP/setup path netwatch also reacts to; _delayed_management_shutdown()
+    # below is unconditional, since nothing else restarts schoolair for it.
+    if await _telemetry_recently_restarted():
+        print("[wizard] schoolair already restarted (netwatch beat us to it) — skipping")
+    else:
+        await _cmd("systemctl restart schoolair 2>/dev/null; true")
     await _cmd("systemctl stop schoolair-wizard 2>/dev/null; true")
 
 
@@ -1918,6 +2000,7 @@ async def index(request):
                 '<strong>Last attempt failed:</strong> '
                 f'{_html.escape(reg_state["message"])}</div>'
             )
+        last_error_banner += _identity_mismatch_html()
         body = _render(STEP1_HTML, raw={
             "wizard_emoji":       _wizard_emoji("m"),
             "quote":              quote,
@@ -2248,6 +2331,7 @@ if __name__ == "__main__":
     _KEY  = os.path.join(_SCRIPT_DIR, "key.pem")
 
     async def _main():
+        await _ap_for_identity_mismatch()
         asyncio.create_task(_idle_watchdog())
         asyncio.create_task(_session_pruner())
         tasks = [app.start_server(host="0.0.0.0", port=SERVER_PORT, debug=False)]

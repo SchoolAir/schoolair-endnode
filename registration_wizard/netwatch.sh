@@ -14,6 +14,7 @@
 #   NETWATCH_POLL       seconds between connectivity checks  (default 30)
 #   NETWATCH_GRACE      seconds of loss before entering ap   (default 120)
 #   NETWATCH_RECONNECT  seconds between reconnect probes     (default 300)
+#   NETWATCH_IDENTITY_FILE  identity-mismatch flag path  (default /run/schoolair/identity-mismatch)
 
 set -euo pipefail
 
@@ -30,6 +31,12 @@ WIZARD_BUSY_FILE="/run/schoolair-wizard-busy"
 # owns "thinking"/"error"/"ok" for the states it actually knows about, and
 # jobs/ingest.py owns "ok"/"no_sensor"/"error" during normal operation.
 LED_STATE_FILE="/run/schoolair-led-state"
+# Left by jobs/ingest.py (device_identity.py) when this card belongs to a
+# different Pi — e.g. two endnodes' uSD cards swapped. Ingest stops sending and
+# starts the wizard, which brings the AP up itself; we make sure AP mode happens
+# (in case that failed) and hold it there (no reconnect probes, no closing the
+# AP on uplink) until a re-registration removes the file.
+IDENTITY_MISMATCH_FILE="${NETWATCH_IDENTITY_FILE:-/run/schoolair/identity-mismatch}"
 
 POLL_INTERVAL="${NETWATCH_POLL:-30}"
 GRACE_SECS="${NETWATCH_GRACE:-120}"
@@ -55,8 +62,32 @@ saved_sta_profiles() {
         | awk -F: '$2=="802-11-wireless" && $1!="'"$AP_CONN"'" {print $1}'
 }
 
+identity_mismatch() {
+    [ -f "$IDENTITY_MISMATCH_FILE" ]
+}
+
 ap_has_clients() {
     iw dev wlan0 station dump 2>/dev/null | grep -q '^Station'
+}
+
+# wizard.py's _delayed_shutdown() also restarts $TELEMETRY_SERVICE, unconditionally,
+# 6s after a successful registration — and it clears WIZARD_BUSY_FILE immediately on
+# success, not 6s later, so our own poll can land either before OR after its restart
+# depending on where in our POLL_INTERVAL cycle we happen to be when the busy file
+# clears. Skip our own restart if one already happened recently enough that it must
+# have picked up the fresh token: margin = POLL_INTERVAL + a small buffer, since that
+# bounds how late our own poll can land relative to any restart that already fired.
+# (The reverse direction — us firing before the wizard's fixed 6s delay — is guarded
+# on the wizard's own side, in _delayed_shutdown() specifically; the token is written
+# to disk before either path can act, so whichever restart happens first is sufficient
+# and the second one is always pure redundancy, not a correctness issue either way.)
+schoolair_recently_restarted() {
+    local margin=$(( POLL_INTERVAL + 5 ))
+    local started now
+    started=$(systemctl show "$TELEMETRY_SERVICE" -p ActiveEnterTimestampMonotonic --value 2>/dev/null) || return 1
+    [ -n "$started" ] && [ "$started" != "0" ] || return 1
+    now=$(awk '{print int($1*1000000)}' /proc/uptime)
+    [ $(( (now - started) / 1000000 )) -lt "$margin" ]
 }
 
 # ── AP control ─────────────────────────────────────────────────────────────────
@@ -166,6 +197,16 @@ fi
 while true; do
     sleep "$POLL_INTERVAL"
 
+    if identity_mismatch && [ "$state" != "ap" ]; then
+        log "Card belongs to a different Pi ($(cat "$IDENTITY_MISMATCH_FILE" 2>/dev/null)) — holding AP mode for re-registration"
+        # The wizard normally has the AP up already; re-activating it would
+        # drop anyone already connected.
+        ap_is_up || bring_up_ap
+        state="ap"
+        last_reconnect=$(date +%s)
+        continue
+    fi
+
     case "$state" in
 
         online)
@@ -188,7 +229,12 @@ while true; do
             ;;
 
         ap)
-            if has_uplink; then
+            if identity_mismatch; then
+                # Hold the AP until the wizard re-registers this Pi (it
+                # removes the file on success; its busy file covers the
+                # uplink it brings up meanwhile).
+                :
+            elif has_uplink; then
                 if [ -f "$WIZARD_BUSY_FILE" ]; then
                     # The wizard brought this uplink up itself and is still
                     # mid-registration — let it finish and do its own cleanup
@@ -199,7 +245,11 @@ while true; do
                     # wizard, or a previously-known network came back on its own.
                     log "Uplink detected while in AP mode — closing AP"
                     take_down_ap
-                    systemctl restart "$TELEMETRY_SERVICE" 2>/dev/null || true
+                    if schoolair_recently_restarted; then
+                        log "$TELEMETRY_SERVICE already restarted recently — skipping redundant restart"
+                    else
+                        systemctl restart "$TELEMETRY_SERVICE" 2>/dev/null || true
+                    fi
                     state="online"
                 fi
             elif [ $(( $(date +%s) - last_reconnect )) -ge "$RECONNECT_INTERVAL" ]; then

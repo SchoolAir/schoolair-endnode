@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import db.queue as queue
+import device_identity
 from dotenv import load_dotenv
 from microdot import Microdot, Response
 from microdot.websocket import with_websocket
@@ -36,6 +37,23 @@ NICKNAME = os.getenv("DEVICE_NICKNAME", socket.gethostname())
 app = Microdot()
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# Written by led_status.py while a watched service is down or crashing (see its
+# DEVICE_ERROR_FILE); the LED can't say so while the setup hotspot is up.
+DEVICE_ERROR_FILE = "/run/schoolair-device-error"
+
+
+def _device_error() -> "str | None":
+    """What's wrong with the device right now, for the dashboard, or None.
+    A card from another Pi comes first: it's why uploads are stopped."""
+    if device_identity.mismatch_detected():
+        return ("This SD card belongs to a different SchoolAir device. Readings are "
+                "not being sent — register this device again to resume.")
+    try:
+        with open(DEVICE_ERROR_FILE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
 
 
 # ----------------------- Static helpers -----------------------
@@ -103,6 +121,7 @@ async def ws_sensors(request, ws):
             "temp":       extract_metric(state.latest_data, "temp") if state.latest_data else None,
             "pm25":       extract_metric(state.latest_data, "pm25") if state.latest_data else None,
             "registered": bool(os.getenv("AUTH_TOKEN", "").strip()),
+            "error":      _device_error(),
             "nickname":   NICKNAME,
             "sent_at":    state.latest_recorded_at,
         }
