@@ -63,6 +63,7 @@ S = {
 def reset_ingest_state():
     """Clear mutable module-level state before and after each test."""
     ingest._alert_buffer.clear()
+    ingest._samples.clear()
     ingest._pending_live       = None
     ingest._live_event         = None
     ingest._credit_bytes       = 0
@@ -74,6 +75,7 @@ def reset_ingest_state():
     ingest.alert_cooldown.clear()
     yield
     ingest._alert_buffer.clear()
+    ingest._samples.clear()
     ingest._pending_live       = None
     ingest._live_event         = None
     ingest._credit_bytes       = 0
@@ -354,6 +356,117 @@ async def test_run_read_no_signal_on_sensor_error():
 
     assert ingest._pending_live is None
     assert not ingest._live_event.is_set()
+
+
+# ── Sampling between uploads ──────────────────────────────────────────────────
+
+async def test_run_read_uploads_the_mean_of_the_intervals_samples():
+    """Samples taken since the last upload are averaged into this one."""
+    ingest._live_event = asyncio.Event()
+    ingest._samples.extend([{"sen6x": {"co2": 600, "pm25": 1.0}},
+                            {"sen6x": {"co2": 700, "pm25": 2.0}}])
+
+    with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 800, "pm25": 3.0}}), \
+         patch("jobs.ingest.load_criteria", return_value=[]), \
+         patch("jobs.ingest.state"):
+        await _run_read(S, [])
+
+    assert ingest._pending_live["data"] == {"sen6x": {"co2": 700, "pm25": 2.0}}
+    assert ingest._samples == []           # the next interval starts empty
+
+
+async def test_run_read_still_uploads_earlier_samples_when_boundary_read_fails():
+    ingest._live_event = asyncio.Event()
+    ingest._samples.append({"sen6x": {"co2": 650}})
+
+    with patch("jobs.ingest.read_sensor", side_effect=RuntimeError("sensor off")), \
+         patch("jobs.ingest.state"):
+        await _run_read(S, [])
+
+    assert ingest._pending_live["data"] == {"sen6x": {"co2": 650}}
+    assert ingest._live_event.is_set()
+
+
+async def test_run_read_checks_alerts_on_the_boundary_sample_not_the_mean():
+    """A spike at the boundary is what verification re-checks; the mean would hide it."""
+    ingest._live_event = asyncio.Event()
+    ingest._samples.extend([{"sen6x": {"co2": 400}}] * 4)
+    criterion = {"metric": "co2", "threshold": 1000, "condition": "above", "severity": "warning"}
+    verified = []
+
+    async def fake_verify(breaching, entry):
+        verified.append(entry)
+
+    with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 1400}}), \
+         patch("jobs.ingest.load_criteria", return_value=[criterion]), \
+         patch("jobs.ingest._verify_all", side_effect=fake_verify), \
+         patch("jobs.ingest.state"):
+        await _run_read(S, [])
+        await asyncio.sleep(0)
+
+    assert ingest._pending_live["data"] == {"sen6x": {"co2": 600}}
+    assert verified[0]["data"] == {"sen6x": {"co2": 1400}}
+
+
+async def test_take_sample_publishes_locally_and_keeps_the_sample():
+    with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 555}}), \
+         patch("jobs.ingest.state") as mock_state:
+        ingest._take_sample([])
+
+    mock_state.set.assert_called_once()
+    assert mock_state.set.call_args[0][0] == {"sen6x": {"co2": 555}}
+    assert ingest._samples == [{"sen6x": {"co2": 555}}]
+
+
+async def test_sample_until_boundary_samples_every_interval_then_stops(monkeypatch):
+    """With 200 s to the boundary and 60 s samples: samples at 60, 120, 180, then
+    a 20 s wait to the boundary, where _run_read takes over."""
+    monkeypatch.setattr(ingest, "SAMPLE_SECONDS", 60)
+    clock = [1000.0]
+    waits = []
+
+    async def fake_wait(seconds):
+        waits.append(round(seconds))
+        clock[0] += seconds
+
+    with patch("jobs.ingest._time_mod.monotonic", side_effect=lambda: clock[0]), \
+         patch("jobs.ingest._wait_for_boundary", side_effect=fake_wait), \
+         patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 500}}), \
+         patch("jobs.ingest.state"):
+        await ingest._sample_until_boundary(200, [])
+
+    assert waits == [60, 60, 60, 20]
+    assert len(ingest._samples) == 3
+
+
+async def test_sample_until_boundary_returns_early_on_window_change(monkeypatch):
+    monkeypatch.setattr(ingest, "SAMPLE_SECONDS", 60)
+    ingest._settings_event = asyncio.Event()
+
+    async def fake_wait(seconds):
+        ingest._settings_event.set()        # the server moved the active window
+
+    with patch("jobs.ingest._wait_for_boundary", side_effect=fake_wait), \
+         patch("jobs.ingest.read_sensor") as mock_read:
+        await ingest._sample_until_boundary(900, [])
+
+    mock_read.assert_not_called()
+
+
+async def test_sample_until_boundary_no_samples_when_interval_is_short(monkeypatch):
+    """SAMPLE_INTERVAL at or above the upload interval: every read is an upload, as before."""
+    monkeypatch.setattr(ingest, "SAMPLE_SECONDS", 60)
+    waits = []
+
+    async def fake_wait(seconds):
+        waits.append(round(seconds))
+
+    with patch("jobs.ingest._wait_for_boundary", side_effect=fake_wait), \
+         patch("jobs.ingest.read_sensor") as mock_read:
+        await ingest._sample_until_boundary(30, [])
+
+    assert waits == [30]
+    mock_read.assert_not_called()
 
 
 # ── _try_post ─────────────────────────────────────────────────────────────────
