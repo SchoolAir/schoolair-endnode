@@ -906,7 +906,8 @@ def _maybe_trigger_update(response: dict) -> None:
 
 async def _handle_response(response: dict) -> None:
     """Process server directives from any successful ingest response."""
-    if response.get("criteria"):
+    # Every successful upload carries the criteria; only a change is worth an SD write.
+    if response.get("criteria") and response["criteria"] != load_criteria():
         save_criteria(response["criteria"])
     _maybe_trigger_update(response)
     schedule = response.get("schedule")
