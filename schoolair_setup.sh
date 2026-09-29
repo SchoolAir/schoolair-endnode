@@ -320,6 +320,21 @@ mkdir -p "$SCHOOLAIR_DIR"
 _PRE_UPDATE_VERSION=""
 [ -f "${SCHOOLAIR_DIR}/jobs/ingest.py" ] \
     && _PRE_UPDATE_VERSION="$(grep -m1 '^VERSION' "${SCHOOLAIR_DIR}/jobs/ingest.py" | sed -nE 's/.*"([^"]+)".*/\1/p')"
+# Device-local state that lives in the app directory but is also tracked in the
+# repo as a default: config/settings.json (this device's upload offset
+# drain_jitter_seconds, ntp_clock_corrected, the server-pushed active window)
+# and config/criteria.json (the server-pushed alert criteria). Copying the repo
+# over them on every update drew a fresh random upload offset (undoing the
+# stagger across devices), dropped ntp_clock_corrected, and put the window and
+# criteria back to the repo defaults until the server sent them again. They are
+# kept like .env. install_dir_with_backup's backup still holds them, so a
+# rollback restores them too; a fresh install gets the repo defaults.
+DEVICE_CONFIG_KEEP="$(mktemp -d)"
+for f in settings.json criteria.json; do
+    if [ -f "${SCHOOLAIR_DIR}/config/${f}" ]; then
+        cp -p "${SCHOOLAIR_DIR}/config/${f}" "${DEVICE_CONFIG_KEEP}/${f}"
+    fi
+done
 if [ -f "${SCHOOLAIR_DIR}/.env" ]; then
     cp "${SCHOOLAIR_DIR}/.env" /tmp/schoolair-env.bak
     install_dir_with_backup "$REPO_DIR" "$SCHOOLAIR_DIR"
@@ -330,6 +345,13 @@ else
     cp "${SCHOOLAIR_DIR}/.env.example" "${SCHOOLAIR_DIR}/.env"
     ok "App deployed + .env created from .env.example"
 fi
+for f in settings.json criteria.json; do
+    if [ -f "${DEVICE_CONFIG_KEEP}/${f}" ]; then
+        mv "${DEVICE_CONFIG_KEEP}/${f}" "${SCHOOLAIR_DIR}/config/${f}"
+        ok "config/${f} kept (device's own copy)"
+    fi
+done
+rm -rf "$DEVICE_CONFIG_KEEP"
 chown -R "${ADMIN_USER}:${ADMIN_USER}" "$SCHOOLAIR_DIR"
 rm -rf "$REPO_DIR"
 
