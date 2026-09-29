@@ -1071,6 +1071,41 @@ def test_version_is_older_than_returns_false_on_malformed():
     assert _version_is_older_than("not-a-version") is False
 
 
+# ── The first reading after a start ───────────────────────────────────────────
+
+async def test_the_first_reading_after_a_start_is_uploaded(monkeypatch):
+    """ingest_loop starts the read loop before the upload loop: the first reading
+    is taken before the upload loop exists. It used to be signalled to nobody."""
+    monkeypatch.setenv("NEW_AUTH_TOKEN", "tok")
+    assert ingest._live_event is None           # a fresh start
+    posted = []
+
+    async def fake_post(readings, backlog, bpr=None, timeout=3.0):
+        posted.append(readings)
+        return {"credit_bytes": 0}
+
+    with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 512}}), \
+         patch("jobs.ingest.load_criteria", return_value=[]), \
+         patch("jobs.ingest.state"), \
+         patch("jobs.ingest.queue.count_pending", return_value=0), \
+         patch("jobs.ingest._try_post", side_effect=fake_post), \
+         patch("jobs.ingest._handle_response", new_callable=AsyncMock), \
+         patch("jobs.ingest._mirror_batch", new_callable=AsyncMock), \
+         patch("jobs.ingest._confirm_update_if_pending"):
+        await _run_read(S, [])                   # the read loop's first boundary
+        task = asyncio.create_task(ingest._upload_loop())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert len(posted) == 1
+    assert posted[0][0]["data"] == {"sen6x": {"co2": 512}}
+
+
 # ── _upload_loop queues on missing token ──────────────────────────────────────
 
 async def test_upload_loop_queues_to_sqlite_when_no_token(tmp_db, monkeypatch):
