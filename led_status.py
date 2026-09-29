@@ -62,6 +62,18 @@ LED_STATE_FILE = "/run/schoolair-led-state"
 # cutting it mid-move loses the flower's position (it has no sensor). The LED
 # holds a steady glow on plain PWM instead, which pigpiod times independently.
 FLOWER_MOVING_FLAG = "/run/schoolair-flower/moving"
+# The flower service writes "thinking" here while it holds still for want of a
+# valid reading (sensor fault, reading too old), so the LED says "no data"
+# instead of breathing "all's well". It has its own file because LED_STATE_FILE
+# can't carry it: jobs/ingest.py writes "ok" there after every upload, and its
+# ping loop turns "thinking" into "ok" within 15 s, so a request written there
+# vanished. The flower rewrites the file on every poll (60 s) while holding and
+# removes it once it has a reading; a request older than
+# FLOWER_REQUEST_MAX_AGE_S is ignored, so a stopped or crashed flower service
+# can't hold the LED at "thinking". It can only turn "ok" into "thinking",
+# never hide an error, AP mode or a sensor fault (see _resolve_state).
+FLOWER_LED_REQUEST_FILE = "/run/schoolair-flower/led-request"
+FLOWER_REQUEST_MAX_AGE_S = 300
 # One line of plain text describing the current error, present only while there
 # is one. Written here (the one place that knows what the LED would say) and
 # shown on the device dashboard (main.py), since AP mode hides "error" on the LED.
@@ -354,8 +366,28 @@ def _publish_error(reason: "str | None") -> None:
         print(f"[led] warning: could not update {DEVICE_ERROR_FILE}: {e}")
 
 
+def _flower_request(mtime_ns: "int | None", now_wall: float) -> "str | None":
+    """The wilting flower's LED request ("thinking"), or None if there is none,
+    it's stale, or it says anything else. mtime_ns is the file's, from
+    _flower_request_mtime(); passing it in keeps the 1 Hz poll to one stat()."""
+    if mtime_ns is None or now_wall - mtime_ns / 1e9 > FLOWER_REQUEST_MAX_AGE_S:
+        return None
+    try:
+        with open(FLOWER_LED_REQUEST_FILE) as f:
+            return "thinking" if f.read().strip() == "thinking" else None
+    except OSError:
+        return None
+
+
+def _flower_request_mtime() -> "int | None":
+    try:
+        return os.stat(FLOWER_LED_REQUEST_FILE).st_mtime_ns
+    except OSError:
+        return None
+
+
 def _resolve_state(health: dict, now_mono: float, raw_state: "str | None" = None,
-                   ap_active: bool = False) -> str:
+                   ap_active: bool = False, flower_request: "str | None" = None) -> str:
     """Precedence, highest to lowest:
       0. AP mode (ap_active): "error" from any source below shows as "ap" — the
          device is waiting for someone to set it up, and the error itself is
@@ -370,8 +402,13 @@ def _resolve_state(health: dict, now_mono: float, raw_state: "str | None" = None
          time) — it shouldn't look identical to a real upload error on an
          already-registered device. A genuine "no_sensor" still passes
          straight through unchanged — a hardware problem is a hardware
-         problem in either mode."""
+         problem in either mode.
+      3. The wilting flower's request (flower_request, see
+         FLOWER_LED_REQUEST_FILE): "thinking" replaces "ok" only. Uploading
+         fine while the sensor has no valid CO2 is not "all's well"."""
     state = raw_state if raw_state is not None else _read_state()
+    if state == "ok" and flower_request == "thinking":
+        state = "thinking"
     if state == "error" and not _is_registered():
         state = "ap"
     if now_mono < health["unhealthy_until"]:
@@ -642,6 +679,8 @@ def main() -> None:
     # process's environment can't be changed from outside.)
     raw_state = _read_state()
     state_mtime = _state_file_mtime()
+    flower_mtime = _flower_request_mtime()   # same stat-then-read-on-change idea
+    flower_request = _flower_request(flower_mtime, time.time())
     last_heartbeat = time.monotonic()
     ap_active = _ap_active()
     last_reason = None
@@ -653,7 +692,13 @@ def main() -> None:
             if mtime != state_mtime:
                 raw_state = _read_state()
                 state_mtime = mtime
-            state = _resolve_state(health, now_mono, raw_state, ap_active)
+            fmtime = _flower_request_mtime()
+            if fmtime != flower_mtime:
+                flower_request = _flower_request(fmtime, time.time())
+                flower_mtime = fmtime
+            elif flower_request and time.time() - flower_mtime / 1e9 > FLOWER_REQUEST_MAX_AGE_S:
+                flower_request = None            # not refreshed: the flower has stopped asking
+            state = _resolve_state(health, now_mono, raw_state, ap_active, flower_request)
             reason = _error_reason(health, now_mono)
             if reason != last_reason:
                 _publish_error(reason)
@@ -681,7 +726,7 @@ def main() -> None:
                 else:
                     wave_id = new_wave
                 print(f"[led] state {last_state} -> {state} "
-                      f"(state file: {_read_state()}, health override: "
+                      f"(state file: {_read_state()}, flower request: {flower_request}, health override: "
                       f"{now_mono < health['unhealthy_until']}, AP: {ap_active}; "
                       f"{len(segments)} pulses, {sum(us for _, us in segments) / 1e6:.2f}s cycle)")
                 last_state = state

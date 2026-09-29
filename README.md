@@ -136,6 +136,14 @@ reason. The flower side waits 1.5 s after raising the flag, watches
 `wave_tx_at()` during the move, and treats a replaced or overdue wave as an
 interruption (position unknown, re-home).
 
+The flower can also ask the LED for "thinking" when it is holding still because
+it has no valid reading (a sensor fault, or a reading too old). It writes the
+word to `/run/schoolair-flower/led-request`, refreshes it every poll while it
+holds, and deletes it when it has a reading again. That request can only turn
+"ok" into "thinking"; errors, AP mode and "no_sensor" still show. A request not
+refreshed for 5 minutes is ignored. It has its own file because the shared
+`/run/schoolair-led-state` is rewritten to "ok" by every upload.
+
 ### Installing the flower
 
 The flower's code lives in `SchoolAir/Flower-End-node`. `deploy/flower.ref`
