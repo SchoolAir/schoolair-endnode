@@ -510,9 +510,11 @@ step "13 / nginx  (configured, disabled until registration)"
 CERT_FILE="${SCHOOLAIR_DIR}/registration_wizard/cert.pem"
 KEY_FILE="${SCHOOLAIR_DIR}/registration_wizard/key.pem"
 cat > /etc/nginx/sites-available/default << NGINXEOF
+# access_log off: a line on the SD card per dashboard request — nobody reads it.
 server {
     listen 80;
     server_name _;
+    access_log off;
     location / {
         proxy_pass http://127.0.0.1:${TELEMETRY_PORT};
         proxy_http_version 1.1;
@@ -525,6 +527,7 @@ server {
 server {
     listen 443 ssl;
     server_name _;
+    access_log off;
     ssl_certificate     ${CERT_FILE};
     ssl_certificate_key ${KEY_FILE};
     location / {

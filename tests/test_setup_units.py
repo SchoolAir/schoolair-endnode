@@ -21,3 +21,11 @@ def test_e2scrub_units_are_stopped_before_they_are_masked():
 def test_stale_failed_state_of_the_masked_units_is_cleared():
     mask = TEXT.index("systemctl mask e2scrub_reap.service e2scrub_all.timer")
     assert "systemctl reset-failed e2scrub_all.timer e2scrub_reap.service" in TEXT[mask:mask + 300]
+
+
+# ── nginx doesn't log every request to the SD card ───────────────────────────
+
+def test_nginx_does_not_log_every_request():
+    block = TEXT[TEXT.index("cat > /etc/nginx/sites-available/default"):TEXT.index("NGINXEOF\nln -sf")]
+    assert block.count("server {") == 2
+    assert block.count("access_log off;") == 2
