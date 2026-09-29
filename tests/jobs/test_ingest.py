@@ -965,6 +965,28 @@ def test_auth_headers_include_version():
     assert "X-Schoolair-Version" in headers
     assert headers["X-Schoolair-Version"] == VERSION
 
+def test_auth_headers_carry_device_identity(monkeypatch):
+    """The server binds the token to the MAC (401 without it) and checks the
+    CPU serial when present."""
+    import device_identity
+    monkeypatch.setattr(device_identity, "read_mac", lambda: "b8:27:eb:a0:33:f7")
+    monkeypatch.setattr(device_identity, "read_cpu_serial", lambda: "00000000abcdef12")
+    headers = _auth_headers()
+    assert headers["X-Device-Mac"] == "b8:27:eb:a0:33:f7"
+    assert headers["X-Device-Cpu-Serial"] == "00000000abcdef12"
+
+
+def test_auth_headers_omit_unknown_identity(monkeypatch):
+    """No MAC or serial readable (laptop): send nothing rather than 'unknown',
+    which the server would reject as a malformed MAC anyway."""
+    import device_identity
+    monkeypatch.setattr(device_identity, "read_mac", lambda: device_identity.UNKNOWN)
+    monkeypatch.setattr(device_identity, "read_cpu_serial", lambda: device_identity.UNKNOWN)
+    headers = _auth_headers()
+    assert "X-Device-Mac" not in headers
+    assert "X-Device-Cpu-Serial" not in headers
+
+
 def test_auth_headers_include_bearer():
     with patch.dict("os.environ", {"NEW_AUTH_TOKEN": "tok123"}):
         headers = _auth_headers()

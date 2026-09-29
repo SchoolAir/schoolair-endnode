@@ -575,11 +575,26 @@ async def _drain_alerts():
 
 
 def _auth_headers() -> dict:
-    return {
+    """Headers for every call to the primary server.
+
+    Since 2026-09-23 the server binds each token to the MAC it was registered
+    with (schoolair-server deviceAuth.ts): a request without a valid
+    X-Device-Mac is a 401 before the token is even looked at, and a CPU serial,
+    when sent, must match the one on file. Both are read live, the same values
+    device_identity.enforce() locks the card to. Unknown values are left out
+    rather than sent as garbage.
+    """
+    headers = {
         "Authorization":      f"Bearer {os.getenv('NEW_AUTH_TOKEN', '').strip()}",
         "Content-Type":       "application/json",
         "X-Schoolair-Version": VERSION,
     }
+    mac, serial = device_identity.read_mac(), device_identity.read_cpu_serial()
+    if mac != device_identity.UNKNOWN:
+        headers["X-Device-Mac"] = mac
+    if serial != device_identity.UNKNOWN:
+        headers["X-Device-Cpu-Serial"] = serial
+    return headers
 
 
 async def _try_post(
