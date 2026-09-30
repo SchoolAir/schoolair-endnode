@@ -88,7 +88,7 @@
     "combine": "min (the worse metric wins)",
     "hysteresis_mm": 2.0,
     "max_reading_age_min": 30,
-    "poll_seconds": 60,
+    "poll_seconds": 10,
     "note": "CO2 1000 ppm = classroom ventilation guideline (no WHO value exists for CO2); PM2.5 15 = WHO 24-h guideline, 25 = WHO interim target 4, 5 = WHO annual. Values between rows interpolate linearly. Edit and restart schoolair-flower.",
     "valid_range": {
       "co2": [
@@ -100,7 +100,9 @@
         1000
       ]
     },
-    "valid_range_note": "Outside these bounds a reading is a sensor fault (SEN6x sends CO2 32766 or PM 6553.5 for 'no valid value'): the flower holds and the LED shows thinking."
+    "valid_range_note": "Outside these bounds a reading is a sensor fault (SEN6x sends CO2 32766 or PM 6553.5 for 'no valid value'): the flower holds and the LED shows thinking.",
+    "smoothing_window_s": 30,
+    "smoothing_note": "Median of the readings from the last N seconds. One reading a minute (normal firmware mode) = no smoothing; in incident mode (a reading every 10 s) the median of three stops the motor twitching. 0 disables."
   },
   "moves": {
     "down_us": 3000,
