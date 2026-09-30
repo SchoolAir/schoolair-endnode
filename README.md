@@ -361,6 +361,16 @@ Pi reads and drains at the higher cadence (school hours).
 
 - Window boundaries must be on a 15-minute mark (`:00`, `:15`, `:30`, `:45`).
 - Maximum window length is 9 hours.
+- `incident` (optional block): while the air is changing fast, the sensor is
+  read every `sample_seconds` (10) instead of every minute, so the wilting
+  flower can follow within seconds. An incident starts when PM2.5 more than
+  doubles (`pm25_jump_factor` 2) or rises across `pm25_threshold` (15 µg/m³),
+  or CO2 rises by `co2_jump_ppm` (100) in a minute or across `co2_threshold`
+  (1000 ppm). It ends after `steady_minutes` (5) with every reading within
+  ±`steady_pm25` (2) and ±`steady_co2` (50) of the window's mean. Only
+  `latest.json` sees the extra readings: the upload mean keeps one reading a
+  minute, so uploads are unchanged. `"enabled": false` switches it off. See
+  `jobs/incident.py`.
 - `temp_offset_c` (default `0`): this unit's temperature correction in °C,
   for a sensor warmed by its enclosure. Measure the unit against a room
   thermometer and enter the difference, e.g. `-4.7` if it reads 4.7 °C high.

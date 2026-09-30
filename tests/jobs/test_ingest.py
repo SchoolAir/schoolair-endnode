@@ -64,6 +64,8 @@ def reset_ingest_state():
     """Clear mutable module-level state before and after each test."""
     ingest._alert_buffer.clear()
     ingest._samples.clear()
+    ingest._last_kept_mono     = None
+    ingest._incident           = ingest.IncidentDetector()
     ingest._pending_live       = None
     ingest._live_event         = None
     ingest._credit_bytes       = 0
@@ -76,6 +78,8 @@ def reset_ingest_state():
     yield
     ingest._alert_buffer.clear()
     ingest._samples.clear()
+    ingest._last_kept_mono     = None
+    ingest._incident           = ingest.IncidentDetector()
     ingest._pending_live       = None
     ingest._live_event         = None
     ingest._credit_bytes       = 0

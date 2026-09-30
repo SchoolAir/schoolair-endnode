@@ -1,4 +1,10 @@
 {
     "active_window": { "start": "07:00", "end": "16:00" },
-    "temp_offset_c": 0
+    "temp_offset_c": 0,
+    "incident": {
+        "sample_seconds": 10,
+        "pm25_jump_factor": 2.0, "pm25_threshold": 15,
+        "co2_jump_ppm": 100, "co2_threshold": 1000,
+        "steady_minutes": 5, "steady_pm25": 2, "steady_co2": 50
+    }
 }

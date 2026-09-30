@@ -43,6 +43,7 @@ import db.queue as queue
 import device_identity
 from atomic_file import write_atomic
 import jobs.aggregate as aggregate
+from jobs.incident import IncidentDetector, load_config as load_incident_config
 import state
 
 load_dotenv()
@@ -150,6 +151,8 @@ NTP_STEP_THRESHOLD_S = 30  # divergence above this (seconds) indicates an NTP st
 # ── Upload state ──────────────────────────────────────────────────────────────
 
 _samples:           list[dict]    = []     # this upload interval's samples, oldest first
+_last_kept_mono:    float | None  = None   # when the last sample went into _samples (monotonic)
+_incident:          IncidentDetector = IncidentDetector()   # reconfigured from settings.json in ingest_loop()
 _pending_live:      dict | None   = None   # reading ready to POST (set by _run_read)
 _live_event:        asyncio.Event | None = None  # signalled when _pending_live is ready
 _credit_bytes:      int   = 0              # server-granted byte budget; always overwritten
@@ -1030,10 +1033,16 @@ async def _ntp_correction_task():
 # ── Read step ─────────────────────────────────────────────────────────────────
 
 
-def _take_sample(active_sensors: list, recorded_at: str | None = None) -> dict | None:
+def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: bool = False) -> dict | None:
     """Read the sensors once, publish the result locally and keep it for the
     next upload's mean. Returns the reading, or None if the SEN6x read failed
-    (aux sensors are optional: a failed one is just missing from the reading)."""
+    (aux sensors are optional: a failed one is just missing from the reading).
+
+    Every reading goes to latest.json and to the incident detector. Only one
+    per SAMPLE_SECONDS goes into the upload mean (or this one when `keep`,
+    the upload-boundary sample), so incident-mode readings every 10 s don't
+    weigh more in the 5/15-minute average than a calm minute does."""
+    global _last_kept_mono
     if recorded_at is None:
         recorded_at = datetime.now(timezone.utc).isoformat()
     try:
@@ -1050,7 +1059,17 @@ def _take_sample(active_sensors: list, recorded_at: str | None = None) -> dict |
             data.update(reading)
 
     state.set(data, recorded_at)
-    _samples.append(data)
+
+    now = _time_mod.monotonic()
+    change = _incident.observe(data, now)
+    if change == "start":
+        print(f"[incident] air changing fast — reading every {_incident.cfg['sample_seconds']}s")
+    elif change == "end":
+        print(f"[incident] steady for {_incident.cfg['steady_minutes']:g} min — back to every {SAMPLE_SECONDS}s")
+
+    if keep or _last_kept_mono is None or now - _last_kept_mono >= SAMPLE_SECONDS - 1:
+        _samples.append(data)
+        _last_kept_mono = now
     return data
 
 
@@ -1064,7 +1083,7 @@ async def _run_read(settings: dict, active_sensors: list):
     global _pending_live, _samples
 
     recorded_at = datetime.now(timezone.utc).isoformat()
-    data = _take_sample(active_sensors, recorded_at)
+    data = _take_sample(active_sensors, recorded_at, keep=True)
     samples, _samples = _samples, []
     if not samples:
         return  # no successful read this interval: nothing to send
@@ -1283,17 +1302,19 @@ async def _read_loop(active_sensors: list):
 
 
 async def _sample_until_boundary(seconds: float, active_sensors: list) -> None:
-    """Between two uploads: take a sample every SAMPLE_SECONDS until the next
-    upload boundary, `seconds` from now. Returns at the boundary, or early when
-    the active window changes (the read loop then uploads at once, as before).
+    """Between two uploads: take a sample every SAMPLE_SECONDS (or every few
+    seconds during an incident, see jobs/incident.py) until the next upload
+    boundary, `seconds` from now. Returns at the boundary, or early when the
+    active window changes (the read loop then uploads at once, as before).
     Samples are not logged: one line a minute would only wear the SD card."""
     deadline = _time_mod.monotonic() + seconds
     while True:
+        step = _incident.sample_seconds or SAMPLE_SECONDS
         remaining = deadline - _time_mod.monotonic()
-        if remaining <= SAMPLE_SECONDS:
+        if remaining <= step:
             await _wait_for_boundary(remaining)
             return
-        await _wait_for_boundary(SAMPLE_SECONDS)
+        await _wait_for_boundary(step)
         if _settings_event is not None and _settings_event.is_set():
             return
         _take_sample(active_sensors)
@@ -1324,11 +1345,12 @@ async def _enter_identity_lockout() -> None:
 
 async def ingest_loop():
     """Initialise SQLite, probe aux sensors, run read / upload / NTP tasks."""
-    global _settings, _settings_event
+    global _settings, _settings_event, _incident
     queue.init()
     _settings = load_settings()
     validate_settings(_settings)
     _settings_event = asyncio.Event()
+    _incident = IncidentDetector(load_incident_config(_settings))   # settings.json "incident"
     # Always sent, 0 included: an offset set earlier survives a service
     # restart on the sensor, so changing it back to 0 must reach it too.
     set_temperature_offset(_temperature_offset(_settings))
