@@ -470,7 +470,7 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
         await asyncio.sleep(10)
         r1_at = datetime.now(timezone.utc).isoformat()
         try:
-            r1 = read_sensor()
+            r1 = await _read_off_loop(read_sensor)
         except RuntimeError as e:
             print(f"[verify/{metrics_str}] T+10s read failed: {e} — aborting")
             entry["severity"] = sev
@@ -482,7 +482,7 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
         await asyncio.sleep(20)
         r2_at = datetime.now(timezone.utc).isoformat()
         try:
-            r2 = read_sensor()
+            r2 = await _read_off_loop(read_sensor)
         except RuntimeError as e:
             print(f"[verify/{metrics_str}] T+30s read failed: {e} — aborting")
             entry["severity"] = sev
@@ -504,7 +504,7 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
         await asyncio.sleep(30)
         r3_at = datetime.now(timezone.utc).isoformat()
         try:
-            r3 = read_sensor()
+            r3 = await _read_off_loop(read_sensor)
         except RuntimeError as e:
             print(f"[verify/{metrics_str}] T+1m read failed: {e} — inconclusive")
             entry["severity"] = sev
@@ -518,7 +518,7 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
         r4_at = datetime.now(timezone.utc).isoformat()
         r4: dict | None = None
         try:
-            r4 = read_sensor()
+            r4 = await _read_off_loop(read_sensor)
         except RuntimeError as e:
             print(f"[verify/{metrics_str}] T+2m read failed: {e} — partial stage 2")
         if r4 is not None:
@@ -1061,7 +1061,32 @@ async def _ntp_correction_task():
 # ── Read step ─────────────────────────────────────────────────────────────────
 
 
-def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: bool = False) -> dict | None:
+_sensor_lock: asyncio.Lock | None = None
+
+
+async def _read_off_loop(read, *args):
+    """Run a sensor read in a worker thread. A read is a subprocess: about a
+    second normally, up to 10 s on a timeout, 15 s per aux driver, and 90 s when
+    read_sensor() re-initialises the SEN6x. Run on the event loop, as it was,
+    that froze the dashboard, uploads and the ping loop at every sample. One
+    read at a time: the read loop and _verify_all share the I2C bus."""
+    global _sensor_lock
+    if _sensor_lock is None:
+        _sensor_lock = asyncio.Lock()
+    async with _sensor_lock:
+        return await asyncio.to_thread(read, *args)
+
+
+def _read_all_sensors(active_sensors: list) -> dict:
+    data = read_sensor()
+    for sensor in active_sensors:
+        reading = read_aux_sensor(sensor)
+        if reading:
+            data.update(reading)
+    return data
+
+
+async def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: bool = False) -> dict | None:
     """Read the sensors once, publish the result locally and keep it for the
     next upload's mean. Returns the reading, or None if the SEN6x read failed
     (aux sensors are optional: a failed one is just missing from the reading).
@@ -1074,7 +1099,7 @@ def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: boo
     if recorded_at is None:
         recorded_at = datetime.now(timezone.utc).isoformat()
     try:
-        data = read_sensor()
+        data = await _read_off_loop(_read_all_sensors, active_sensors)
     except RuntimeError as e:
         print(f"Sensor read failed: {e}")
         _sensor_failing = True
@@ -1089,11 +1114,6 @@ def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: boo
         _sensor_failing = False
         if _get_led_state() == "no_sensor":
             _set_led_state("ap" if _identity_locked else "thinking")
-
-    for sensor in active_sensors:
-        reading = read_aux_sensor(sensor)
-        if reading:
-            data.update(reading)
 
     now = _time_mod.monotonic()
     change = _incident.observe(data, now)
@@ -1119,7 +1139,7 @@ async def _run_read(settings: dict, active_sensors: list):
     global _pending_live, _samples
 
     recorded_at = datetime.now(timezone.utc).isoformat()
-    data = _take_sample(active_sensors, recorded_at, keep=True)
+    data = await _take_sample(active_sensors, recorded_at, keep=True)
     samples, _samples = _samples, []
     if not samples:
         return  # no successful read this interval: nothing to send
@@ -1360,7 +1380,10 @@ async def _sample_until_boundary(seconds: float, active_sensors: list) -> None:
         await _wait_for_boundary(step)
         if _settings_event is not None and _settings_event.is_set():
             return
-        _take_sample(active_sensors)
+        await _take_sample(active_sensors)
+        # The window may also change during the read; the next wait would clear it.
+        if _settings_event is not None and _settings_event.is_set():
+            return
 
 
 async def _enter_identity_lockout() -> None:
