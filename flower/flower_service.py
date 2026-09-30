@@ -270,6 +270,33 @@ def reading_problem(reading, cal):
             return f"{metric} {v:g} outside {lo:g}-{hi:g}"
     return None
 
+def smoothed_reading(recent, cal):
+    """Median per metric over the readings in the last mapping.smoothing_window_s.
+
+    With one reading a minute (normal mode) the window holds a single reading, so
+    this is the plain reading and the flower behaves as before. When the firmware
+    is in incident mode (a reading every 10 s after a jump) the window holds three,
+    and the median stops the motor twitching on every wobble while still following
+    a real change within about half a minute. The window is measured on the
+    readings' own timestamps, so a stale file or a slow poll cannot widen it.
+    """
+    if not recent:
+        return None
+    newest = recent[-1]
+    out = dict(newest)
+    for metric in cal["mapping"]["tables"]:
+        vals = sorted(float(r[metric]) for r in recent if r.get(metric) is not None)
+        if vals:
+            out[metric] = vals[len(vals) // 2] if len(vals) % 2 else (vals[len(vals) // 2 - 1] + vals[len(vals) // 2]) / 2
+    return out
+
+def _epoch(reading):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(reading["recorded_at"].replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
 def target_height(reading, cal):
     """Returns (height_mm, details). The worse metric (lower height) wins."""
     m = cal["mapping"]; positions = cal["positions"]
@@ -290,6 +317,7 @@ class Flower:
         self.st = Stepper(self.cal)
         self.pos = self.cal.get("current_position_mm")
         self.last_reading = None
+        self.recent = []                  # valid readings inside the smoothing window, oldest first
         self.just_homed = False
         self._started = time.time()   # heartbeat waits a full interval after start
         mv = self.cal["moves"]
@@ -378,15 +406,25 @@ class Flower:
             # Hold: a sensor fault is "no data", and the LED says so ("thinking").
             return {"status": "invalid reading", "problem": problem, "recorded_at": r.get("recorded_at"),
                     "held_at_mm": self.pos}
-        target, per_metric = target_height(r, self.cal)
+        # Keep the valid readings of the last smoothing window and score their median.
+        window = float(self.cal["mapping"].get("smoothing_window_s", 0))
+        t = _epoch(r)
+        if not self.recent or r.get("recorded_at") != self.recent[-1].get("recorded_at"):
+            self.recent.append(r)
+        if t is not None:
+            self.recent = [x for x in self.recent if (_epoch(x) or t) > t - window]
+        self.recent = self.recent[-25:]
+        sm = smoothed_reading(self.recent, self.cal) if window > 0 else r
+        target, per_metric = target_height(sm, self.cal)
         if target is None:
             return {"status": "no mapped metric in reading", "reading": r}
         hyst = self.cal["mapping"]["hysteresis_mm"]
         moved = False
         if self.pos is None or abs(target - self.pos) >= hyst:
             self.goto(target); moved = True
-        return {"status": "ok", "co2": r.get("co2"), "pm25": r.get("pm25"), "age_min": round(age or 0, 1),
-                "heights": per_metric, "target_mm": target, "position_mm": self.pos, "moved": moved}
+        return {"status": "ok", "co2": sm.get("co2"), "pm25": sm.get("pm25"), "n": len(self.recent),
+                "age_min": round(age or 0, 1), "heights": per_metric, "target_mm": target,
+                "position_mm": self.pos, "moved": moved}
 
     # ------------------------------------------------------------ cold boot
     def _is_cold_boot(self):

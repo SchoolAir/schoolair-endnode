@@ -33,11 +33,13 @@ def test_nginx_does_not_log_every_request():
 
 # ── Automatic apt runs (security updates ship through OTA instead) ───────────
 
-def test_unattended_upgrades_not_installed_or_configured_on():
+def test_unattended_upgrades_installed_but_never_run_automatically():
+    """The tool is installed (OTA runs it by hand), its daily runs are not."""
     install = TEXT.split("apt-get install -y", 1)[1].split("\n    ok ", 1)[0]
-    assert "unattended-upgrades" not in install
+    assert "unattended-upgrades" in install
     assert 'Unattended-Upgrade "1"' not in TEXT
     assert 'Update-Package-Lists "1"' not in TEXT
+    assert 'APT::Periodic::Unattended-Upgrade "0";' in TEXT
 
 
 def test_apt_timers_are_stopped_before_they_are_masked():
