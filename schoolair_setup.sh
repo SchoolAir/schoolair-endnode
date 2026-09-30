@@ -840,10 +840,13 @@ if [[ "$MODE" == "--update" ]]; then
     systemctl restart sen6x.service           || warn "sen6x.service restart failed"
     systemctl restart schoolair.service       || warn "schoolair.service restart failed"
     # New flower code only takes effect on restart; same wait as for pigpiod.
-    # try-restart: leaves it stopped on units where its drop-in keeps it off.
+    # restart, not try-restart: on the update that first installs the flower it
+    # isn't running yet, and try-restart left it stopped until the next reboot.
+    # Its drop-in's conditions still keep it off where no flower is fitted (an
+    # unmet condition skips the start; it is not a failure).
     if [ "$FLOWER_CHANGED" = 1 ]; then
         wait_for_flower_move
-        systemctl try-restart schoolair-flower.service || warn "schoolair-flower.service restart failed"
+        systemctl restart schoolair-flower.service || warn "schoolair-flower.service restart failed"
     fi
     # schoolair-netwatch.service is a long-running bash process — cp'ing a new
     # netwatch.sh to disk does NOT make its already-running interpreter pick up

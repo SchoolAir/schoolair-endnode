@@ -136,9 +136,15 @@ def test_same_pin_is_not_reinstalled():
 
 
 def test_update_restarts_the_flower_only_when_it_changed_and_not_mid_move():
-    restart = SETUP.index("systemctl try-restart schoolair-flower.service")
+    restart = SETUP.index("systemctl restart schoolair-flower.service")
     guard = SETUP.rindex('if [ "$FLOWER_CHANGED" = 1 ]', 0, restart)
     assert "wait_for_flower_move" in SETUP[guard:restart]
+
+
+def test_update_starts_a_newly_installed_flower():
+    """try-restart skips a unit that isn't running, so the update that first
+    installed the flower left it stopped until the next reboot."""
+    assert "try-restart schoolair-flower" not in SETUP
 
 
 def test_wait_for_flower_move_outlasts_a_blind_home():
