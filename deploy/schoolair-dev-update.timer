@@ -1,0 +1,10 @@
+[Unit]
+Description=SchoolAir: hourly check of the dev branch for a newer firmware (dev-channel units only)
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

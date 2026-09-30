@@ -100,7 +100,7 @@ def _confirm_update_if_pending() -> None:
     except OSError as e:
         print(f"[OTA] Warning: could not clear pending-update marker: {e}")
 
-VERSION = "2.3.16"
+VERSION = "2.3.17"
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
@@ -608,6 +608,20 @@ async def _drain_alerts():
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 
+CHANNEL_FILE = "/etc/schoolair-channel"
+
+
+def _channel() -> str:
+    """Which branch this unit follows: "dev" (bench units, self-updating from
+    the dev branch hourly) or "stable" (school units, moved by the server's
+    min_version). Missing file = stable. Reported so the server can tell."""
+    try:
+        with open(CHANNEL_FILE) as f:
+            return "dev" if f.read().strip() == "dev" else "stable"
+    except OSError:
+        return "stable"
+
+
 def _auth_headers() -> dict:
     """Headers for every call to the primary server.
 
@@ -622,6 +636,7 @@ def _auth_headers() -> dict:
         "Authorization":      f"Bearer {os.getenv('NEW_AUTH_TOKEN', '').strip()}",
         "Content-Type":       "application/json",
         "X-Schoolair-Version": VERSION,
+        "X-Schoolair-Channel": _channel(),   # "dev" or "stable"; see schoolair-dev-update
     }
     mac, serial = device_identity.read_mac(), device_identity.read_cpu_serial()
     if mac != device_identity.UNKNOWN:

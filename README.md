@@ -47,6 +47,19 @@ school hours, ≤ 2 h outside them).
 SCHOOLAIR_MIN_VERSION=2.1.0
 ```
 
+**Channels.** Each unit follows a channel, written in `/etc/schoolair-channel`:
+
+| Channel | Units | Installs from | Updated when |
+|---|---|---|---|
+| `stable` (default, file absent) | schools | `main` | the server's `SCHOOLAIR_MIN_VERSION` is raised |
+| `dev` | the bench unit | `dev` | `schoolair-dev-update` finds a newer `VERSION` on the `dev` branch: it runs from `schoolair-dev-update.timer` every hour and installs it, without anyone running the update by hand |
+
+Both use the same `schoolair-update` and the same 40-minute rollback watchdog.
+A dev update waits for any flower move to finish first, and a version that was
+rolled back is recorded in `/var/lib/schoolair/dev-update-rolled-back` and not
+tried again. To put a unit on dev: `echo dev | sudo tee /etc/schoolair-channel`.
+The channel is sent in the `X-Schoolair-Channel` header with every upload.
+
 **To update a single Pi manually:**
 
 ```bash
