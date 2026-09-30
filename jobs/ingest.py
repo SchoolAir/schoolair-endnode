@@ -75,6 +75,17 @@ def _get_led_state() -> "str | None":
         return None
 
 
+# True from a failed SEN6x read until the next good one. While it is set the LED
+# keeps "no_sensor": uploading the interval's earlier samples, or a server
+# ping, must not turn a failing sensor back into "ok".
+_sensor_failing = False
+
+
+def _set_led_ok() -> None:
+    if not _sensor_failing:
+        _set_led_state("ok")
+
+
 # Held by the registration wizard for the whole of a connect-and-register attempt
 # (see registration_wizard/wizard.py run_registration). While it exists the wizard
 # owns the LED ("thinking" is its own), so don't second-guess it.
@@ -739,7 +750,7 @@ async def _startup_connectivity_ping() -> bool:
         if not res.is_success:
             _maybe_trigger_update_from_error(res)
             return False
-        _set_led_state("ok")
+        _set_led_ok()
         print("[startup] connectivity confirmed")
         try:
             response = res.json()
@@ -1059,16 +1070,25 @@ def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: boo
     per SAMPLE_SECONDS goes into the upload mean (or this one when `keep`,
     the upload-boundary sample), so incident-mode readings every 10 s don't
     weigh more in the 5/15-minute average than a calm minute does."""
-    global _last_kept_mono
+    global _last_kept_mono, _sensor_failing
     if recorded_at is None:
         recorded_at = datetime.now(timezone.utc).isoformat()
     try:
         data = read_sensor()
     except RuntimeError as e:
         print(f"Sensor read failed: {e}")
+        _sensor_failing = True
         _set_led_state("no_sensor")
         state.publish_error(str(e), recorded_at)
         return None
+
+    if _sensor_failing:
+        # The sensor is back. Without this the LED kept "no_sensor" until the
+        # next upload, up to 15 min after one missed sample. "thinking", not
+        # "ok": the ping loop confirms the server within _PING_RECHECK_S.
+        _sensor_failing = False
+        if _get_led_state() == "no_sensor":
+            _set_led_state("ap" if _identity_locked else "thinking")
 
     for sensor in active_sensors:
         reading = read_aux_sensor(sensor)
@@ -1284,7 +1304,7 @@ async def _upload_loop() -> None:
         asyncio.create_task(_mirror_batch([_format_reading(entry)]))
         await _handle_response(response)
         print(f"[upload] live reading sent (backlog: {backlog_count})")
-        _set_led_state("ok")
+        _set_led_ok()
         _confirm_update_if_pending()
 
         if backlog_count > 0 and _credit_bytes > 0:

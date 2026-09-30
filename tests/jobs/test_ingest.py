@@ -76,6 +76,7 @@ def reset_ingest_state():
     ingest._settings_event     = None
     ingest._verifying.clear()
     ingest.alert_cooldown.clear()
+    ingest._sensor_failing     = False
     yield
     ingest._alert_buffer.clear()
     ingest._samples.clear()
@@ -90,6 +91,7 @@ def reset_ingest_state():
     ingest._settings           = dict(S)
     ingest._settings_event     = None
     ingest._verifying.clear()
+    ingest._sensor_failing     = False
 
 
 @pytest.fixture
@@ -446,6 +448,47 @@ async def test_take_sample_publishes_the_error_when_the_read_fails():
 
     assert mock_state.publish_error.call_args[0][0] == "Sensor script timed out"
     assert ingest._samples == []
+
+
+# ── Status LED while sampling ─────────────────────────────────────────────────
+
+@pytest.fixture
+def led_file(tmp_path, monkeypatch):
+    path = tmp_path / "led-state"
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(path))
+    return path
+
+
+async def test_a_good_sample_after_a_failed_one_clears_no_sensor(led_file):
+    """One missed sample must not show a sensor fault until the next upload."""
+    with patch("jobs.ingest.read_sensor", side_effect=[RuntimeError("not ready"), {"sen6x": {"co2": 500}}]), \
+         patch("jobs.ingest.state"):
+        ingest._take_sample([])
+        assert led_file.read_text() == "no_sensor"
+        ingest._take_sample([])
+
+    assert led_file.read_text() == "thinking"   # the ping loop turns this into "ok"
+    assert not ingest._sensor_failing
+
+
+async def test_a_good_sample_leaves_other_led_states_alone(led_file):
+    led_file.write_text("error")
+    with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 500}}), \
+         patch("jobs.ingest.state"):
+        ingest._take_sample([])
+
+    assert led_file.read_text() == "error"
+
+
+async def test_an_upload_does_not_hide_a_failing_sensor(led_file):
+    """The boundary sample failed but earlier samples were uploaded: the LED
+    stays on "no_sensor" instead of going back to "ok"."""
+    with patch("jobs.ingest.read_sensor", side_effect=RuntimeError("sensor off")), \
+         patch("jobs.ingest.state"):
+        ingest._take_sample([])
+    ingest._set_led_ok()
+
+    assert led_file.read_text() == "no_sensor"
 
 
 async def test_sample_until_boundary_samples_every_interval_then_stops(monkeypatch):
