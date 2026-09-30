@@ -16,9 +16,19 @@
 #
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/SchoolAir/schoolair-endnode/main/schoolair_setup.sh"
+# Which branch this unit follows: /etc/schoolair-channel says "dev" (the bench
+# unit: installs from the dev branch, and schoolair-dev-update checks it hourly)
+# or "stable" (school units, and the default: main, moved by the server's
+# SCHOOLAIR_MIN_VERSION). REPO_BRANCH passes the choice on to the setup script.
+CHANNEL="$(tr -d '[:space:]' < /etc/schoolair-channel 2>/dev/null || true)"
+case "$CHANNEL" in
+    dev) BRANCH=dev ;;
+    *)   BRANCH=main ;;
+esac
+export REPO_BRANCH="$BRANCH"
+REPO_RAW="https://raw.githubusercontent.com/SchoolAir/schoolair-endnode/${BRANCH}/schoolair_setup.sh"
 
-echo "━━━ SchoolAir OTA update: $(date) ━━━"
+echo "━━━ SchoolAir OTA update: $(date) — channel ${CHANNEL:-stable}, branch ${BRANCH} ━━━"
 echo "Fetching setup script from ${REPO_RAW} …"
 
 _TMP=$(mktemp /tmp/schoolair-setup-XXXXXX.sh)

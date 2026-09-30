@@ -1,0 +1,10 @@
+[Unit]
+Description=SchoolAir: update from the dev branch if it has a newer version (dev-channel units only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/schoolair-dev-update
+StandardOutput=journal
+StandardError=journal

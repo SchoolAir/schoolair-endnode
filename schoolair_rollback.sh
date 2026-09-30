@@ -33,6 +33,7 @@ set -uo pipefail   # not -e: a failed restore of one path shouldn't abort the re
 BACKUP_ROOT="${SCHOOLAIR_BACKUP_ROOT:-/var/backups/schoolair-update}"
 BACKUP_MANIFEST="${SCHOOLAIR_BACKUP_MANIFEST:-${BACKUP_ROOT}.manifest}"
 PENDING_FILE="${SCHOOLAIR_PENDING_FILE:-/var/lib/schoolair/update-pending.json}"
+ROLLED_BACK_FILE="${SCHOOLAIR_ROLLED_BACK_FILE:-/var/lib/schoolair/dev-update-rolled-back}"
 LOG_TAG="[schoolair-rollback]"
 
 log() { echo "${LOG_TAG} $*"; }
@@ -64,6 +65,15 @@ restart_services() {
 
 do_restore_now() {
     log "Restoring from backup (immediate)…"
+    # Remember the version being reverted, so a dev-channel unit's hourly
+    # check (schoolair-dev-update) does not install it again next hour.
+    local to_version
+    to_version="$(python3 -c "import json; print(json.load(open('${PENDING_FILE}')).get('to_version', ''))" 2>/dev/null || true)"
+    if [ -n "$to_version" ]; then
+        mkdir -p "$(dirname "$ROLLED_BACK_FILE")"
+        echo "$to_version" >> "$ROLLED_BACK_FILE"
+        log "Recorded ${to_version} as rolled back (${ROLLED_BACK_FILE})"
+    fi
     restore_from_backup
     restart_services
     rm -f "$PENDING_FILE"

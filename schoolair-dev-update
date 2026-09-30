@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# schoolair-dev-update — self-update for dev-channel units.
+#
+# Units carry a channel in /etc/schoolair-channel: "dev" (the bench unit) or
+# "stable" (school units; also the default when the file is missing). Stable
+# units update only when the server raises SCHOOLAIR_MIN_VERSION. Dev units
+# run this once an hour (deploy/schoolair-dev-update.timer): it reads the
+# VERSION on the dev branch on GitHub and, when that is newer than the
+# installed one, runs schoolair-update, which on a dev unit installs from the
+# dev branch. The same rollback watchdog applies: an update not confirmed by a
+# successful upload within 40 min is reverted.
+#
+# Two guards:
+#   - never while the wilting flower moves (/run/schoolair-flower/moving);
+#     the update restarts services and a cut move loses the flower's position.
+#   - never retry a version that was rolled back (/var/lib/schoolair/
+#     dev-update-rolled-back, written by schoolair_rollback.sh), or a bad
+#     dev commit would be installed and reverted every hour.
+set -euo pipefail
+
+CHANNEL_FILE="${SCHOOLAIR_CHANNEL_FILE:-/etc/schoolair-channel}"
+ROLLED_BACK_FILE="${SCHOOLAIR_ROLLED_BACK_FILE:-/var/lib/schoolair/dev-update-rolled-back}"
+INSTALLED="${SCHOOLAIR_INSTALLED_INGEST:-/home/admin/schoolair/jobs/ingest.py}"
+RAW="${SCHOOLAIR_DEV_RAW:-https://raw.githubusercontent.com/SchoolAir/schoolair-endnode/dev/jobs/ingest.py}"
+MOVING_FLAG="${SCHOOLAIR_MOVING_FLAG:-/run/schoolair-flower/moving}"
+UPDATE_CMD="${SCHOOLAIR_UPDATE_CMD:-/usr/local/bin/schoolair-update}"
+
+channel="$(tr -d '[:space:]' < "$CHANNEL_FILE" 2>/dev/null || echo stable)"
+[ "$channel" = "dev" ] || { echo "channel is ${channel:-stable} — nothing to do"; exit 0; }
+
+installed="$(grep -m1 '^VERSION' "$INSTALLED" 2>/dev/null | sed -nE 's/.*"([^"]+)".*/\1/p')"
+remote="$(curl -fsSL --max-time 20 "$RAW" | grep -m1 '^VERSION' | sed -nE 's/.*"([^"]+)".*/\1/p' || true)"
+if [ -z "$installed" ] || [ -z "$remote" ]; then
+    echo "could not read versions (installed='${installed}', dev='${remote}') — skipping"
+    exit 0
+fi
+
+# "is $remote newer than $installed?" with dotted numbers (2.3.16 > 2.3.9).
+newer() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ] && [ "$1" != "$2" ]; }
+if ! newer "$remote" "$installed"; then
+    echo "dev is ${remote}, installed ${installed} — up to date"
+    exit 0
+fi
+if [ -f "$ROLLED_BACK_FILE" ] && grep -qx "$remote" "$ROLLED_BACK_FILE"; then
+    echo "dev is ${remote}, but that version was rolled back on this unit — not retrying"
+    exit 0
+fi
+
+for _ in $(seq 1 150); do
+    [ -e "$MOVING_FLAG" ] || break
+    sleep 1
+done
+if [ -e "$MOVING_FLAG" ]; then
+    echo "flower still moving after 150 s — trying again next hour"
+    exit 0
+fi
+
+echo "dev is ${remote}, installed ${installed} — updating from the dev branch"
+exec "$UPDATE_CMD"
