@@ -440,6 +440,9 @@ ok "schoolair command  →  /usr/local/bin/schoolair"
 if [ -f "${SCHOOLAIR_DIR}/schoolair-update" ]; then
     install_with_backup "${SCHOOLAIR_DIR}/schoolair-update" /usr/local/bin/schoolair-update
     chmod 755 /usr/local/bin/schoolair-update
+    # Dev-channel self-update (a no-op on stable units; see the script's header).
+    install_with_backup "${SCHOOLAIR_DIR}/schoolair-dev-update" /usr/local/bin/schoolair-dev-update
+    chmod 755 /usr/local/bin/schoolair-dev-update
     chown root:root /usr/local/bin/schoolair-update
     ok "schoolair-update  →  /usr/local/bin/  (OTA entry point, root-owned)"
 else
@@ -647,7 +650,7 @@ ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update wit
 step "15 / systemd services"
 DEPLOY_DIR="${SCHOOLAIR_DIR}/deploy"
 
-for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-pigpio-setup.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer; do
+for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-pigpio-setup.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
     if [ -f "${DEPLOY_DIR}/${svc}" ]; then
         install_with_backup "${DEPLOY_DIR}/${svc}" "/etc/systemd/system/${svc}"
         ok "${svc} installed"
@@ -791,6 +794,9 @@ systemctl enable schoolair-update-watchdog.timer 2>/dev/null || true
 # Enabled wherever it is installed; its drop-in decides whether it runs.
 [ -f /etc/systemd/system/schoolair-flower.service ] && systemctl enable schoolair-flower.service 2>/dev/null || true
 systemctl start  schoolair-update-watchdog.timer 2>/dev/null || true
+# Hourly dev-branch check; the script exits at once on a stable unit.
+systemctl enable schoolair-dev-update.timer 2>/dev/null || true
+systemctl start  schoolair-dev-update.timer 2>/dev/null || true
 ok "Services enabled"
 
 if [[ "$MODE" == "--update" ]]; then
