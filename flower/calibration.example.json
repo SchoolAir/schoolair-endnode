@@ -113,7 +113,9 @@
       "up_to_mm": 30.0,
       "up_us": 6000,
       "note": "after homing, climb out of the stop to 30 mm in full steps at 6 ms; the stem is folded hardest down there"
-    }
+    },
+    "home_us": 3000,
+    "home_note": "homing stroke (ends in a stall on the stop): half-steps at this rate, independent of down_us"
   },
   "current_position_mm": null,
   "unit": "fill in: hostname of the endnode this calibration was measured on",
