@@ -595,6 +595,37 @@ def test_send_pattern_zeroes_pwm_then_starts_wave_then_deletes_the_old_one():
     pi.wave_add_generic.assert_called_with([(mask, 0, 1000), (0, mask, 9000)])
 
 
+def test_send_pattern_yields_when_the_flower_raises_its_flag_during_the_build(monkeypatch):
+    """Found live 2026-09-30 19:15: the flag came up while a breathing wave was
+    being built (thousands of pulses, slow on a Pi Zero W); the send then cut
+    the flower's homing chain. The flag is re-checked right before the send."""
+    pi = _wave_capable_pi()
+    pi.wave_create.return_value = 9
+    moving = [False]
+    # The build itself raises the flag (the flower started between the loop's check and the send).
+    pi.wave_add_generic.side_effect = lambda pulses: moving.__setitem__(0, True) or 1
+    monkeypatch.setattr(led_status, "_flower_moving", lambda: moving[0])
+    assert led_status._send_pattern(pi, _FakePigpio, [(1, 1000), (0, 9000)], prev_wave_id=3) is led_status.FLOWER_HAS_WAVES
+    pi.wave_send_repeat.assert_not_called()
+    pi.set_PWM_dutycycle.assert_not_called()
+    pi.wave_delete.assert_called_once_with(9)        # the built-but-unsent wave; the old one stays
+
+
+def test_send_pattern_does_not_even_build_while_the_flower_moves(monkeypatch):
+    pi = _wave_capable_pi()
+    monkeypatch.setattr(led_status, "_flower_moving", lambda: True)
+    assert led_status._send_pattern(pi, _FakePigpio, [(1, 1000), (0, 9000)], prev_wave_id=None) is led_status.FLOWER_HAS_WAVES
+    pi.wave_add_generic.assert_not_called()
+
+
+def test_steady_glow_never_stops_the_flowers_wave(monkeypatch):
+    pi = _wave_capable_pi()
+    monkeypatch.setattr(led_status, "_flower_moving", lambda: True)
+    led_status._steady_glow(pi)
+    pi.wave_tx_stop.assert_not_called()
+    pi.set_PWM_dutycycle.assert_called()
+
+
 def test_send_pattern_first_pattern_has_nothing_to_delete():
     pi = _wave_capable_pi()
     pi.wave_create.return_value = 0

@@ -77,7 +77,7 @@ def save_cal(cal):
 # is declared interrupted and the position becomes unknown.
 MOVING_FLAG = os.environ.get("FLOWER_MOVING_FLAG", "/run/schoolair-flower/moving")
 LED_REQUEST_FILE = "/run/schoolair-flower/led-request"   # read by schoolair-led, see Flower._led
-LED_YIELD_S = 1.5
+LED_YIELD_S = 3.0      # the LED daemon polls the flag about once a second; 1.5 s lost a race on 2026-10-01
 MOVE_GRACE_S = 3.0
 WAVE_CHAIN = 9998      # pigpio wave_tx_at(): a chain of several waves is playing (a one-wave chain reports that wave's id)
 WAVE_NONE = 9999       # pigpio wave_tx_at(): nothing is playing
@@ -322,6 +322,9 @@ class Flower:
         self._started = time.time()   # heartbeat waits a full interval after start
         mv = self.cal["moves"]
         self.down_us, self.up_us, self.up_full = mv["down_us"], mv["up_us"], mv["up_full_step"]
+        # Homing ends in a deliberate stall on the stop: keep it gentle even when the
+        # working down speed is fast (the bench runs 1.5 ms since 2026-10-01).
+        self.home_us = mv.get("home_us", max(mv["down_us"], 3000))
 
     def _save(self, state="known", note=None):
         # Re-read the file and change only the position keys, so an edit made to
@@ -355,7 +358,7 @@ class Flower:
             dist = (self.cal["travel_stop_to_stop_mm"] - stop) + self.cal["homing"]["overshoot_mm"]
         log.info("homing: down %.1f mm to the bottom stop", dist)
         self._save(state="moving", note="homing")
-        self._move(dist, "down", self.down_us)
+        self._move(dist, "down", self.home_us)
         # Where the stop physically is, in the frame all positions are measured in.
         # 0 on the original lid; 25 once the stop spacer (or the Rev H+ 32.5 mm post)
         # puts the stop at the wilted height. Positions and tables stay unchanged.

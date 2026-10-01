@@ -556,10 +556,23 @@ def _detect_step_us(pi) -> int:
     return max(1, round(WAVE_PERIOD_US / real_range))
 
 
+# Returned by _send_pattern when the flower raised its moving flag while the
+# wave was being built: nothing was sent, the flower's step pattern is playing.
+FLOWER_HAS_WAVES = object()
+
+
 def _send_pattern(pi, pigpio, segments, prev_wave_id):
     """Hands a pattern to pigpiod and starts it repeating, replacing whatever
     was playing, with no gap. Returns the new wave id, or None if pigpiod
-    refused it (caller falls back to a steady glow — never a dark LED).
+    refused it (caller falls back to a steady glow — never a dark LED), or
+    FLOWER_HAS_WAVES if the flower took the transmitter meanwhile.
+
+    Building a breathing pattern is thousands of pulses over pigpiod's socket,
+    a second or more on a Pi Zero W. The main loop checked the flower's flag
+    before calling here; the flag is checked again right before the send, so a
+    flag raised during the build is honoured. Found live on 2026-09-30 19:15:
+    the flag came up 2 s before this loop noticed it, the send landed on top
+    of the flower's homing chain, and the flower aborted and re-homed blind.
 
     Order matters (both found live on a Pi Zero W):
       - pigpiod ignores a wave on a pin that still has a PWM duty cycle set —
@@ -567,6 +580,8 @@ def _send_pattern(pi, pigpio, segments, prev_wave_id):
         behind — so PWM is zeroed immediately before the wave starts.
       - the new wave is created and started BEFORE the old one is deleted;
         starting a wave replaces the running one in place."""
+    if _flower_moving():
+        return FLOWER_HAS_WAVES
     mask = 1 << GPIO_LED
     pulses = [pigpio.pulse(mask if level else 0, 0 if level else mask, us) for level, us in segments]
     if pi.wave_add_generic(pulses) < 0:
@@ -574,6 +589,9 @@ def _send_pattern(pi, pigpio, segments, prev_wave_id):
     wave_id = pi.wave_create()
     if wave_id < 0:
         return None
+    if _flower_moving():                 # raised during the build: the flower's wave is playing now
+        pi.wave_delete(wave_id)
+        return FLOWER_HAS_WAVES
     pi.set_PWM_dutycycle(GPIO_LED, 0)
     if pi.wave_send_repeat(wave_id) < 0:
         pi.wave_delete(wave_id)
@@ -584,8 +602,10 @@ def _send_pattern(pi, pigpio, segments, prev_wave_id):
 
 
 def _steady_glow(pi) -> None:
-    """Last-resort display if a wave can't be created: plain PWM at the cap."""
-    pi.wave_tx_stop()
+    """Last-resort display if a wave can't be created: plain PWM at the cap.
+    wave_tx_stop would cut a flower move, so it is skipped while one is on."""
+    if not _flower_moving():
+        pi.wave_tx_stop()
     _hold_pwm(pi)
 
 
@@ -719,17 +739,24 @@ def main() -> None:
             if state != last_state and not yielding:
                 segments = _state_segments(state)
                 new_wave = _send_pattern(pi, pigpio, segments, wave_id)
-                if new_wave is None:
-                    print(f"[led] WARNING: pigpiod refused the {state!r} wave — showing a steady glow")
-                    _steady_glow(pi)
-                    wave_id = None
+                if new_wave is FLOWER_HAS_WAVES:
+                    # The flower took the transmitter while the wave was being
+                    # built. last_state stays as it was, so the pattern is sent
+                    # once the flag is gone (the "flower done" branch above
+                    # forces a resend); the next poll sees the flag and yields.
+                    print(f"[led] flower started moving while the {state!r} wave was being built — not sent")
                 else:
-                    wave_id = new_wave
-                print(f"[led] state {last_state} -> {state} "
-                      f"(state file: {_read_state()}, flower request: {flower_request}, health override: "
-                      f"{now_mono < health['unhealthy_until']}, AP: {ap_active}; "
-                      f"{len(segments)} pulses, {sum(us for _, us in segments) / 1e6:.2f}s cycle)")
-                last_state = state
+                    if new_wave is None:
+                        print(f"[led] WARNING: pigpiod refused the {state!r} wave — showing a steady glow")
+                        _steady_glow(pi)
+                        wave_id = None
+                    else:
+                        wave_id = new_wave
+                    print(f"[led] state {last_state} -> {state} "
+                          f"(state file: {_read_state()}, flower request: {flower_request}, health override: "
+                          f"{now_mono < health['unhealthy_until']}, AP: {ap_active}; "
+                          f"{len(segments)} pulses, {sum(us for _, us in segments) / 1e6:.2f}s cycle)")
+                    last_state = state
             # Heartbeat: raises if pigpiod has gone away (crashed/restarted —
             # either way the wave died with it), so systemd restarts us and a
             # fresh wave is sent, instead of leaving the LED dark.
