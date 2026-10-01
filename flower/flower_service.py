@@ -77,6 +77,13 @@ def save_cal(cal):
 # is declared interrupted and the position becomes unknown.
 MOVING_FLAG = os.environ.get("FLOWER_MOVING_FLAG", "/run/schoolair-flower/moving")
 LED_REQUEST_FILE = "/run/schoolair-flower/led-request"   # read by schoolair-led, see Flower._led
+DEMO_FLAG = "/run/schoolair/demo"   # present = demo mode; shared with the firmware (reads every ~3 s, deletes it after demo.max_minutes); cleared by a reboot
+
+def demo_mode():
+    """Demonstrations only: the firmware reads every few seconds while this file
+    exists, and the flower polls and smooths faster (mapping.demo). Checked on every
+    cycle so it can be toggled by hand without restarting anything."""
+    return os.path.exists(DEMO_FLAG)
 LED_YIELD_S = 3.0      # the LED daemon polls the flag about once a second; 1.5 s lost a race on 2026-10-01
 MOVE_GRACE_S = 3.0
 WAVE_CHAIN = 9998      # pigpio wave_tx_at(): a chain of several waves is playing (a one-wave chain reports that wave's id)
@@ -410,7 +417,9 @@ class Flower:
             return {"status": "invalid reading", "problem": problem, "recorded_at": r.get("recorded_at"),
                     "held_at_mm": self.pos}
         # Keep the valid readings of the last smoothing window and score their median.
-        window = float(self.cal["mapping"].get("smoothing_window_s", 0))
+        demo = demo_mode()
+        m = self.cal["mapping"]
+        window = float((m.get("demo", {}) if demo else m).get("smoothing_window_s", m.get("smoothing_window_s", 0)))
         t = _epoch(r)
         if not self.recent or r.get("recorded_at") != self.recent[-1].get("recorded_at"):
             self.recent.append(r)
@@ -425,9 +434,12 @@ class Flower:
         moved = False
         if self.pos is None or abs(target - self.pos) >= hyst:
             self.goto(target); moved = True
-        return {"status": "ok", "co2": sm.get("co2"), "pm25": sm.get("pm25"), "n": len(self.recent),
-                "age_min": round(age or 0, 1), "heights": per_metric, "target_mm": target,
-                "position_mm": self.pos, "moved": moved}
+        out = {"status": "ok", "co2": sm.get("co2"), "pm25": sm.get("pm25"), "n": len(self.recent),
+               "age_min": round(age or 0, 1), "heights": per_metric, "target_mm": target,
+               "position_mm": self.pos, "moved": moved}
+        if demo:
+            out["demo"] = True
+        return out
 
     # ------------------------------------------------------------ cold boot
     def _is_cold_boot(self):
@@ -532,6 +544,7 @@ class Flower:
 
     def run(self):
         poll = self.cal["mapping"]["poll_seconds"]
+        self._demo_logged = False
         try:
             if self.cal.get("self_test", {}).get("on_cold_boot", True) and self._is_cold_boot():
                 self.self_test()
@@ -555,7 +568,10 @@ class Flower:
                 self.maybe_nod(s)
             except MoveInterrupted:
                 pass                             # logged by _move; goto() homes on the next cycle
-            time.sleep(poll)
+            demo = demo_mode()
+            if demo != self._demo_logged:
+                log.info("demo mode %s (%s)", "on" if demo else "off", DEMO_FLAG); self._demo_logged = demo
+            time.sleep(self.cal["mapping"].get("demo", {}).get("poll_seconds", poll) if demo else poll)
 
 def main(argv):
     fl = Flower()

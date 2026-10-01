@@ -384,6 +384,14 @@ Pi reads and drains at the higher cadence (school hours).
   `latest.json` sees the extra readings: the upload mean keeps one reading a
   minute, so uploads are unchanged. `"enabled": false` switches it off. See
   `jobs/incident.py`.
+- `demo` (optional block): **for demonstrations only.** While the file
+  `/run/schoolair/demo` exists (`touch /run/schoolair/demo` as admin, no
+  restart needed) the sensor is read every `sample_seconds` (3) whatever the
+  incident detector says, so the flower reacts while people watch. `rm` the
+  file to end it; it ends by itself after `max_minutes` (120, from the file's
+  mtime, so a new `touch` extends it) and at reboot. Uploads are unchanged.
+  Each switch is logged, `latest.json` carries `"mode": "demo"`, and the local
+  dashboard shows it. See `jobs/demo.py`.
 - `temp_offset_c` (default `0`): this unit's temperature correction in °C,
   for a sensor warmed by its enclosure. Measure the unit against a room
   thermometer and enter the difference, e.g. `-4.7` if it reads 4.7 °C high.
