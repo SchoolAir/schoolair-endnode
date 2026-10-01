@@ -66,6 +66,7 @@ def reset_ingest_state():
     ingest._samples.clear()
     ingest._last_kept_mono     = None
     ingest._incident           = ingest.IncidentDetector()
+    ingest._demo               = ingest.DemoSwitch(path='/nonexistent/schoolair-demo')
     ingest._pending_live       = None
     ingest._live_event         = None
     ingest._credit_bytes       = 0
@@ -80,6 +81,7 @@ def reset_ingest_state():
     ingest._samples.clear()
     ingest._last_kept_mono     = None
     ingest._incident           = ingest.IncidentDetector()
+    ingest._demo               = ingest.DemoSwitch(path='/nonexistent/schoolair-demo')
     ingest._pending_live       = None
     ingest._live_event         = None
     ingest._credit_bytes       = 0

@@ -1,8 +1,8 @@
 # Vendored by scripts/vendor_flower.sh — do not edit these files here;
 # change them in SchoolAir/Flower-End-node and re-run the script.
 repo https://github.com/SchoolAir/Flower-End-node.git
-commit 3260ffa46281d15109e3756120f58997497de744
-sha256 97f208b39c8529c587fd6d96ef5e2d7ea99d9007f2e4a98142a55423ac448633 flower_service.py
+commit a001b5eb2a470a55b563c54dd34ca245984d4b6e
+sha256 4e692a0b856a85be9296727d8b569052a1d3e8088940af29127d5a4f87b97378 flower_service.py
 sha256 5f27ebd450a534b816143a21d389acde81427221a571830ed8fbbd2d1004cdd3 step.py
 sha256 f091263267e8892edd1a43193e2d4df239c4481749740da493dad0b7751a8225 schoolair-flower.service
-sha256 bd483bb3bdf9f97d6d8a92fa2ed67e7d14b6f188134977774ae8676632041be9 calibration.example.json
+sha256 69ee1abc70ef90254ec6220ebcb0d83402e4399c10b3261c47277d3580845eb8 calibration.example.json

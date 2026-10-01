@@ -44,6 +44,7 @@ import device_identity
 from atomic_file import write_atomic
 import jobs.aggregate as aggregate
 from jobs.incident import IncidentDetector, load_config as load_incident_config
+from jobs.demo import DemoSwitch, load_config as load_demo_config
 import state
 
 load_dotenv()
@@ -153,6 +154,7 @@ NTP_STEP_THRESHOLD_S = 30  # divergence above this (seconds) indicates an NTP st
 _samples:           list[dict]    = []     # this upload interval's samples, oldest first
 _last_kept_mono:    float | None  = None   # when the last sample went into _samples (monotonic)
 _incident:          IncidentDetector = IncidentDetector()   # reconfigured from settings.json in ingest_loop()
+_demo:              DemoSwitch = DemoSwitch()                 # /run/schoolair/demo; see jobs/demo.py
 _pending_live:      dict | None   = None   # reading ready to POST (set by _run_read)
 _live_event:        asyncio.Event | None = None  # signalled when _pending_live is ready
 _credit_bytes:      int   = 0              # server-granted byte budget; always overwritten
@@ -1073,10 +1075,9 @@ def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: boo
         if reading:
             data.update(reading)
 
-    state.set(data, recorded_at)
-
     now = _time_mod.monotonic()
     change = _incident.observe(data, now)
+    state.set(data, recorded_at, mode=_mode())
     if change == "start":
         print(f"[incident] air changing fast — reading every {_incident.cfg['sample_seconds']}s")
     elif change == "end":
@@ -1316,6 +1317,13 @@ async def _read_loop(active_sensors: list):
         await _sample_until_boundary(delay, active_sensors)
 
 
+def _mode() -> str:
+    """What drives the read cadence right now, for latest.json and the dashboard."""
+    if _demo.active():
+        return "demo"
+    return "incident" if _incident.active else "normal"
+
+
 async def _sample_until_boundary(seconds: float, active_sensors: list) -> None:
     """Between two uploads: take a sample every SAMPLE_SECONDS (or every few
     seconds during an incident, see jobs/incident.py) until the next upload
@@ -1324,7 +1332,7 @@ async def _sample_until_boundary(seconds: float, active_sensors: list) -> None:
     Samples are not logged: one line a minute would only wear the SD card."""
     deadline = _time_mod.monotonic() + seconds
     while True:
-        step = _incident.sample_seconds or SAMPLE_SECONDS
+        step = _demo.sample_seconds if _demo.active() else (_incident.sample_seconds or SAMPLE_SECONDS)
         remaining = deadline - _time_mod.monotonic()
         if remaining <= step:
             await _wait_for_boundary(remaining)
@@ -1360,12 +1368,13 @@ async def _enter_identity_lockout() -> None:
 
 async def ingest_loop():
     """Initialise SQLite, probe aux sensors, run read / upload / NTP tasks."""
-    global _settings, _settings_event, _incident
+    global _settings, _settings_event, _incident, _demo
     queue.init()
     _settings = load_settings()
     validate_settings(_settings)
     _settings_event = asyncio.Event()
     _incident = IncidentDetector(load_incident_config(_settings))   # settings.json "incident"
+    _demo = DemoSwitch(load_demo_config(_settings))                 # settings.json "demo"
     # Always sent, 0 included: an offset set earlier survives a service
     # restart on the sensor, so changing it back to 0 must reach it too.
     set_temperature_offset(_temperature_offset(_settings))

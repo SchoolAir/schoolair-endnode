@@ -102,7 +102,12 @@
     },
     "valid_range_note": "Outside these bounds a reading is a sensor fault (SEN6x sends CO2 32766 or PM 6553.5 for 'no valid value'): the flower holds and the LED shows thinking.",
     "smoothing_window_s": 30,
-    "smoothing_note": "Median of the readings from the last N seconds. One reading a minute (normal firmware mode) = no smoothing; in incident mode (a reading every 10 s) the median of three stops the motor twitching. 0 disables."
+    "smoothing_note": "Median of the readings from the last N seconds. One reading a minute (normal firmware mode) = no smoothing; in incident mode (a reading every 10 s) the median of three stops the motor twitching. 0 disables.",
+    "demo": {
+      "poll_seconds": 2,
+      "smoothing_window_s": 9,
+      "note": "used while /run/schoolair/demo exists (demonstrations: the firmware then reads every ~3 s); 9 s = median of three 3-second readings (10 would catch four)"
+    }
   },
   "moves": {
     "down_us": 3000,
