@@ -297,8 +297,8 @@ if [[ "$MODE" == "setup" ]]; then
     step "2 / System packages"
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades
-    ok "git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades"
+        git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades
+    ok "git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades"
 
     systemctl disable nginx 2>/dev/null || true
     systemctl stop    nginx 2>/dev/null || true
@@ -412,7 +412,8 @@ rm -rf "$REPO_DIR"
 # executable bit on scripts systemd invokes directly. netwatch.sh was once
 # committed non-executable and every OTA silently reproduced the crash-loop
 # until this was added.
-chmod +x "${WIZARD_DIR}/launcher.sh" "${WIZARD_DIR}/netwatch.sh" "${SCHOOLAIR_DIR}/detect_flower.sh" 2>/dev/null || true
+chmod +x "${WIZARD_DIR}/launcher.sh" "${WIZARD_DIR}/netwatch.sh" "${SCHOOLAIR_DIR}/detect_flower.sh" \
+    "${SCHOOLAIR_DIR}/detect_unit_type.sh" 2>/dev/null || true
 
 # ── 4. Python dependencies ─────────────────────────────────────────────────────
 step "4 / Python dependencies"
@@ -421,6 +422,28 @@ pip3 install --quiet --break-system-packages --root-user-action=ignore \
 python3 -c "import microdot" 2>/dev/null \
     || die "microdot failed to import after install."
 ok "microdot, simple-websocket, httpx, python-dotenv, questionary, netifaces installed"
+
+# The telemetry service runs from its own venv (deploy/schoolair.service:
+# ExecStart=.venv/bin/python), with the versions pinned in requirements.txt;
+# the wizard and the helper scripts use the system python above. Nothing used
+# to create the venv: on a fresh install schoolair.service failed at every
+# start. An update keeps the venv (install_dir_with_backup only adds files)
+# and installs whatever requirements.txt added; there a failed pip is only a
+# warning, since the post-restart health check rolls back an app that can't
+# start.
+VENV="${SCHOOLAIR_DIR}/.venv"
+if [ ! -x "${VENV}/bin/python" ]; then
+    sudo -u "$ADMIN_USER" python3 -m venv "$VENV" || die "could not create ${VENV}"
+    ok "venv created  →  ${VENV}"
+fi
+if sudo -u "$ADMIN_USER" "${VENV}/bin/pip" install --quiet --disable-pip-version-check \
+        -r "${SCHOOLAIR_DIR}/requirements.txt"; then
+    ok "venv: requirements.txt installed"
+elif [[ "$MODE" == "setup" ]]; then
+    die "pip install -r requirements.txt into ${VENV} failed — see above."
+else
+    warn "pip install -r requirements.txt into ${VENV} failed — keeping the venv as it is"
+fi
 
 # ── 5. Device utility scripts ─────────────────────────────────────────────────
 step "5 / Device utility scripts  →  ${ADMIN_HOME}/"
@@ -490,6 +513,18 @@ if [[ "$MODE" == "setup" ]]; then
 step "8 / I2C enable + baudrate"
 raspi-config nonint do_i2c 0
 ok "I2C enabled (takes effect after reboot)"
+
+# Indoor or outdoor? Everything indoor-only (pigpiod, the status LED, the
+# flower) hangs off /etc/schoolair-unit-type, and only first_boot.sh wrote it,
+# on a golden-image clone's first boot. A fresh install never got one. do_i2c
+# above also turns I2C on right away, so the sensor can be probed now.
+if [ -s /etc/schoolair-unit-type ]; then
+    ok "Unit type already known: $(cat /etc/schoolair-unit-type)"
+elif bash "${SCHOOLAIR_DIR}/detect_unit_type.sh"; then
+    ok "Unit type: $(cat /etc/schoolair-unit-type)"
+else
+    warn "Sensor not identified — unit type unknown (indoor-only parts are skipped; re-run setup with the sensor connected)"
+fi
 
 if   [ -f /boot/firmware/config.txt ]; then CFG=/boot/firmware/config.txt
 elif [ -f /boot/config.txt ];           then CFG=/boot/config.txt
@@ -650,7 +685,7 @@ ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update wit
 step "15 / systemd services"
 DEPLOY_DIR="${SCHOOLAIR_DIR}/deploy"
 
-for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-pigpio-setup.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
+for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
     if [ -f "${DEPLOY_DIR}/${svc}" ]; then
         install_with_backup "${DEPLOY_DIR}/${svc}" "/etc/systemd/system/${svc}"
         ok "${svc} installed"
@@ -785,6 +820,7 @@ fi
 
 systemctl daemon-reload
 systemctl enable schoolair-launcher.service
+systemctl enable schoolair-netwatch.service
 systemctl enable schoolair.service
 systemctl enable sen6x.service
 systemctl enable schoolair-first-boot.service 2>/dev/null || true
@@ -994,6 +1030,8 @@ chk "NM hotspot '${AP_CONN}'"             nmcli con show "$AP_CONN"
 chk "Captive-portal DNS config"           test -f /etc/NetworkManager/dnsmasq-shared.d/schoolair-captive.conf
 chk "Avahi service file"                  test -f /etc/avahi/services/schoolair.service
 chk "schoolair-launcher enabled"          systemctl is-enabled schoolair-launcher.service
+chk "schoolair-netwatch enabled"          systemctl is-enabled schoolair-netwatch.service
+chk "telemetry venv works"                "${SCHOOLAIR_DIR}/.venv/bin/python" -c "import httpx, microdot, dotenv"
 chk "schoolair.service enabled"           systemctl is-enabled schoolair.service
 chk "sen6x.service enabled"              systemctl is-enabled sen6x.service
 chk "schoolair-first-boot enabled"        systemctl is-enabled schoolair-first-boot.service

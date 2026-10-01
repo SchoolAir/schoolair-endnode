@@ -7,13 +7,23 @@ sensor reading, data ingestion to the central server, and local alert detection.
 
 ## Quick start — fresh Pi
 
+1. Flash **Raspberry Pi OS Lite** (Trixie) with Raspberry Pi Imager: the 32-bit
+   build for a Pi Zero W, 64-bit for newer boards. In Imager's customisation:
+   username `admin`, your Wi-Fi, SSH on.
+2. Connect the sensor, boot, SSH in and run:
+
 ```bash
-curl -sSL https://raw.githubusercontent.com/SchoolAir/schoolair-ex-RMIT-pi/main/schoolair_setup.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/SchoolAir/schoolair-endnode/main/schoolair_setup.sh | sudo bash
+sudo reboot
 ```
 
-This clones the repo to `/home/admin/schoolair/`, installs dependencies, builds
-the SEN6x binaries, configures a Wi-Fi hotspot for first-boot registration,
-and enables all systemd services. Idempotent — safe to re-run.
+This clones the repo to `/home/admin/schoolair/`, installs dependencies (the
+telemetry service gets its own venv, `.venv`, from `requirements.txt`), builds
+the SEN6x binaries, detects whether this is an indoor or outdoor unit,
+configures a Wi-Fi hotspot for first-boot registration, and enables all
+systemd services. It takes about half an hour on a Pi Zero W. Idempotent —
+safe to re-run. Indoor units install pigpiod by themselves after the reboot,
+once they are online.
 
 To use a different admin username:
 
