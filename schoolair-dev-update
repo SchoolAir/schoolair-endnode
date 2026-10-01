@@ -29,7 +29,10 @@ channel="$(tr -d '[:space:]' < "$CHANNEL_FILE" 2>/dev/null || echo stable)"
 [ "$channel" = "dev" ] || { echo "channel is ${channel:-stable} — nothing to do"; exit 0; }
 
 installed="$(grep -m1 '^VERSION' "$INSTALLED" 2>/dev/null | sed -nE 's/.*"([^"]+)".*/\1/p')"
-remote="$(curl -fsSL --max-time 20 "$RAW" | grep -m1 '^VERSION' | sed -nE 's/.*"([^"]+)".*/\1/p' || true)"
+# Fetched whole, then searched: `curl | grep -m1` makes grep close the pipe
+# early and curl log "(23) Failure writing output" on every hourly run.
+remote_src="$(curl -fsSL --max-time 20 "$RAW" || true)"
+remote="$(printf '%s\n' "$remote_src" | grep -m1 '^VERSION' | sed -nE 's/.*"([^"]+)".*/\1/p' || true)"
 if [ -z "$installed" ] || [ -z "$remote" ]; then
     echo "could not read versions (installed='${installed}', dev='${remote}') — skipping"
     exit 0
