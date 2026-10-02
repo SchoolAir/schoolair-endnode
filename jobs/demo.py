@@ -15,7 +15,7 @@ the firmware can delete it to expire it, and so a reboot ends a demo.
 
 While it exists the sensor is read every demo.sample_seconds (3), whatever
 the incident detector says. Uploads are unchanged: the 5/15-minute mean still
-keeps one reading a minute (ingest's _samples). A unit left in demo mode by
+keeps one reading per SAMPLE_INTERVAL (ingest's _samples). A unit left in demo mode by
 mistake reads itself out of it: after demo.max_minutes (120, counted from the
 file's mtime, so `touch` again extends it) the file is deleted and normal
 cadence resumes. Each transition is logged, and latest.json carries

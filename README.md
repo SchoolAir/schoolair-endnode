@@ -108,7 +108,7 @@ schoolair-netwatch       Persistent — monitors WiFi after boot. On uplink loss
 
 ### Latest reading file
 
-Every sample the telemetry process takes (once a minute, `SAMPLE_INTERVAL`) is
+Every sample the telemetry process takes (every 15 s, `SAMPLE_INTERVAL`) is
 written, atomically, to `/run/schoolair/latest.json`. A metric the sensor had no
 valid value for is `null`:
 
@@ -194,7 +194,7 @@ only when its pin changed. Both first wait for any move in progress to finish
 
 `main.py` runs two concurrent coroutines:
 
-- **Ingest loop** — samples the sensor every minute and publishes each sample
+- **Ingest loop** — samples the sensor every 15 s and publishes each sample
   locally (see *Latest reading file*). On a clock-aligned schedule (5 min during
   the active window, 15 min outside it) the mean of that interval's samples
   becomes one reading, which is uploaded at once or kept in SQLite and drained
@@ -375,10 +375,10 @@ Pi reads and drains at the higher cadence (school hours).
 - Window boundaries must be on a 15-minute mark (`:00`, `:15`, `:30`, `:45`).
 - Maximum window length is 9 hours.
 - `incident` (optional block): while the air is changing fast, the sensor is
-  read every `sample_seconds` (10) instead of every minute, so the wilting
+  read every `sample_seconds` (10) instead of every 15 s, so the wilting
   flower can follow within seconds. An incident starts when PM2.5 more than
   doubles (`pm25_jump_factor` 2) or rises across `pm25_threshold` (15 µg/m³),
-  or CO2 rises by `co2_jump_ppm` (100) in a minute or across `co2_threshold`
+  or CO2 rises by `co2_jump_ppm` (100) between two readings or across `co2_threshold`
   (1000 ppm). It ends after `steady_minutes` (5) with every reading within
   ±`steady_pm25` (2) and ±`steady_co2` (50) of the window's mean. Only
   `latest.json` sees the extra readings: the upload mean keeps one reading a
@@ -405,7 +405,7 @@ Pi reads and drains at the higher cadence (school hours).
 
 | Env var                  | Default   | Meaning                        |
 |--------------------------|-----------|--------------------------------|
-| `SAMPLE_INTERVAL`        | `60` s    | 1 min — local sensor read and `latest.json` cadence |
+| `SAMPLE_INTERVAL`        | `15` s    | local sensor read and `latest.json` cadence (60 s before 2.3.20) |
 | `READ_INTERVAL_ACTIVE`   | `300` s   | 5 min — upload cadence inside the window (mean of its samples) |
 | `READ_INTERVAL_IDLE`     | `900` s   | 15 min — upload cadence outside the window (mean of its samples) |
 | `DRAIN_INTERVAL_ACTIVE`  | `1800` s  | 30 min — max time between drains inside the window |
