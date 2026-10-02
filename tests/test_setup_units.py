@@ -70,3 +70,12 @@ def test_pigpiod_restarts_only_when_its_drop_in_changed():
     guard = TEXT.rindex('if [ "$PIGPIOD_CONF_CHANGED" = 1 ]', 0, restart)
     assert "wait_for_flower_move" in TEXT[guard:restart]   # see test_flower_install.py
     assert TEXT.count("systemctl restart pigpiod") == 1
+
+
+def test_telemetry_does_not_wait_for_the_network():
+    """Readings and latest.json don't need Wi-Fi; waiting for network-online.target
+    kept the flower still for minutes after a power-up away from home (2026-10-02)."""
+    unit = (Path(__file__).parents[1] / "deploy/schoolair.service").read_text()
+    body = "\n".join(l for l in unit.splitlines() if not l.startswith("#"))
+    assert "network-online.target" not in body
+    assert "After=network.target sen6x.service" in body

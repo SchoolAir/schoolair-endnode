@@ -194,6 +194,10 @@ only when its pin changed. Both first wait for any move in progress to finish
 
 `main.py` runs two concurrent coroutines:
 
+- **Starts without a network.** `schoolair.service` waits only for the sensor,
+  not for Wi-Fi: readings and `latest.json` begin within about a minute of
+  power-up wherever the unit is, and uploads queue in SQLite until a network
+  appears.
 - **Ingest loop** — samples the sensor every minute and publishes each sample
   locally (see *Latest reading file*). On a clock-aligned schedule (5 min during
   the active window, 15 min outside it) the mean of that interval's samples
