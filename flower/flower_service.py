@@ -528,6 +528,33 @@ class Flower:
         log.info("nod x%d (%s then %s, %.0f mm) at %.1f mm", repeats, first, second, dip, self.pos)
         return True
 
+    def maybe_nightly_home(self, status):
+        """Once a night (nightly_home.at, local time, default 04:00) re-home and return,
+        so an unexplained loss of position (2026-10-02: the carriage was found 25 mm
+        below the count after a quiet night) never lasts longer than a day. Only
+        while the flower is otherwise idle, and never twice on the same date."""
+        nh = self.cal.get("nightly_home", {})
+        if not nh.get("enabled", False) or status.get("moved"):
+            return
+        now = time.localtime()
+        try:
+            hh, mm = (int(x) for x in nh.get("at", "04:00").split(":"))
+        except ValueError:
+            return
+        if (now.tm_hour, now.tm_min) < (hh, mm):
+            return
+        today = time.strftime("%Y-%m-%d", now)
+        if getattr(self, "_nightly_done", None) == today:
+            return
+        if time.time() - self._started < 120:        # a service that starts at 04:00 is not "due"
+            self._nightly_done = today; return
+        back_to = self.pos
+        log.info("nightly home (%s): re-homing, then back to %s mm", nh.get("at", "04:00"), back_to)
+        self.home()
+        if isinstance(back_to, (int, float)):
+            self.goto(back_to)
+        self._nightly_done = today
+
     def maybe_nod(self, status):
         hb = self.cal.get("heartbeat", {})
         if not hb.get("enabled", False) or status.get("status") != "ok" or status.get("moved"):
@@ -566,6 +593,7 @@ class Flower:
                 else:
                     self._led_clear()
                 self.maybe_nod(s)
+                self.maybe_nightly_home(s)
             except MoveInterrupted:
                 pass                             # logged by _move; goto() homes on the next cycle
             demo = demo_mode()
