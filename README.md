@@ -194,6 +194,9 @@ only when its pin changed. Both first wait for any move in progress to finish
 
 `main.py` runs two concurrent coroutines:
 
+- **Logs stay on the card.** The journal is persistent (64 MB cap, synced
+  every minute), so after a reboot `journalctl -b -1` reads the previous boot
+  and `journalctl --list-boots` lists them. Before 2.3.21 it lived in RAM.
 - **Starts without a network.** `schoolair.service` waits only for the sensor,
   not for Wi-Fi: readings and `latest.json` begin within about a minute of
   power-up wherever the unit is, and uploads queue in SQLite until a network

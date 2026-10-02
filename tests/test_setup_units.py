@@ -79,3 +79,14 @@ def test_telemetry_does_not_wait_for_the_network():
     body = "\n".join(l for l in unit.splitlines() if not l.startswith("#"))
     assert "network-online.target" not in body
     assert "After=network.target sen6x.service" in body
+
+
+def test_journal_is_persistent_and_capped():
+    """Twice (2026-09-30, 2026-10-02) a reboot's cause was unreadable because the
+    journal lived in RAM. Martin: logs on the card, on all units, bounded."""
+    block = TEXT[TEXT.index("00-schoolair.conf << 'EOF'"):TEXT.index("systemctl restart systemd-journald")]
+    assert "Storage=persistent" in block
+    assert "SystemMaxUse=64M" in block
+    assert "SyncIntervalSec=1min" in block
+    assert "mkdir -p /etc/systemd/journald.conf.d /var/log/journal" in TEXT
+    assert "Storage=volatile" not in block

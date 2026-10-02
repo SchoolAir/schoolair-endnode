@@ -310,15 +310,30 @@ fi
 # Runs in both setup and update mode — changes are idempotent.
 step "2b / SD card longevity"
 
-# journald volatile: journal lives in /run (already tmpfs) — never writes to SD
-mkdir -p /etc/systemd/journald.conf.d
+# journald persistent, capped. Until 2.3.21 the journal lived in RAM only
+# (Storage=volatile) to spare the SD card, which meant the boot before a
+# reboot could never be read: twice in two days (2026-09-30, 2026-10-02) a
+# reboot's cause was lost. Martin, 2026-10-02: keep logs on the card on all
+# units. The cost is bounded: a 64 MB ring, flushed once a minute, rate
+# limited; the app's own chatter is already low (no per-sample log lines).
+# `journalctl --list-boots` then shows previous boots and `journalctl -b -1`
+# reads the last one.
+mkdir -p /etc/systemd/journald.conf.d /var/log/journal
 cat > /etc/systemd/journald.conf.d/00-schoolair.conf << 'EOF'
 [Journal]
-Storage=volatile
+Storage=persistent
+SystemMaxUse=64M
+SystemMaxFileSize=8M
 RuntimeMaxUse=32M
+SyncIntervalSec=1min
+RateLimitIntervalSec=30s
+RateLimitBurst=1000
 EOF
+# Ownership and ACLs journald expects on /var/log/journal (the admin user keeps
+# read access through the systemd-journal group this grants).
+systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 systemctl restart systemd-journald 2>/dev/null || true
-ok "journald: volatile storage, 32 MB RAM cap"
+ok "journald: persistent on the card, 64 MB cap, synced every minute"
 
 # Disable swap — Pi Zero 512 MB is sufficient; SD swap is the #1 card killer
 systemctl disable dphys-swapfile 2>/dev/null || true
@@ -980,7 +995,7 @@ chk() {
 chk "hostname is schoolair-*"              bash -c '[[ "$(hostname)" == schoolair-* ]]'
 chk "automatic apt runs disabled"        grep -q 'Unattended-Upgrade "0"' /etc/apt/apt.conf.d/20auto-upgrades
 chk "unattended-upgrade available"       command -v unattended-upgrade
-chk "journald volatile"                   grep -q "Storage=volatile" /etc/systemd/journald.conf.d/00-schoolair.conf
+chk "journald persistent, capped"        grep -q "Storage=persistent" /etc/systemd/journald.conf.d/00-schoolair.conf
 chk "swap disabled"                       bash -c "! systemctl is-enabled dphys-swapfile 2>/dev/null"
 chk "microdot importable"                  python3 -c "import microdot"
 chk "httpx importable"                     python3 -c "import httpx"
