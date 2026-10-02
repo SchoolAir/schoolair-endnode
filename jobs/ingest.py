@@ -5,7 +5,7 @@ Write-through pipeline with local fallback and server-controlled backlog drain:
   Read loop   — samples the sensors every SAMPLE_SECONDS and publishes each
                 sample locally (state.set → /run/schoolair/latest.json), so
                 services on this Pi such as the wilting flower follow the room
-                within a minute. Every READ_ACTIVE_SECONDS (active window) or
+                within seconds. Every READ_ACTIVE_SECONDS (active window) or
                 READ_IDLE_SECONDS (outside it), aligned to the device's upload
                 offset, the mean of that interval's samples becomes the one
                 reading to upload, and _live_event is signalled. Sampling faster
@@ -132,7 +132,7 @@ READ_IDLE_SECONDS     = int(os.getenv("READ_INTERVAL_IDLE",    900))   # 15 min
 # Local sample interval: how often the sensor is read and latest.json updated.
 # Samples between two uploads are averaged into that upload. At or above the
 # upload interval, every sample is an upload again (the original behaviour).
-SAMPLE_SECONDS        = int(os.getenv("SAMPLE_INTERVAL",        60))   # 1 min
+SAMPLE_SECONDS        = int(os.getenv("SAMPLE_INTERVAL",        15))   # 15 s (was 60 until 2.3.20; Martin, 2026-10-02)
 
 # Drain interval constants kept as reference (no longer drive a timer)
 DRAIN_ACTIVE_SECONDS  = int(os.getenv("DRAIN_INTERVAL_ACTIVE", 1800))
@@ -1329,7 +1329,7 @@ async def _sample_until_boundary(seconds: float, active_sensors: list) -> None:
     seconds during an incident, see jobs/incident.py) until the next upload
     boundary, `seconds` from now. Returns at the boundary, or early when the
     active window changes (the read loop then uploads at once, as before).
-    Samples are not logged: one line a minute would only wear the SD card."""
+    Samples are not logged: a line every 15 s would only wear the SD card."""
     deadline = _time_mod.monotonic() + seconds
     while True:
         step = _demo.sample_seconds if _demo.active() else (_incident.sample_seconds or SAMPLE_SECONDS)
