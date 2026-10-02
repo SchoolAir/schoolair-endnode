@@ -1,7 +1,14 @@
 [Unit]
 Description=SchoolAir sensor ingest
-After=network-online.target sen6x.service
-Wants=network-online.target sen6x.service
+# Readings don't need the network: latest.json (the wilting flower) is written
+# from the first read, and uploads queue in SQLite until Wi-Fi appears, so this
+# starts as soon as the sensor is initialised, not after network-online.target.
+# Found on 2026-10-02: on a battery, in a building with no known Wi-Fi, the
+# flower stood still for minutes after each power-up while this unit waited
+# for a network that never came. The boot connectivity ping and the NTP
+# correction already cope with starting offline.
+After=network.target sen6x.service
+Wants=sen6x.service
 
 [Service]
 Type=simple
