@@ -21,7 +21,7 @@ This clones the repo to `/home/admin/schoolair/`, installs dependencies (the
 telemetry service gets its own venv, `.venv`, from `requirements.txt`), builds
 the SEN6x binaries, detects whether this is an indoor or outdoor unit,
 configures a Wi-Fi hotspot for first-boot registration, and enables all
-systemd services. It takes about half an hour on a Pi Zero W. Idempotent —
+systemd services. It takes about 15 minutes on a Pi Zero W. Idempotent —
 safe to re-run. Indoor units install pigpiod by themselves after the reboot,
 once they are online.
 
