@@ -609,7 +609,9 @@ systemctl restart avahi-daemon
 ok "Avahi configured (schoolair.local + regiwiz.local)"
 
 # ── 12. dhcpcd (Bullseye only) ────────────────────────────────────────────────
-if [ -f /etc/dhcpcd.conf ]; then
+# Only where dhcpcd actually runs: Bookworm and later ship /etc/dhcpcd.conf
+# (dhcpcd-base) without the service.
+if [ -f /etc/dhcpcd.conf ] && systemctl is-enabled --quiet dhcpcd 2>/dev/null; then
     step "12 / dhcpcd conflict prevention  (Bullseye)"
     if grep -q "denyinterfaces ${AP_IFACE}" /etc/dhcpcd.conf; then
         ok "Already configured"

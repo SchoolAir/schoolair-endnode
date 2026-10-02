@@ -168,3 +168,11 @@ def test_golden_images_do_not_carry_the_marker():
 def test_first_boot_detects_the_flower_after_the_unit_type():
     fb = (ROOT / "first_boot.sh").read_text()
     assert fb.index("/home/admin/schoolair/detect_unit_type.sh") < fb.index("/home/admin/schoolair/detect_flower.sh ||")
+
+
+def test_the_led_waits_for_pigpiod_instead_of_crash_looping():
+    """Before pigpiod is installed the LED is skipped, then started by the installer."""
+    led = (ROOT / "deploy/schoolair-led.service").read_text()
+    assert "ConditionPathExists=/var/lib/schoolair-pigpio-installed" in led
+    unit = (ROOT / "deploy/schoolair-pigpio-setup.service").read_text()
+    assert unit.index("touch /var/lib/schoolair-pigpio-installed") < unit.index("systemctl start schoolair-led.service")

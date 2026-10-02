@@ -2,8 +2,11 @@
 Description=SchoolAir: status LED (breathing/blink patterns via pigpiod)
 # Indoor units only — same GPIO/pigpiod infrastructure as the flower
 # actuator. pigpiod itself is installed by schoolair-pigpio-setup.service,
-# which needs network and can run well after this unit first starts —
-# Restart=on-failure just keeps retrying until pigpiod actually exists.
+# which needs network and can run well after this unit first starts. Until it
+# has (its marker below), this unit is skipped instead of failing: on a fresh
+# install, retrying every 2 s crashed a Python process 50 times in the first
+# five minutes of boot, on the Pi Zero's one core, while pigpio was being
+# installed. schoolair-pigpio-setup.service starts it once pigpiod is there.
 #
 # Starts at the very beginning of boot (DefaultDependencies=no,
 # WantedBy=sysinit.target) so the "thinking" pulse shows almost
@@ -13,6 +16,7 @@ Description=SchoolAir: status LED (breathing/blink patterns via pigpiod)
 # needs no network and nothing else from the normal boot, only pigpiod
 # (which schoolair's pigpiod-early drop-in likewise starts early).
 ConditionPathExists=/etc/schoolair-unit-type
+ConditionPathExists=/var/lib/schoolair-pigpio-installed
 DefaultDependencies=no
 Wants=pigpiod.service
 After=pigpiod.service
