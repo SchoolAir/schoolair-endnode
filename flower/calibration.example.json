@@ -88,7 +88,7 @@
     "combine": "min (the worse metric wins)",
     "hysteresis_mm": 2.0,
     "max_reading_age_min": 30,
-    "poll_seconds": 10,
+    "poll_seconds": 5,
     "note": "CO2 1000 ppm = classroom ventilation guideline (no WHO value exists for CO2); PM2.5 15 = WHO 24-h guideline, 25 = WHO interim target 4, 5 = WHO annual. Values between rows interpolate linearly. Edit and restart schoolair-flower.",
     "valid_range": {
       "co2": [
@@ -101,8 +101,8 @@
       ]
     },
     "valid_range_note": "Outside these bounds a reading is a sensor fault (SEN6x sends CO2 32766 or PM 6553.5 for 'no valid value'): the flower holds and the LED shows thinking.",
-    "smoothing_window_s": 30,
-    "smoothing_note": "Median of the readings from the last N seconds. One reading a minute (normal firmware mode) = no smoothing; in incident mode (a reading every 10 s) the median of three stops the motor twitching. 0 disables.",
+    "smoothing_window_s": 45,
+    "smoothing_note": "Median of the readings from the last N seconds. 45 s = three 15-second readings (firmware normal cadence since endnode v2.3.20); one reading per window = no smoothing. 0 disables.",
     "demo": {
       "poll_seconds": 2,
       "smoothing_window_s": 9,
@@ -141,5 +141,10 @@
     "led_state_when_no_reading": "thinking",
     "note": "first start after power-up: home, rise to erect, then go to the reading. Without a reading: hold last known (or erect) and ask the LED for thinking; never park at wilted without a reading.",
     "led_request_file": "/run/schoolair-flower/led-request"
+  },
+  "nightly_home": {
+    "enabled": true,
+    "at": "04:00",
+    "note": "local time; re-home and return once a night so a lost position never lasts longer than a day"
   }
 }
