@@ -318,8 +318,13 @@ step "2b / SD card longevity"
 # limited; the app's own chatter is already low (no per-sample log lines).
 # `journalctl --list-boots` then shows previous boots and `journalctl -b -1`
 # reads the last one.
+# Named 90-…: Raspberry Pi OS ships /usr/lib/systemd/journald.conf.d/
+# 40-rpi-volatile-storage.conf (Storage=volatile), and drop-ins apply in name
+# order across both directories, so 00-schoolair.conf lost to it (found on the
+# bench after 2.3.21: /var/log/journal stayed empty).
 mkdir -p /etc/systemd/journald.conf.d /var/log/journal
-cat > /etc/systemd/journald.conf.d/00-schoolair.conf << 'EOF'
+rm -f /etc/systemd/journald.conf.d/00-schoolair.conf
+cat > /etc/systemd/journald.conf.d/90-schoolair.conf << 'EOF'
 [Journal]
 Storage=persistent
 SystemMaxUse=64M
@@ -995,7 +1000,7 @@ chk() {
 chk "hostname is schoolair-*"              bash -c '[[ "$(hostname)" == schoolair-* ]]'
 chk "automatic apt runs disabled"        grep -q 'Unattended-Upgrade "0"' /etc/apt/apt.conf.d/20auto-upgrades
 chk "unattended-upgrade available"       command -v unattended-upgrade
-chk "journald persistent, capped"        grep -q "Storage=persistent" /etc/systemd/journald.conf.d/00-schoolair.conf
+chk "journald persistent, capped"        grep -q "Storage=persistent" /etc/systemd/journald.conf.d/90-schoolair.conf
 chk "swap disabled"                       bash -c "! systemctl is-enabled dphys-swapfile 2>/dev/null"
 chk "microdot importable"                  python3 -c "import microdot"
 chk "httpx importable"                     python3 -c "import httpx"
