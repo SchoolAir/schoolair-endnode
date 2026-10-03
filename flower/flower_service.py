@@ -481,7 +481,12 @@ class Flower:
     def self_test(self):
         """Home, rise to erect, then settle on the current reading."""
         last_known = self.pos if self.cal.get("position_state") == "known" else None
-        log.info("cold boot: self-test (home, erect, then current reading)")
+        log.info("cold boot: self-test (full home, erect, then current reading)")
+        # After a power cut the saved position cannot be trusted: the carriage may
+        # have moved unpowered, or a move was cut off before its count was saved.
+        # On 2026-10-03 a short home from a stale position set a wrong zero and the
+        # flower sat far below where it believed. Always home blind on a cold boot.
+        self.cal["position_state"] = "unknown"
         self.home()
         self.goto(self.cal["working_max_mm"])
         s = self.step()
