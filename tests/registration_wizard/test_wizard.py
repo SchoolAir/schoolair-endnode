@@ -11,6 +11,8 @@ so that wizard.py's bare `from config import ...` resolves correctly.
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import json
+
 import pytest
 import wizard
 
@@ -430,3 +432,33 @@ async def test_step1_without_mismatch_has_no_identity_banner(net, monkeypatch, t
     request.args.get.return_value = None
     body = (await wizard.index(request)).body.decode()
     assert "different SchoolAir device" not in body
+
+
+# ── Secrets never reach the log ───────────────────────────────────────────────
+
+async def test_registration_log_does_not_contain_the_auth_token(monkeypatch, capsys):
+    """The register response carries the device's auth_token; the journal is on
+    the SD card since 2.3.21, so it must not be printed."""
+    secret = "c1d8398d8c31b58a3074d2b3200fc4f7"
+    body = json.dumps({"message": "Device registration success", "auth_token": secret, "device_id": 4})
+
+    class Resp:
+        status = 200
+        def read(self): return body.encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(wizard.urllib.request, "urlopen", lambda *a, **k: Resp())
+    ok, _, token = await wizard._post_heartbeat({"token": "prov-tok", "mac_address": "aa"})
+
+    out = capsys.readouterr().out
+    assert ok and token == secret            # still handed to the caller
+    assert secret not in out
+    assert '"auth_token": "<redacted>"' in out and "device_id" in out
+
+
+def test_redact_secrets_blanks_every_secret_field():
+    text = '{"token": "t1", "password": "p", "device_token": "d", "site": "Trinitat Nova"}'
+    out = wizard._redact_secrets(text)
+    assert "t1" not in out and '"p"' not in out and '"d"' not in out
+    assert "Trinitat Nova" in out

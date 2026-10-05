@@ -1463,6 +1463,17 @@ async def _post_legacy_registration(org_token: str, nickname: str) -> tuple:
         return False, f"Legacy registration failed: {exc}", {}
 
 
+_SECRET_FIELD_RE = re.compile(r'("(?:auth_token|device_token|token|password)"\s*:\s*")[^"]*(")')
+
+
+def _redact_secrets(text: str) -> str:
+    """The register response carries this device's auth_token. Its body was
+    logged as-is, and since 2.3.21 the journal is kept on the SD card, so
+    every registration left the token on the card. Keep the rest for
+    debugging; blank out the secret values."""
+    return _SECRET_FIELD_RE.sub(r"\1<redacted>\2", text)
+
+
 async def _post_heartbeat(payload: dict) -> tuple[bool, str, str]:
     """POST to the primary server's register endpoint.
 
@@ -1488,7 +1499,7 @@ async def _post_heartbeat(payload: dict) -> tuple[bool, str, str]:
     loop = asyncio.get_running_loop()
     try:
         code, resp_body = await loop.run_in_executor(None, _do)
-        print(f"[heartbeat] HTTP {code}: {resp_body[:200]}")
+        print(f"[heartbeat] HTTP {code}: {_redact_secrets(resp_body)[:200]}")
         if code == 200:
             try:
                 device_auth_token = json.loads(resp_body).get("auth_token", "")
@@ -1499,10 +1510,10 @@ async def _post_heartbeat(payload: dict) -> tuple[bool, str, str]:
     except urllib.error.HTTPError as exc:
         body_str = ""
         try:
-            body_str = exc.read().decode()[:200]
+            body_str = exc.read().decode()
         except Exception:
             pass
-        print(f"[heartbeat] HTTP {exc.code}: {body_str}")
+        print(f"[heartbeat] HTTP {exc.code}: {_redact_secrets(body_str)[:200]}")
         if exc.code in (401, 403):
             return False, "Token rejected by SchoolAir Cloud", ""
         return False, f"Server error HTTP {exc.code}", ""

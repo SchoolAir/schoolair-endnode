@@ -92,3 +92,10 @@ def test_journal_is_persistent_and_capped():
     assert "SyncIntervalSec=1min" in block
     assert "mkdir -p /etc/systemd/journald.conf.d /var/log/journal" in TEXT
     assert "Storage=volatile" not in block
+
+
+def test_journal_moves_to_the_card_without_a_reboot():
+    """Restarting journald doesn't leave /run; the update has to ask it to flush."""
+    restart = TEXT.index("systemctl restart systemd-journald")
+    assert TEXT.index("journalctl --flush", restart) - restart < 600
+    assert "test -e /run/systemd/journal/flushed" in TEXT

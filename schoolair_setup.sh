@@ -338,6 +338,11 @@ EOF
 # read access through the systemd-journal group this grants).
 systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 systemctl restart systemd-journald 2>/dev/null || true
+# A restart alone keeps writing to /run: journald moves to /var/log/journal only
+# when asked to flush, which systemd-journal-flush.service does at boot. Without
+# this a unit stayed RAM-only from the update until its next reboot (seen on a
+# unit updated to 2.3.22) — the reboot whose cause these logs are for.
+journalctl --flush 2>/dev/null || true
 ok "journald: persistent on the card, 64 MB cap, synced every minute"
 
 # Disable swap — Pi Zero 512 MB is sufficient; SD swap is the #1 card killer
@@ -1001,6 +1006,7 @@ chk "hostname is schoolair-*"              bash -c '[[ "$(hostname)" == schoolai
 chk "automatic apt runs disabled"        grep -q 'Unattended-Upgrade "0"' /etc/apt/apt.conf.d/20auto-upgrades
 chk "unattended-upgrade available"       command -v unattended-upgrade
 chk "journald persistent, capped"        grep -q "Storage=persistent" /etc/systemd/journald.conf.d/90-schoolair.conf
+chk "journal written to the card"        test -e /run/systemd/journal/flushed
 chk "swap disabled"                       bash -c "! systemctl is-enabled dphys-swapfile 2>/dev/null"
 chk "microdot importable"                  python3 -c "import microdot"
 chk "httpx importable"                     python3 -c "import httpx"
