@@ -83,7 +83,7 @@ async def test_demo_readings_do_not_inflate_the_upload_mean(tmp_path, monkeypatc
          patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 500}}), \
          patch("jobs.ingest.state") as mock_state:
         for _ in range(41):                                # two minutes at 3 s
-            ingest._take_sample([]); clock[0] += 3
+            await ingest._take_sample([]); clock[0] += 3
     assert mock_state.set.call_count == 41
     assert len(ingest._samples) == 3                       # 1000, 1060, 1120
 
@@ -97,10 +97,10 @@ def test_latest_json_says_which_mode(tmp_path, monkeypatch):
     assert state.latest_mode == "demo"
 
 
-def test_take_sample_labels_the_mode(tmp_path):
+async def test_take_sample_labels_the_mode(tmp_path):
     f = tmp_path / "demo"; f.touch()
     ingest._demo = DemoSwitch(path=str(f))
     with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 500}}), \
          patch("jobs.ingest.state") as mock_state:
-        ingest._take_sample([])
+        await ingest._take_sample([])
     assert mock_state.set.call_args.kwargs.get("mode") == "demo"

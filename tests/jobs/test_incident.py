@@ -126,13 +126,13 @@ async def test_incident_readings_reach_latest_json_but_the_upload_mean_keeps_one
     with patch("jobs.ingest._time_mod.monotonic", side_effect=lambda: clock[0]), \
          patch("jobs.ingest.read_sensor", side_effect=lambda: next(readings)), \
          patch("jobs.ingest.state") as mock_state:
-        ingest._take_sample([])                 # calm
+        await ingest._take_sample([])                 # calm
         clock[0] += 60
-        ingest._take_sample([])                 # the jump: incident starts
+        await ingest._take_sample([])                 # the jump: incident starts
         assert ingest._incident.active
         for _ in range(12):                     # two minutes at 10 s
             clock[0] += 10
-            ingest._take_sample([])
+            await ingest._take_sample([])
 
     assert mock_state.set.call_count == 14                # every reading published
     assert len(ingest._samples) == 4                      # 1000, 1060, 1120, 1180: one per minute

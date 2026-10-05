@@ -76,6 +76,8 @@ def reset_ingest_state():
     ingest._settings_event     = None
     ingest._verifying.clear()
     ingest.alert_cooldown.clear()
+    ingest._sensor_failing     = False
+    ingest._sensor_lock        = None
     yield
     ingest._alert_buffer.clear()
     ingest._samples.clear()
@@ -90,6 +92,8 @@ def reset_ingest_state():
     ingest._settings           = dict(S)
     ingest._settings_event     = None
     ingest._verifying.clear()
+    ingest._sensor_failing     = False
+    ingest._sensor_lock        = None
 
 
 @pytest.fixture
@@ -432,7 +436,7 @@ async def test_run_read_checks_alerts_on_the_boundary_sample_not_the_mean():
 async def test_take_sample_publishes_locally_and_keeps_the_sample():
     with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 555}}), \
          patch("jobs.ingest.state") as mock_state:
-        ingest._take_sample([])
+        await ingest._take_sample([])
 
     mock_state.set.assert_called_once()
     assert mock_state.set.call_args[0][0] == {"sen6x": {"co2": 555}}
@@ -442,10 +446,98 @@ async def test_take_sample_publishes_locally_and_keeps_the_sample():
 async def test_take_sample_publishes_the_error_when_the_read_fails():
     with patch("jobs.ingest.read_sensor", side_effect=RuntimeError("Sensor script timed out")), \
          patch("jobs.ingest.state") as mock_state:
-        assert ingest._take_sample([]) is None
+        assert await ingest._take_sample([]) is None
 
     assert mock_state.publish_error.call_args[0][0] == "Sensor script timed out"
     assert ingest._samples == []
+
+
+async def test_a_slow_sensor_read_does_not_block_the_event_loop():
+    """The read runs in a worker thread: other tasks (dashboard, uploads) keep going."""
+    import threading, time
+    started, release = threading.Event(), threading.Event()
+    ticks = []
+
+    def slow_read():
+        started.set()
+        release.wait(5)
+        return {"sen6x": {"co2": 500}}
+
+    async def other_task():
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        ticks.append(time.monotonic())      # ran while the read was still in progress
+        release.set()
+
+    with patch("jobs.ingest.read_sensor", side_effect=slow_read), \
+         patch("jobs.ingest.state"):
+        data, _ = await asyncio.gather(ingest._take_sample([]), other_task())
+
+    assert ticks and data == {"sen6x": {"co2": 500}}
+
+
+async def test_sensor_reads_never_overlap():
+    """The read loop and alert verification share the I2C bus."""
+    import threading, time
+    active, overlaps = [0], [0]
+    guard = threading.Lock()
+
+    def read():
+        with guard:
+            active[0] += 1
+            overlaps[0] += active[0] > 1
+        time.sleep(0.05)
+        with guard:
+            active[0] -= 1
+        return {"sen6x": {"co2": 500}}
+
+    with patch("jobs.ingest.read_sensor", side_effect=read), \
+         patch("jobs.ingest.state"):
+        await asyncio.gather(ingest._take_sample([]), ingest._read_off_loop(ingest.read_sensor),
+                             ingest._take_sample([]))
+
+    assert overlaps[0] == 0
+
+
+# ── Status LED while sampling ─────────────────────────────────────────────────
+
+@pytest.fixture
+def led_file(tmp_path, monkeypatch):
+    path = tmp_path / "led-state"
+    monkeypatch.setattr(ingest, "LED_STATE_FILE", str(path))
+    return path
+
+
+async def test_a_good_sample_after_a_failed_one_clears_no_sensor(led_file):
+    """One missed sample must not show a sensor fault until the next upload."""
+    with patch("jobs.ingest.read_sensor", side_effect=[RuntimeError("not ready"), {"sen6x": {"co2": 500}}]), \
+         patch("jobs.ingest.state"):
+        await ingest._take_sample([])
+        assert led_file.read_text() == "no_sensor"
+        await ingest._take_sample([])
+
+    assert led_file.read_text() == "thinking"   # the ping loop turns this into "ok"
+    assert not ingest._sensor_failing
+
+
+async def test_a_good_sample_leaves_other_led_states_alone(led_file):
+    led_file.write_text("error")
+    with patch("jobs.ingest.read_sensor", return_value={"sen6x": {"co2": 500}}), \
+         patch("jobs.ingest.state"):
+        await ingest._take_sample([])
+
+    assert led_file.read_text() == "error"
+
+
+async def test_an_upload_does_not_hide_a_failing_sensor(led_file):
+    """The boundary sample failed but earlier samples were uploaded: the LED
+    stays on "no_sensor" instead of going back to "ok"."""
+    with patch("jobs.ingest.read_sensor", side_effect=RuntimeError("sensor off")), \
+         patch("jobs.ingest.state"):
+        await ingest._take_sample([])
+    ingest._set_led_ok()
+
+    assert led_file.read_text() == "no_sensor"
 
 
 async def test_sample_until_boundary_samples_every_interval_then_stops(monkeypatch):
