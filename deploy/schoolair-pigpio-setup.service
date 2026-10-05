@@ -10,8 +10,9 @@ Wants=network-online.target
 ConditionPathExists=/etc/schoolair-unit-type
 ConditionPathExists=!/var/lib/schoolair-pigpio-installed
 
-# Last step: start the wilting flower, which waits for pigpiod (see
-# schoolair-flower-fitted.conf); a no-op where no flower is fitted or installed.
+# Last steps: start the status LED and the wilting flower, which both wait for
+# pigpiod (schoolair-led.service's condition, schoolair-flower-fitted.conf); a
+# no-op where no flower is fitted or installed.
 [Service]
 Type=oneshot
 ExecStart=/bin/bash -c '\
@@ -19,6 +20,7 @@ ExecStart=/bin/bash -c '\
     apt-get update -qq && apt-get install -y -qq pigpio python3-pigpio || exit 1; \
     systemctl enable --now pigpiod; \
     mkdir -p /var/lib && touch /var/lib/schoolair-pigpio-installed; \
+    systemctl start schoolair-led.service 2>/dev/null || true; \
     systemctl start schoolair-flower.service 2>/dev/null || true'
 Restart=on-failure
 RestartSec=30
