@@ -371,6 +371,7 @@ class Flower:
         # puts the stop at the wilted height. Positions and tables stay unchanged.
         self.pos = float(self.cal["homing"].get("stop_position_mm", 0.0))
         self.just_homed = True
+        self._homed_at = time.localtime()   # a home after tonight's hour counts as tonight's
         self._save(note="homed " + time.strftime("%Y-%m-%d %H:%M"))
 
     def goto(self, mm):
@@ -551,6 +552,11 @@ class Flower:
         today = time.strftime("%Y-%m-%d", now)
         if getattr(self, "_nightly_done", None) == today:
             return
+        # Already homed today after the hour (e.g. the cold-boot self-test after a power
+        # cut, 2026-10-07): homing again minutes later only grinds the stop a second time.
+        h = getattr(self, "_homed_at", None)
+        if h and time.strftime("%Y-%m-%d", h) == today and (h.tm_hour, h.tm_min) >= (hh, mm):
+            self._nightly_done = today; return
         if time.time() - self._started < 120:        # a service that starts at 04:00 is not "due"
             self._nightly_done = today; return
         back_to = self.pos
