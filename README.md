@@ -68,6 +68,13 @@ Both use the same `schoolair-update` and the same 40-minute rollback watchdog.
 A dev update waits for any flower move to finish first, and a version that was
 rolled back is recorded in `/var/lib/schoolair/dev-update-rolled-back` and not
 tried again. To put a unit on dev: `echo dev | sudo tee /etc/schoolair-channel`.
+A fresh setup ignores the channel file and installs `main` unless told otherwise,
+so a new dev unit is set up with:
+
+```bash
+echo dev | sudo tee /etc/schoolair-channel
+curl -sSL https://raw.githubusercontent.com/SchoolAir/schoolair-endnode/dev/schoolair_setup.sh | sudo REPO_BRANCH=dev bash
+```
 The channel is sent in the `X-Schoolair-Channel` header with every upload.
 
 **To update a single Pi manually:**
