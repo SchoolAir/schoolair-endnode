@@ -1,5 +1,5 @@
 {
-  "measured_on": "2026-09-28",
+  "measured_on": "2026-10-12",
   "motor": "28BYJ-48 5V via ULN2003, half-step, 4096 half-steps per output turn",
   "pins_bcm": {
     "IN1": 17,
@@ -21,31 +21,31 @@
   "mm_per_turn_measured": 8.1,
   "us_per_halfstep": 2000,
   "speed_mm_per_s": 1.0,
-  "travel_stop_to_stop_mm": 80.0,
-  "working_min_mm": 25.0,
-  "working_max_mm": 70.0,
+  "travel_stop_to_stop_mm": 65.0,
+  "working_min_mm": 10.0,
+  "working_max_mm": 57.5,
   "top_margin_mm": 17.5,
   "holds_position_unpowered": true,
   "homing": {
     "overshoot_mm": 10,
     "note": "drive down travel + overshoot; the gearbox stalls at the bottom stop; that is 0 mm",
-    "stop_position_mm": 0.0,
-    "stop_position_note": "0 on the original lid. Set to 25 once stop_spacer.stl (or the Rev H+ 32.5 mm post) is fitted; positions and tables stay as measured.",
+    "stop_position_mm": 10.0,
+    "stop_position_note": "Where the stop post physically is, in the old-stop frame. 10 for a lid printed from the 2026-10-12 CAD (17.5 mm post: the mechanical bottom is wilted). 0 on the original lid, 25 with stop_spacer.stl or the 32.5 mm post; the bench lid's post was cut to 1.5.",
     "known_overshoot_mm": 3.0,
     "known_overshoot_note": "margin past the expected stop when the position is known; the full overshoot_mm only applies to a blind home"
   },
-  "working_max_note": "62.5 mm proposed 2026-09-28 evening: clean and looks good; 3 mm under the 65.5 ceiling where the vase stopped seating. Earlier 55.5 limit came from a jam now attributed to the stem tube standing proud of the collar.",
+  "working_max_note": "57.5 for the 165 mm drive rod (2026-10-12 CAD): above about 58.5 the straight rod wedges in the stem's natural curve near the head and the motor grinds.",
   "bottom_stop_mm": 0.0,
-  "bottom_stop_note": "Mechanical bottom stop of the original lid, the frame all positions are measured in. On it the flower folds well past horizontal, so wilted sits at 25 mm and the lid carries a stop at that height (spacer or Rev H+ post, see homing.stop_position_mm). Physical top is about 75 mm; working range 25 to 70.",
-  "worst_air_mm": 25.0,
-  "worst_air_note": "25 mm = fully wilted, past horizontal, chosen 2026-09-28 evening as the more convincing wilt (30 mm = exactly horizontal). Bottom stop at 0 is only the homing reference.",
+  "bottom_stop_note": "Mechanical bottom stop of the original lid, the frame all positions are measured in. Lids from the 2026-10-12 CAD carry a 17.5 mm post, so the stop sits at 10 (= wilted); see homing.stop_position_mm. Working range 10 to 57.5.",
+  "worst_air_mm": 10.0,
+  "worst_air_note": "10 mm = fully wilted on the 2026-10-12 hardware (165 mm rod, 145 mm stem, 11 g head); 25 mm = horizontal.",
   "positions": {
-    "erect": 70.0,
-    "leaning": 45.5,
-    "horizontal": 30.0,
-    "wilted": 25.0
+    "erect": 57.0,
+    "leaning": 50.0,
+    "horizontal": 25.0,
+    "wilted": 10.0
   },
-  "positions_note": "mm above the bottom stop, from the bench on 2026-09-28: erect = 12 on the clock with a slight curve; leaning = 11; horizontal = 9 (the guideline line on the dashboard chart); wilted = past horizontal, the more convincing wilt.",
+  "positions_note": "mm above the old bottom stop, from the bench on 2026-10-12 with a 165 mm drive rod (about 140 mm above the carriage boss), 145 mm stem from roof to head and 11 g added to the head: erect = 12 on the clock; leaning = 11; horizontal = 9 (the guideline line on the dashboard chart); wilted = past horizontal.",
   "mapping": {
     "tables": {
       "co2": [
@@ -110,10 +110,10 @@
     }
   },
   "moves": {
-    "down_us": 3000,
-    "up_us": 5000,
+    "down_us": 1500,
+    "up_us": 2500,
     "up_full_step": true,
-    "note": "up in two-coil full steps at 5 ms: clean under the stem load; down in half steps at 3 ms",
+    "note": "up in two-coil full steps at 2.5 ms: clean under the stem load on the 2026-10-12 hardware; down in half steps at 1.5 ms",
     "recovery": {
       "up_to_mm": 30.0,
       "up_us": 6000,

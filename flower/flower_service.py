@@ -42,6 +42,7 @@ Usage:
   flower_service.py --score         print the latest reading and the height it maps to
   flower_service.py --goto 40       move to 40 mm and exit (assumes position is known)
   flower_service.py --home          home only
+  flower_service.py --home --goto 57   home, then climb to 57 mm (slow recovery climb out of the stop first)
 Run as the same user that owns calibration.json; needs pigpiod running.
 """
 import json, os, sqlite3, sys, time, signal, logging
@@ -643,7 +644,10 @@ def _dispatch(fl, argv):
         print(json.dumps({"reading": r, "heights": h, "target_mm": None if problem else t,
                           "problem": problem}, indent=2)); return
     if "--home" in argv:
-        fl.home(); return
+        fl.home()
+        if "--goto" not in argv: return
+        # --home --goto X: the same process still knows it just homed, so the climb
+        # out of the stop uses the slow recovery setting (a separate --goto would not).
     if "--nod" in argv:
         fl.nod(); return
     if "--self-test" in argv:
