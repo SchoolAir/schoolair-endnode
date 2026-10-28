@@ -1,6 +1,8 @@
 [Unit]
 Description=SchoolAir Registration Wizard (Microdot)
 After=NetworkManager.service
+# Bluetooth registration runs alongside the hotspot form (see schoolair-ble.service).
+Wants=schoolair-ble.service
 
 [Service]
 Type=simple

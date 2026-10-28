@@ -297,8 +297,8 @@ if [[ "$MODE" == "setup" ]]; then
     step "2 / System packages"
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades
-    ok "git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades"
+        git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades bluez
+    ok "git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades bluez"
 
     systemctl disable nginx 2>/dev/null || true
     systemctl stop    nginx 2>/dev/null || true
@@ -443,10 +443,13 @@ chmod +x "${WIZARD_DIR}/launcher.sh" "${WIZARD_DIR}/netwatch.sh" "${SCHOOLAIR_DI
 # ── 4. Python dependencies ─────────────────────────────────────────────────────
 step "4 / Python dependencies"
 pip3 install --quiet --break-system-packages --root-user-action=ignore \
-    "microdot>=2.0.0" simple-websocket httpx python-dotenv questionary netifaces
+    "microdot>=2.0.0" simple-websocket httpx python-dotenv questionary netifaces dbus-next
 python3 -c "import microdot" 2>/dev/null \
     || die "microdot failed to import after install."
-ok "microdot, simple-websocket, httpx, python-dotenv, questionary, netifaces installed"
+# Bluetooth registration (schoolair-ble.service) only; the hotspot wizard works without it.
+python3 -c "import dbus_next" 2>/dev/null \
+    || warn "dbus-next failed to import — Bluetooth registration will not start."
+ok "microdot, simple-websocket, httpx, python-dotenv, questionary, netifaces, dbus-next installed"
 
 # The telemetry service runs from its own venv (deploy/schoolair.service:
 # ExecStart=.venv/bin/python), with the versions pinned in requirements.txt;
@@ -719,7 +722,7 @@ ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update wit
 step "15 / systemd services"
 DEPLOY_DIR="${SCHOOLAIR_DIR}/deploy"
 
-for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-detect-hardware.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
+for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-ble.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-detect-hardware.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
     if [ -f "${DEPLOY_DIR}/${svc}" ]; then
         install_with_backup "${DEPLOY_DIR}/${svc}" "/etc/systemd/system/${svc}"
         ok "${svc} installed"

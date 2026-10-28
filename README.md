@@ -112,6 +112,10 @@ schoolair-wizard         Browser-based registration + Wi-Fi setup (Microdot,
   .service               port 80). Started on demand. Stops itself after a
                          successful registration; idle-timeout stops it on LAN.
 
+schoolair-ble            Bluetooth registration (Improv Wi-Fi over BLE).
+  .service               Pulled in by the wizard and stops with it; exits at
+                         once on a registered device.
+
 schoolair.service        Main telemetry process (see below). Starts after the
                          launcher exits. Restarts automatically on failure.
 
@@ -354,6 +358,21 @@ through:
 After registration the wizard writes `AUTH_TOKEN` to `.env`, restarts
 `schoolair.service`, and exits. nginx activates to proxy port 80 → port 8080.
 
+### Over Bluetooth
+
+While the wizard runs, `schoolair-ble.service` also advertises the device as
+`SchoolAir-<ID>` (a 5-character ID from the CPU serial —
+`device_identity.short_id()`). The registration web page connects over Web
+Bluetooth, writes the registration token and device name to the SchoolAir
+service, then sends the Wi-Fi details over Improv Wi-Fi. The device joins the
+network, registers exactly as the wizard does, and reports each step back
+(wrong password, no internet, token rejected, done) without the phone ever
+joining the hotspot. On a failure the hotspot comes back, so both paths stay
+usable. Writes need an encrypted link: the phone shows a pairing prompt once.
+
+Protocol layer: `registration_wizard/improv.py`; SchoolAir payloads:
+`ble_flow.py`; BlueZ GATT server and flow: `ble_provision.py`.
+
 ---
 
 ## WiFi loss recovery
@@ -510,6 +529,9 @@ SEN6x sensor connected via I2C on a Pi.
 cd schoolair/        # repo root
 pytest -m "not hardware"    # laptop-safe (102 tests)
 pytest                      # full suite — Pi only
+
+# Bluetooth registration against the local BlueZ (advertises from hci0 briefly)
+SCHOOLAIR_BLE_SYSTEM_TEST=1 pytest tests/registration_wizard/test_ble_bluez_system.py
 ```
 
 See `tests/README.md` for a breakdown by module.
@@ -552,7 +574,10 @@ schoolair-pi/
 ├── registration_wizard/
 │   ├── launcher.sh            Boot-time decision: start wizard or not
 │   ├── netwatch.sh            Persistent WiFi watchdog daemon
-│   └── wizard.py              Microdot browser portal (registration + Wi-Fi)
+│   ├── wizard.py              Microdot browser portal (registration + Wi-Fi)
+│   ├── ble_provision.py       Bluetooth registration (BlueZ GATT server)
+│   ├── ble_flow.py            SchoolAir BLE payloads (token, status)
+│   └── improv.py              Improv Wi-Fi protocol framing
 │
 ├── scripts/
 │   ├── mock-sensor.sh         Fake sensor output for local development

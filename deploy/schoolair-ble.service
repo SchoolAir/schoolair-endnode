@@ -1,0 +1,25 @@
+[Unit]
+Description=SchoolAir Bluetooth registration (Improv Wi-Fi over BLE)
+# Runs whenever the wizard runs: schoolair-wizard.service Wants= it, and
+# stopping the wizard (e.g. after a successful registration) stops it too.
+# It exits on its own straight away on a registered device.
+PartOf=schoolair-wizard.service
+After=bluetooth.service NetworkManager.service
+Wants=bluetooth.service
+# A Pi without working Bluetooth must not crash-loop forever.
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/admin/schoolair/registration_wizard/ble_provision.py
+WorkingDirectory=/home/admin/schoolair/registration_wizard
+User=root
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Not enabled — pulled in by schoolair-wizard.service.
+WantedBy=multi-user.target

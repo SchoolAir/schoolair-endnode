@@ -147,3 +147,18 @@ def test_schoolair_unit_provides_the_flag_directory():
     assert di.MISMATCH_FILE.startswith("/run/schoolair/")
     assert "RuntimeDirectory=schoolair" in unit
     assert "RuntimeDirectoryPreserve=yes" in unit
+
+
+# ── short_id ───────────────────────────────────────────────────────────────────
+
+def test_short_id_is_five_unambiguous_characters_and_stable():
+    sid = di.short_id(PI_A[0])
+    assert len(sid) == di.SHORT_ID_LENGTH
+    assert not set(sid) & set("ILOU")
+    assert di.short_id(PI_A[0].upper()) == sid  # case of the serial doesn't matter
+    assert di.short_id(PI_B[0]) != sid
+
+
+def test_short_id_defaults_to_this_pi(monkeypatch):
+    monkeypatch.setattr(di, "read_cpu_serial", lambda: PI_A[0])
+    assert di.short_id() == di.short_id(PI_A[0])
