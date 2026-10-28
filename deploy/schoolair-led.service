@@ -1,5 +1,9 @@
 [Unit]
 Description=SchoolAir: status LED (breathing/blink patterns via pigpiod)
+# The LED is not detected: it is assumed on every indoor unit, and is meant to
+# stay the fallback once a richer light or a screen gets its own detection
+# (README.md, "Hardware detection").
+#
 # Indoor units only — same GPIO/pigpiod infrastructure as the flower
 # actuator. pigpiod itself is installed by schoolair-pigpio-setup.service,
 # which needs network and can run well after this unit first starts. Until it

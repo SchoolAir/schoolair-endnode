@@ -36,8 +36,8 @@ echo "[schoolair-first-boot] Hostname is now: ${NEW_HN}"
 # and fast, like the rest of this script.
 /home/admin/schoolair/detect_unit_type.sh || true
 
-# Indoor units: is a wilting flower fitted? detect_flower.sh reads the dock's
-# strap and sets /etc/schoolair-flower-fitted; offline and instant, like the
+# Indoor units: is a wilting flower fitted? detect_flower.sh looks for the
+# flower's driver board and sets /etc/schoolair-flower-fitted; offline and instant, like the
 # rest of this script. The flower itself starts once pigpiod is installed.
 if grep -qs indoor /etc/schoolair-unit-type && [ -x /home/admin/schoolair/detect_flower.sh ]; then
     /home/admin/schoolair/detect_flower.sh || true

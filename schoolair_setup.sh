@@ -496,6 +496,11 @@ if [ -f "${SCHOOLAIR_DIR}/schoolair-update" ]; then
 else
     warn "schoolair-update not found in app dir — OTA updates unavailable"
 fi
+# Hardware re-check on request (by hand or from the server; see its header).
+install_with_backup "${SCHOOLAIR_DIR}/schoolair-redetect" /usr/local/bin/schoolair-redetect
+chmod 755 /usr/local/bin/schoolair-redetect
+chown root:root /usr/local/bin/schoolair-redetect
+ok "schoolair-redetect  →  /usr/local/bin/  (root-owned)"
 
 # ── 6. Registration wizard TLS certificate ────────────────────────────────────
 step "6 / Registration wizard TLS certificate"
@@ -704,6 +709,8 @@ cat > "$SUDOERS_FILE" << EOF
 ${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl start schoolair-wizard
 # Allow the telemetry server to trigger an OTA update (fixed, root-owned script)
 ${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/schoolair-update
+# Allow it to re-check the fitted hardware when the server asks (fixed, root-owned script)
+${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/schoolair-redetect
 EOF
 chmod 440 "$SUDOERS_FILE"
 ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update without password"
@@ -712,7 +719,7 @@ ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update wit
 step "15 / systemd services"
 DEPLOY_DIR="${SCHOOLAIR_DIR}/deploy"
 
-for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
+for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-detect-hardware.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
     if [ -f "${DEPLOY_DIR}/${svc}" ]; then
         install_with_backup "${DEPLOY_DIR}/${svc}" "/etc/systemd/system/${svc}"
         ok "${svc} installed"
@@ -743,7 +750,10 @@ fi
 # installing it needs no network and no GitHub access. It is installed on every
 # indoor unit (a few tens of KB), so a golden image carries it; the drop-in
 # deploy/schoolair-flower-fitted.conf lets it run only where detect_flower.sh
-# found the dock's strap and pigpiod is installed. Everything it replaces goes
+# found the flower's driver board and pigpiod is installed. On an update the
+# check catches a newly fitted flower; one already running keeps its pins and
+# its marker (a removed flower is caught at the next boot, or by
+# schoolair-redetect). Everything it replaces goes
 # through install_with_backup, so an OTA rollback restores the previous flower
 # too.
 FLOWER_CHANGED=0
@@ -853,6 +863,7 @@ systemctl enable sen6x.service
 systemctl enable schoolair-first-boot.service 2>/dev/null || true
 systemctl enable schoolair-pigpio-setup.service 2>/dev/null || true
 systemctl enable schoolair-led.service 2>/dev/null || true
+systemctl enable schoolair-detect-hardware.service 2>/dev/null || true
 systemctl enable schoolair-update-watchdog.timer 2>/dev/null || true
 # Enabled wherever it is installed; its drop-in decides whether it runs.
 [ -f /etc/systemd/system/schoolair-flower.service ] && systemctl enable schoolair-flower.service 2>/dev/null || true

@@ -1,0 +1,24 @@
+[Unit]
+Description=SchoolAir: detect the fitted hardware (flower driver board) at every boot
+# What is detected, what is assumed (the status LED) and when each check
+# runs: README.md, "Hardware detection".
+#
+# Hardware can change between boots (a flower fitted or taken out), so the
+# flower marker is re-checked before the flower service decides whether to
+# start (its drop-in requires /etc/schoolair-flower-fitted). A probe takes
+# well under a second and needs no network. Not ordered before
+# schoolair-led.service: that one starts at sysinit and must not wait.
+ConditionPathExists=/etc/schoolair-unit-type
+DefaultDependencies=no
+After=local-fs.target
+Before=schoolair-flower.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'grep -qs indoor /etc/schoolair-unit-type || exit 0; exec /bin/bash /home/admin/schoolair/detect_flower.sh'
+# 1 = no flower, 2 = unknown: answers, not failures.
+SuccessExitStatus=1 2
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

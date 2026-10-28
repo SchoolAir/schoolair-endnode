@@ -130,10 +130,10 @@ ok "Hostname → schoolair-template  (Pi Imager can override per-device when fla
 
 # ── 8b. Wilting flower marker ─────────────────────────────────────────────────
 step "Removing the flower-fitted marker"
-# detect_flower.sh re-creates it at each clone's first boot if its dock has
-# the strap; left here, every clone of this image would think it has a flower.
+# detect_flower.sh re-creates it at each clone's first boot if it has the
+# flower's driver board; left here, every clone of this image would think it has a flower.
 sudo rm -f /etc/schoolair-flower-fitted
-ok "/etc/schoolair-flower-fitted removed — each clone checks its own strap"
+ok "/etc/schoolair-flower-fitted removed — each clone checks its own hardware"
 
 # ── 9. SSH host keys ──────────────────────────────────────────────────────────
 step "Removing SSH host keys"

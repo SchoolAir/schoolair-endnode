@@ -635,6 +635,36 @@ def _channel() -> str:
         return "stable"
 
 
+UNIT_TYPE_FILE = "/etc/schoolair-unit-type"
+FLOWER_MARKER = "/etc/schoolair-flower-fitted"
+REDETECT_DONE_FILE = "/var/lib/schoolair-redetect-done"
+
+
+def _hardware() -> str:
+    """What this unit found it is: "indoor+flower", "indoor", "outdoor" or
+    "unknown" (detect_unit_type.sh / detect_flower.sh). Reported so the server
+    can tell, and can ask for a re-check (see _maybe_redetect)."""
+    try:
+        with open(UNIT_TYPE_FILE) as f:
+            unit = f.read().strip()
+    except OSError:
+        return "unknown"
+    if unit not in ("indoor", "outdoor"):
+        return "unknown"
+    if unit == "indoor" and os.path.exists(FLOWER_MARKER):
+        return "indoor+flower"
+    return unit
+
+
+def _redetect_done() -> str:
+    """Id of the server's last re-check request this unit carried out, or ""."""
+    try:
+        with open(REDETECT_DONE_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def _auth_headers() -> dict:
     """Headers for every call to the primary server.
 
@@ -650,7 +680,11 @@ def _auth_headers() -> dict:
         "Content-Type":       "application/json",
         "X-Schoolair-Version": VERSION,
         "X-Schoolair-Channel": _channel(),   # "dev" or "stable"; see schoolair-dev-update
+        "X-Schoolair-Hardware": _hardware(),
     }
+    done = _redetect_done()
+    if done:
+        headers["X-Schoolair-Redetect-Done"] = done
     mac, serial = device_identity.read_mac(), device_identity.read_cpu_serial()
     if mac != device_identity.UNKNOWN:
         headers["X-Device-Mac"] = mac
@@ -837,6 +871,45 @@ async def _trigger_update():
     _update_in_progress = False  # only reached on failure
 
 
+# ── Hardware re-check ─────────────────────────────────────────────────────────
+
+_redetect_in_progress = False
+
+
+def _maybe_redetect(response: dict) -> None:
+    """The server asks for a hardware re-check with {"redetect": "<id>"} and
+    keeps sending it until X-Schoolair-Redetect-Done carries that id. Each id
+    is carried out once."""
+    request = response.get("redetect")
+    if not isinstance(request, str) or not request or request == _redetect_done():
+        return
+    asyncio.create_task(_run_redetect(request))
+
+
+async def _run_redetect(request: str) -> None:
+    global _redetect_in_progress
+    # An update re-checks too, and both start and stop the flower: one at a
+    # time. The server repeats the request, so a skipped one comes back.
+    if _redetect_in_progress or _update_in_progress:
+        return
+    _redetect_in_progress = True
+    print(f"[hardware] Server asked for a re-check ({request}) — running schoolair-redetect")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "/usr/local/bin/schoolair-redetect", request,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        if stdout:
+            print(stdout.decode(errors="replace")[-2000:].rstrip())
+        print(f"[hardware] Re-check finished (exit {proc.returncode}) — now {_hardware()}")
+    except Exception as e:
+        print(f"[hardware] Re-check failed: {e}")
+    finally:
+        _redetect_in_progress = False
+
+
 # ── WiFi push ─────────────────────────────────────────────────────────────────
 
 _WIFI_STATE_FILE  = "config/wifi_state.json"
@@ -987,6 +1060,7 @@ async def _handle_response(response: dict) -> None:
     if response.get("criteria") and response["criteria"] != load_criteria():
         save_criteria(response["criteria"])
     _maybe_trigger_update(response)
+    _maybe_redetect(response)
     schedule = response.get("schedule")
     if schedule and "active_start" in schedule and "active_end" in schedule:
         new_window = {"start": schedule["active_start"], "end": schedule["active_end"]}

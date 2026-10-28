@@ -1275,6 +1275,66 @@ def test_auth_headers_include_bearer():
     assert headers["Authorization"] == "Bearer tok123"
 
 
+# ── Hardware report and re-check ──────────────────────────────────────────────
+
+@pytest.fixture
+def hw_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(ingest, "UNIT_TYPE_FILE", str(tmp_path / "unit-type"))
+    monkeypatch.setattr(ingest, "FLOWER_MARKER", str(tmp_path / "flower-fitted"))
+    monkeypatch.setattr(ingest, "REDETECT_DONE_FILE", str(tmp_path / "redetect-done"))
+    return tmp_path
+
+
+@pytest.mark.parametrize("unit,flower,expected", [
+    ("indoor", True, "indoor+flower"),
+    ("indoor", False, "indoor"),
+    ("outdoor", True, "outdoor"),   # a stray marker means nothing outdoors
+    (None, False, "unknown"),
+    ("garbage", False, "unknown"),
+])
+def test_auth_headers_report_the_detected_hardware(hw_files, unit, flower, expected):
+    if unit is not None:
+        (hw_files / "unit-type").write_text(unit + "\n")
+    if flower:
+        (hw_files / "flower-fitted").touch()
+    assert _auth_headers()["X-Schoolair-Hardware"] == expected
+
+
+def test_auth_headers_report_the_last_redetect_done(hw_files):
+    assert "X-Schoolair-Redetect-Done" not in _auth_headers()
+    (hw_files / "redetect-done").write_text("req-7\n")
+    assert _auth_headers()["X-Schoolair-Redetect-Done"] == "req-7"
+
+
+async def test_redetect_request_runs_the_root_script_once_per_id(hw_files):
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate.return_value = (b"", b"")
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        ingest._maybe_redetect({"redetect": "req-8"})
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert mock_exec.call_args.args == ("sudo", "-n", "/usr/local/bin/schoolair-redetect", "req-8")
+        (hw_files / "redetect-done").write_text("req-8")
+        mock_exec.reset_mock()
+        ingest._maybe_redetect({"redetect": "req-8"})
+        await asyncio.sleep(0)
+        mock_exec.assert_not_called()
+
+
+async def test_redetect_ignores_bad_requests_and_waits_for_an_update(hw_files):
+    with patch("asyncio.create_subprocess_exec", AsyncMock()) as mock_exec:
+        for r in ({}, {"redetect": None}, {"redetect": ""}, {"redetect": 5}):
+            ingest._maybe_redetect(r)
+        ingest._update_in_progress = True
+        try:
+            await ingest._run_redetect("req-9")
+        finally:
+            ingest._update_in_progress = False
+        await asyncio.sleep(0)
+        mock_exec.assert_not_called()
+
+
 async def test_trigger_update_guard_skips_subprocess_when_already_running():
     """Second call while an update is in flight must not spawn a second process."""
     ingest._update_in_progress = True

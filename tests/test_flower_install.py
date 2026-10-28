@@ -1,12 +1,13 @@
 """tests/test_flower_install.py
 
 How the endnode installs the wilting flower (SchoolAir/Flower-End-node):
-detect_flower.sh reads the dock's strap, schoolair_setup.sh installs the flower
-bundled in flower/ (scripts/vendor_flower.sh) on indoor units with backups, and
+detect_flower.sh finds the flower's driver board, schoolair_setup.sh installs
+the flower bundled in flower/ (scripts/vendor_flower.sh) on indoor units with backups, and
 a drop-in lets the service run only where a flower is fitted and pigpiod exists.
 
-detect_flower.sh is run for real with a fake `pinctrl`; the rest are static
-checks on the scripts, in the style of test_setup_units.py.
+detect_flower.sh and schoolair-redetect are run for real with a fake `pinctrl`
+and `systemctl`; the rest are static checks on the scripts, in the style of
+test_setup_units.py.
 """
 
 import hashlib
@@ -21,47 +22,154 @@ SETUP = (ROOT / "schoolair_setup.sh").read_text()
 
 # ── detect_flower.sh ──────────────────────────────────────────────────────────
 
-def _detect(tmp_path, level: str | None, marker_exists: bool = False):
-    """Run detect_flower.sh with a fake pinctrl reporting `level` ("lo"/"hi"),
-    or with no pinctrl at all when level is None."""
+PINS = ("17", "27", "22", "23")
+
+
+def _detect(tmp_path, levels: dict | None, marker_exists: bool = False,
+            flower_running: bool = False, outputs: tuple = ()):
+    """Run detect_flower.sh with a fake pinctrl. `levels` maps a pin to what it
+    reads with the pull-up on ("lo"/"hi"); None means no pinctrl at all."""
     marker = tmp_path / "schoolair-flower-fitted"
     if marker_exists:
         marker.touch()
-    env = {**os.environ, "FLOWER_MARKER": str(marker)}
-    if level is None:
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text(f"#!/bin/sh\nexit {0 if flower_running else 3}\n")
+    systemctl.chmod(0o755)
+    env = {**os.environ, "FLOWER_MARKER": str(marker), "SYSTEMCTL": str(systemctl)}
+    if levels is None:
         env["PINCTRL"] = str(tmp_path / "no-such-pinctrl")
     else:
+        cases = "".join(
+            f'  {p}) mode={"output" if p in outputs else "input"}; level={lv} ;;\n'
+            for p, lv in levels.items())
         fake = tmp_path / "pinctrl"
         fake.write_text(
             "#!/bin/sh\n"
             f'echo "$@" >> "{tmp_path}/calls"\n'
-            f'[ "$1" = get ] && echo "$2: ip    pu | {level} // GPIO$2 = input"\n'
-            "exit 0\n")
+            '[ "$1" = get ] || exit 0\n'
+            'case "$2" in\n' + cases + "esac\n"
+            'echo "$2: ip    pu | $level // GPIO$2 = $mode"\n')
         fake.chmod(0o755)
         env["PINCTRL"] = str(fake)
     r = subprocess.run(["bash", str(ROOT / "detect_flower.sh")], env=env,
                        capture_output=True, text=True, timeout=10)
-    return r.returncode, marker.exists(), tmp_path
+    calls = (tmp_path / "calls").read_text().splitlines() if (tmp_path / "calls").exists() else []
+    return r.returncode, marker.exists(), calls, r.stdout
 
 
-def test_strap_to_ground_marks_the_flower_fitted(tmp_path):
-    rc, marked, d = _detect(tmp_path, "lo")
+def test_driver_board_on_all_four_pins_marks_the_flower_fitted(tmp_path):
+    rc, marked, calls, _ = _detect(tmp_path, dict.fromkeys(PINS, "lo"))
     assert (rc, marked) == (0, True)
-    # the pull-up must be switched on before reading, or an open pin floats
-    assert (d / "calls").read_text().splitlines()[0] == "set 26 ip pu"
+    for p in PINS:
+        # the pull-up goes on before the read, the pull-down after it
+        up = calls.index(f"set {p} ip pu")
+        assert calls[up + 1] == f"get {p}" and calls[up + 2] == f"set {p} ip pd"
 
 
-def test_no_strap_no_flower(tmp_path):
-    assert _detect(tmp_path, "hi")[:2] == (1, False)
+def test_no_board_no_flower_and_a_stale_marker_goes(tmp_path):
+    """The marker follows the hardware: a flower taken out is forgotten."""
+    assert _detect(tmp_path, dict.fromkeys(PINS, "hi"), marker_exists=True)[:2] == (1, False)
 
 
-def test_a_hand_set_marker_is_kept_without_a_strap(tmp_path):
-    """The bench unit has no dock harness: it is marked by hand."""
-    assert _detect(tmp_path, "hi", marker_exists=True)[:2] == (0, True)
+def test_no_jumper_pin_is_read(tmp_path):
+    """The GPIO26 strap is retired: the board itself is the evidence."""
+    calls = _detect(tmp_path, dict.fromkeys(PINS, "lo"))[2]
+    assert not any(c.split()[1] == "26" for c in calls)
+
+
+def test_a_loose_wire_is_reported_and_changes_nothing(tmp_path):
+    levels = {**dict.fromkeys(PINS, "lo"), "22": "hi"}
+    rc, marked, _, out = _detect(tmp_path, levels)
+    assert (rc, marked) == (2, False)
+    assert "GPIO22" in out
+    assert _detect(tmp_path, levels, marker_exists=True)[:2] == (0, True)
+
+
+def test_pins_are_not_touched_while_the_flower_service_runs(tmp_path):
+    """It holds them as outputs; an input mid-move would lose the position."""
+    rc, marked, calls, _ = _detect(tmp_path, dict.fromkeys(PINS, "hi"),
+                                   marker_exists=True, flower_running=True)
+    assert (rc, marked) == (0, True)
+    assert not any(c.startswith("set") for c in calls)
+
+
+def test_pins_driven_as_outputs_are_not_probed(tmp_path):
+    rc, marked, calls, _ = _detect(tmp_path, dict.fromkeys(PINS, "lo"), outputs=("27",))
+    assert (rc, marked) == (2, False)
+    assert not any(c.startswith("set") for c in calls)
 
 
 def test_without_pinctrl_the_answer_is_unknown(tmp_path):
     assert _detect(tmp_path, None)[:2] == (2, False)
+    assert _detect(tmp_path, None, marker_exists=True)[:2] == (0, True)
+
+
+# ── schoolair-redetect ────────────────────────────────────────────────────────
+
+def _redetect(tmp_path, *args, unit="indoor", flower_running=True, detect_rc=0):
+    sa = tmp_path / "schoolair"
+    sa.mkdir()
+    (sa / "detect_flower.sh").write_text(f'echo detect >> "{tmp_path}/log"\nexit {detect_rc}\n')
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{tmp_path}/log"\n'
+        f'[ "$1" = is-active ] && exit {0 if flower_running else 3}\n'
+        "exit 0\n")
+    systemctl.chmod(0o755)
+    (tmp_path / "unit-type").write_text(unit)
+    done = tmp_path / "lib" / "redetect-done"
+    env = {**os.environ, "SCHOOLAIR_DIR": str(sa), "DONE_FILE": str(done),
+           "UNIT_TYPE_FILE": str(tmp_path / "unit-type"), "SYSTEMCTL": str(systemctl),
+           "FLOWER_MOVING_FLAG": str(tmp_path / "moving")}
+    r = subprocess.run(["bash", str(ROOT / "schoolair-redetect"), *args], env=env,
+                       capture_output=True, text=True, timeout=10)
+    log = (tmp_path / "log").read_text().splitlines() if (tmp_path / "log").exists() else []
+    return r.returncode, log, done.read_text().strip() if done.exists() else None
+
+
+def test_redetect_frees_the_pins_probes_then_restarts_the_flower(tmp_path):
+    rc, log, done = _redetect(tmp_path, "req-42")
+    assert rc == 0 and done == "req-42"
+    assert log.index("stop schoolair-flower.service") < log.index("detect") \
+        < log.index("start schoolair-flower.service")
+
+
+def test_redetect_leaves_a_removed_flower_stopped(tmp_path):
+    log = _redetect(tmp_path, detect_rc=1)[1]
+    assert "stop schoolair-flower.service" in log
+    assert "start schoolair-flower.service" not in log
+
+
+def test_redetect_on_an_outdoor_unit_only_records_the_request(tmp_path):
+    rc, log, done = _redetect(tmp_path, "r1", unit="outdoor")
+    assert (rc, done) == (0, "r1")
+    assert "detect" not in log
+
+
+def test_redetect_refuses_a_request_id_it_cannot_safely_echo(tmp_path):
+    rc, log, done = _redetect(tmp_path, "x; rm -rf /")
+    assert rc == 2 and done is None and log == []
+
+
+def test_redetect_is_installed_root_owned_and_allowed_by_sudoers():
+    assert 'install_with_backup "${SCHOOLAIR_DIR}/schoolair-redetect" /usr/local/bin/schoolair-redetect' in SETUP
+    assert "chown root:root /usr/local/bin/schoolair-redetect" in SETUP
+    assert "NOPASSWD: /usr/local/bin/schoolair-redetect" in SETUP
+    assert os.access(ROOT / "schoolair-redetect", os.X_OK)
+
+
+# ── Detection at every boot ───────────────────────────────────────────────────
+
+def test_boot_detection_runs_before_the_flower_and_is_installed():
+    unit = (ROOT / "deploy/schoolair-detect-hardware.service").read_text()
+    assert "Before=schoolair-flower.service" in unit
+    assert "detect_flower.sh" in unit
+    assert "SuccessExitStatus=1 2" in unit
+    # the LED starts at sysinit and must not wait for it
+    assert "schoolair-led" not in unit.split("[Service]")[0].split("Before=")[1].splitlines()[0]
+    assert "schoolair-detect-hardware.service" in SETUP[SETUP.index("for svc in sen6x.service"):]
+    assert "systemctl enable schoolair-detect-hardware.service" in SETUP
 
 
 # ── schoolair_setup.sh ────────────────────────────────────────────────────────
@@ -156,7 +264,7 @@ def test_wait_for_flower_move_outlasts_a_blind_home():
 
 # ── Around the service ────────────────────────────────────────────────────────
 
-def test_drop_in_requires_the_strap_and_pigpiod():
+def test_drop_in_requires_the_marker_and_pigpiod():
     conf = (ROOT / "deploy/schoolair-flower-fitted.conf").read_text()
     assert "ConditionPathExists=/etc/schoolair-flower-fitted" in conf
     assert "ConditionPathExists=/var/lib/schoolair-pigpio-installed" in conf

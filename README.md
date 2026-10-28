@@ -174,6 +174,55 @@ holds, and deletes it when it has a reading again. That request can only turn
 refreshed for 5 minutes is ignored. It has its own file because the shared
 `/run/schoolair-led-state` is rewritten to "ok" by every upload.
 
+### Hardware detection
+
+A unit works out what it is from what is connected to it, so one image and one
+setup serve every model. Nothing is configured by hand, and no jumpers are used.
+
+| Part | How it is found | Result |
+|---|---|---|
+| Sensor: SEN63C or SEN65 | `detect_unit_type.sh` asks the sensor for its product name over I2C (via `sen6x_read`) | `/etc/schoolair-unit-type`: `indoor` (SEN63C) or `outdoor` (SEN65) |
+| Wilting flower | `detect_flower.sh` looks for the stepper's ULN2003 driver board on GPIO17/27/22/23 (below) | `/etc/schoolair-flower-fitted` present or absent |
+| Status light | Not detected: assumed present on every indoor unit (below) | `schoolair-led.service` drives GPIO24 |
+
+**Flower.** Each ULN2003 input has about 13 kΩ to ground. With the Pi's pull-up
+on, a pin wired to the board reads low (about 0.7 V, too little to move the
+motor) and an open pin reads high. If all four read low, the marker is created.
+If all four read high, it is removed. A mix means a loose jumper wire: the
+script logs which pins and leaves the marker as it was. The motor itself, behind
+the board's socket, can't be seen. The pins are never probed while the flower
+service holds them (it drives them as outputs, and an input mid-move would lose
+the position). The old GPIO26 strap is no longer read.
+
+**Status light.** Today's light is a plain two-leg LED on GPIO24, and it is
+assumed to be there. It can't be detected as wired: with either pull, a plain
+LED reads the same as an open pin, and the Pi has no analog input to tell the
+difference. Driving GPIO24 with no LED on it is harmless and costs one pin that
+nothing else needs. The plan is for the plain LED to stay the fallback:
+- If a richer status light (for example a WS2812 smart LED) or a screen is added
+  later, it gets its own check here. The plain LED is driven only when neither
+  is found.
+- If one is ever needed, a plain LED can be made detectable without an extra
+  pin. Put a 10 kΩ resistor across its legs, in the LED's own lead: the
+  pull-up test then reads low only while the LED is plugged in, just like the
+  flower's board.
+
+**When it runs.** The sensor type is detected at a clone's first boot and on
+every setup/update. The flower is checked:
+- at every boot, before the flower starts (`schoolair-detect-hardware.service`).
+  This catches a flower fitted or taken out between boots;
+- at a clone's first boot, and on every setup/update. While the flower service
+  runs it owns the pins, so an update only catches a newly fitted flower;
+- on request, by hand: `sudo schoolair-redetect` waits for any move, stops the
+  flower, probes, and starts it again if the board is still there (it re-homes);
+- on request, from the server: `"redetect": "<id>"` in an ingest response runs
+  the same command. The unit runs each id once and reports it back in the
+  `X-Schoolair-Redetect-Done` header.
+
+Every request to the server carries `X-Schoolair-Hardware`: `indoor+flower`,
+`indoor`, `outdoor` or `unknown`. `prepare_image.sh` removes the flower marker
+from golden images, so each clone checks its own hardware.
+
 ### Installing the flower
 
 The flower's code is developed in `SchoolAir/Flower-End-node`, which is
@@ -193,12 +242,8 @@ The service is installed and enabled on every indoor unit. A drop-in
 (`deploy/schoolair-flower-fitted.conf`) lets it start only when both of these
 are true:
 
-- **A flower is fitted.** The AQU dock's harness ties GPIO26 (physical pin 37)
-  to ground (pin 39). `detect_flower.sh` switches on the pull-up and reads the
-  pin: low means a strap, and it creates `/etc/schoolair-flower-fitted`. It runs
-  at a clone's first boot and on every setup/update. `prepare_image.sh` removes
-  the marker from golden images. A unit without the harness (the bench unit) is
-  marked by hand: `sudo touch /etc/schoolair-flower-fitted`.
+- **A flower is fitted** (`/etc/schoolair-flower-fitted`, set by
+  `detect_flower.sh`; see [Hardware detection](#hardware-detection)).
 - **pigpiod is installed** (`/var/lib/schoolair-pigpio-installed`). On a new
   unit that happens only once the network is up. `schoolair-pigpio-setup.service`
   then starts the flower.

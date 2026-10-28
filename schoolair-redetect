@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# schoolair-redetect — check again which hardware is fitted, now.
+#
+# Installed root-owned to /usr/local/bin; admin may run it with sudo (sudoers,
+# schoolair_setup.sh step 14). Run by hand (`sudo schoolair-redetect`) or by
+# jobs/ingest.py when the server's ingest response carries {"redetect": "<id>"}.
+#
+# Unlike the checks at boot and on update, this one also catches a flower that
+# was removed while the unit ran: the flower service holds the stepper pins, so
+# it is stopped (after any move in progress) for the probe and started again.
+# The start is gated by the flower drop-in, so it stays stopped if the board is
+# gone. Stopping marks the position unknown: a flower that is still there
+# re-homes once.
+#
+# The optional argument is the server's request id; it is written to DONE_FILE
+# when the check has run, and reported back in every upload's
+# X-Schoolair-Redetect-Done header so the server can clear its request.
+set -u
+
+SCHOOLAIR_DIR="${SCHOOLAIR_DIR:-/home/admin/schoolair}"
+DONE_FILE="${DONE_FILE:-/var/lib/schoolair-redetect-done}"
+UNIT_TYPE_FILE="${UNIT_TYPE_FILE:-/etc/schoolair-unit-type}"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+FLOWER_MOVING_FLAG="${FLOWER_MOVING_FLAG:-/run/schoolair-flower/moving}"
+log() { echo "[schoolair-redetect] $*"; }
+
+request="${1:-}"
+# The id comes from the server and ends up in a file and an HTTP header.
+if [ -n "$request" ] && ! [[ "$request" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+    log "invalid request id — ignored"
+    exit 2
+fi
+
+if grep -qs indoor "$UNIT_TYPE_FILE"; then
+    # Same wait as schoolair_setup.sh: never cut a move (a blind home ~100 s).
+    for _ in $(seq 1 150); do
+        [ -e "$FLOWER_MOVING_FLAG" ] || break
+        sleep 1
+    done
+    was_running=0
+    if "$SYSTEMCTL" is-active --quiet schoolair-flower.service 2>/dev/null; then
+        was_running=1
+        "$SYSTEMCTL" stop schoolair-flower.service
+    fi
+    bash "${SCHOOLAIR_DIR}/detect_flower.sh"
+    flower=$?
+    if [ "$flower" = 0 ]; then
+        "$SYSTEMCTL" start schoolair-flower.service 2>/dev/null || true
+        [ "$was_running" = 1 ] && log "flower still fitted — restarted (it re-homes)" || log "flower fitted — started"
+    elif [ "$was_running" = 1 ]; then
+        log "flower no longer fitted — left stopped"
+    fi
+else
+    log "not an indoor unit — no flower to look for"
+fi
+
+if [ -n "$request" ]; then
+    mkdir -p "$(dirname "$DONE_FILE")"
+    echo "$request" > "$DONE_FILE"
+fi
+exit 0
