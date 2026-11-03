@@ -41,3 +41,16 @@ def test_status_payload_is_compact_json_with_a_known_code():
 ])
 def test_wifi_error_code(err, code):
     assert ble_flow.wifi_error_code(err) == code
+
+
+def test_reconnecting_a_registered_device_needs_only_the_token():
+    reg = ble_flow.parse_registration(b'{"token": "t1"}', require_nickname=False)
+    assert reg["token"] == "t1" and reg["nickname"] == ""
+    with pytest.raises(ValueError, match="token"):
+        ble_flow.parse_registration(b'{"nickname": "Room 12"}', require_nickname=False)
+
+
+def test_idle_status_can_say_the_device_is_registered():
+    payload = json.loads(ble_flow.status_payload("idle", "", registered=True, nickname="Room 12"))
+    assert payload == {"code": "idle", "message": "", "registered": True, "nickname": "Room 12"}
+    assert ble_flow.LED_STATES["locked"] == "error"

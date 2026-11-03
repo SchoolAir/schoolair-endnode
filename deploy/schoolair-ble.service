@@ -2,7 +2,8 @@
 Description=SchoolAir Bluetooth registration (Improv Wi-Fi over BLE)
 # Runs whenever the wizard runs: schoolair-wizard.service Wants= it, and
 # stopping the wizard (e.g. after a successful registration) stops it too.
-# It exits on its own straight away on a registered device.
+# It exits on its own straight away on a registered device that is online;
+# a registered device that lost its network (AP up) gets reconnect-only mode.
 PartOf=schoolair-wizard.service
 After=bluetooth.service NetworkManager.service
 Wants=bluetooth.service

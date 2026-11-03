@@ -8,7 +8,13 @@ service (ble_provision.py) adds two characteristics, whose payloads live here:
                                    Send Wi-Fi settings:
                                    {"token", "nickname", "site"?, "environment"?, "migrate"?}
   Status (read, notify)            JSON {"code", "message"}, one of STATUS_CODES,
-                                   updated at every step of the attempt.
+                                   updated at every step of the attempt. The
+                                   first value ("idle") also says whether the
+                                   device is already registered:
+                                   {"registered": true, "nickname": "Room 12"}
+                                   — it lost its network, and the page only
+                                   reconnects it to Wi-Fi (the token is checked,
+                                   not used up).
 
 Kept free of D-Bus so it can be unit-tested on a laptop.
 """
@@ -32,6 +38,7 @@ STATUS_CODES = (
     "no_internet",
     "registering",
     "registration_rejected",
+    "locked",
     "done",
 )
 
@@ -46,6 +53,7 @@ LED_STATES = {
     "dhcp_failed":           "error",
     "no_internet":           "error",
     "registration_rejected": "error",
+    "locked":                "error",
     "done":                  "success",
 }
 
@@ -53,15 +61,16 @@ ENVIRONMENTS = ("indoor", "outdoor")
 MAX_REGISTRATION_BYTES = 512  # the largest attribute value BLE allows
 
 
-def status_payload(code: str, message: str = "") -> bytes:
+def status_payload(code: str, message: str = "", **extra) -> bytes:
     if code not in STATUS_CODES:
         raise ValueError(f"unknown status code {code!r}")
-    return json.dumps({"code": code, "message": message}, separators=(",", ":")).encode()
+    return json.dumps({"code": code, "message": message, **extra}, separators=(",", ":")).encode()
 
 
-def parse_registration(raw: bytes) -> dict:
+def parse_registration(raw: bytes, require_nickname: bool = True) -> dict:
     """The Registration characteristic's JSON -> the fields run_registration
-    needs. Raises ValueError with a message fit for the Status characteristic."""
+    needs. Raises ValueError with a message fit for the Status characteristic.
+    Reconnecting a registered device needs only the token (require_nickname=False)."""
     if len(raw) > MAX_REGISTRATION_BYTES:
         raise ValueError("Registration data is too long")
     try:
@@ -75,7 +84,7 @@ def parse_registration(raw: bytes) -> dict:
     nickname = str(data.get("nickname", "")).strip()
     if not token:
         raise ValueError("Registration token is missing")
-    if not nickname:
+    if not nickname and require_nickname:
         raise ValueError("Device name is missing")
     environment = str(data.get("environment") or "indoor").strip().lower()
     if environment not in ENVIRONMENTS:

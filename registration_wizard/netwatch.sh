@@ -15,6 +15,8 @@
 #   NETWATCH_GRACE      seconds of loss before entering ap   (default 120)
 #   NETWATCH_RECONNECT  seconds between reconnect probes     (default 300)
 #   NETWATCH_IDENTITY_FILE  identity-mismatch flag path  (default /run/schoolair/identity-mismatch)
+#   NETWATCH_BLE_CLIENT_FILE  phone-connected flag path  (default /run/schoolair-ble-client)
+#   NETWATCH_BUSY_FILE      wizard busy-lock path        (default /run/schoolair-wizard-busy)
 
 set -euo pipefail
 
@@ -26,7 +28,7 @@ TELEMETRY_SERVICE="schoolair"
 # validation and registration, so has_uplink() can go true mid-attempt —
 # without this check we'd race in and stop the wizard before it finishes
 # writing the token to disk.
-WIZARD_BUSY_FILE="/run/schoolair-wizard-busy"
+WIZARD_BUSY_FILE="${NETWATCH_BUSY_FILE:-/run/schoolair-wizard-busy}"
 # Status-LED signal (led_status.py). We only ever write "ap" here — wizard.py
 # owns "thinking"/"error"/"ok" for the states it actually knows about, and
 # jobs/ingest.py owns "ok"/"no_sensor"/"error" during normal operation.
@@ -37,6 +39,9 @@ LED_STATE_FILE="/run/schoolair-led-state"
 # (in case that failed) and hold it there (no reconnect probes, no closing the
 # AP on uplink) until a re-registration removes the file.
 IDENTITY_MISMATCH_FILE="${NETWATCH_IDENTITY_FILE:-/run/schoolair/identity-mismatch}"
+# Kept by ble_provision.py while a phone is connected over Bluetooth. A
+# reconnect probe stops the wizard, and with it the Bluetooth service.
+BLE_CLIENT_FILE="${NETWATCH_BLE_CLIENT_FILE:-/run/schoolair-ble-client}"
 
 POLL_INTERVAL="${NETWATCH_POLL:-30}"
 GRACE_SECS="${NETWATCH_GRACE:-120}"
@@ -137,6 +142,16 @@ try_reconnect() {
 
     if ap_has_clients; then
         log "Reconnect probe deferred — client currently connected to AP"
+        return 1
+    fi
+
+    if [ -f "$BLE_CLIENT_FILE" ]; then
+        log "Reconnect probe deferred — phone connected over Bluetooth"
+        return 1
+    fi
+
+    if [ -f "$WIZARD_BUSY_FILE" ]; then
+        log "Reconnect probe deferred — registration in progress"
         return 1
     fi
 

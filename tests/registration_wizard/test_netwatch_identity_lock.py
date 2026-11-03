@@ -93,3 +93,66 @@ def test_mismatch_with_ap_already_up_holds_it_without_reactivating(tmp_path):
     assert "nmcli con down SchoolAir_AP" not in calls
     assert "systemctl restart schoolair" not in calls
 
+
+
+# ── Reconnect probes wait for a Bluetooth session or a running registration ───
+
+# AP up, no client uplink: netwatch is in "ap" and probes every NETWATCH_RECONNECT s.
+FAKE_NMCLI_AP_ONLY = """#!/bin/bash
+echo "nmcli $*" >> "$CALLS"
+if [[ "$*" == *"NAME,STATE con show --active"* ]]; then
+    echo "SchoolAir_AP:activated"
+elif [[ "$*" == *"NAME,TYPE con show"* ]]; then
+    echo "SchoolNet:802-11-wireless"
+fi
+exit 0
+"""
+
+
+def _run_probe(tmp_path, flag_name: "str | None") -> str:
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    (fakebin / "nmcli").write_text(FAKE_NMCLI_AP_ONLY)
+    for name in ("systemctl", "iw", "iptables", "sleep"):
+        (fakebin / name).write_text(FAKE_LOGGER)
+    # netwatch's own poll sleep must still wait a little, or the loop spins.
+    (fakebin / "sleep").write_text('#!/bin/bash\n[ "$1" = 1 ] && /bin/sleep 1\nexit 0\n')
+    for f in fakebin.iterdir():
+        f.chmod(0o755)
+    calls = tmp_path / "calls.log"
+    calls.touch()
+    ble, busy = tmp_path / "ble-client", tmp_path / "busy"
+    if flag_name:
+        (tmp_path / flag_name).write_text("x")
+    env = {
+        "PATH": f"{fakebin}:/usr/bin:/bin",
+        "CALLS": str(calls),
+        "NETWATCH_POLL": "1",
+        "NETWATCH_RECONNECT": "0",
+        "NETWATCH_IDENTITY_FILE": str(tmp_path / "no-mismatch"),
+        "NETWATCH_BLE_CLIENT_FILE": str(ble),
+        "NETWATCH_BUSY_FILE": str(busy),
+    }
+    try:
+        out = subprocess.run(["bash", str(NETWATCH)], env=env, capture_output=True, text=True, timeout=4)
+        stdout = out.stdout
+    except subprocess.TimeoutExpired as e:
+        stdout = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+    return stdout + calls.read_text()
+
+
+def test_probe_closes_the_ap_when_nobody_is_connected(tmp_path):
+    log = _run_probe(tmp_path, None)
+    assert "nmcli con down SchoolAir_AP" in log
+
+
+def test_probe_waits_while_a_phone_is_connected_over_bluetooth(tmp_path):
+    log = _run_probe(tmp_path, "ble-client")
+    assert "phone connected over Bluetooth" in log
+    assert "nmcli con down SchoolAir_AP" not in log
+
+
+def test_probe_waits_while_a_registration_is_running(tmp_path):
+    log = _run_probe(tmp_path, "busy")
+    assert "registration in progress" in log
+    assert "nmcli con down SchoolAir_AP" not in log

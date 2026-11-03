@@ -24,6 +24,7 @@ import pwd
 import random
 import re
 import secrets
+import shlex
 import sys
 import time
 import urllib.error
@@ -1328,19 +1329,14 @@ async def _setup_client_profile(ssid: str, password: str, delete_committed: bool
     await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
     if delete_committed:
         await _cmd(f'nmcli con delete "{committed}" 2>/dev/null; true')
-    if password:
-        rc, _, err = await _cmd(
-            f'nmcli con add type wifi ifname {AP_INTERFACE} '
-            f'con-name "{TEMP_PROFILE}" ssid "{ssid}" '
-            f'wifi-sec.key-mgmt wpa-psk wifi-sec.psk "{password}" '
-            f'ipv4.method auto ipv6.method ignore'
-        )
-    else:
-        rc, _, err = await _cmd(
-            f'nmcli con add type wifi ifname {AP_INTERFACE} '
-            f'con-name "{TEMP_PROFILE}" ssid "{ssid}" '
-            f'ipv4.method auto ipv6.method ignore'
-        )
+    # The SSID and password come straight from a form or a Bluetooth write and
+    # this runs as root through a shell: quote them, never interpolate raw.
+    security = f"wifi-sec.key-mgmt wpa-psk wifi-sec.psk {shlex.quote(password)} " if password else ""
+    rc, _, err = await _cmd(
+        f'nmcli con add type wifi ifname {AP_INTERFACE} '
+        f'con-name "{TEMP_PROFILE}" ssid {shlex.quote(ssid)} '
+        f'{security}ipv4.method auto ipv6.method ignore'
+    )
     if rc != 0:
         return False, f"Could not create connection profile: {err}"
     return True, "ok"

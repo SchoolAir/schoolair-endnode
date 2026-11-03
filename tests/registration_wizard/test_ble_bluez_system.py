@@ -64,6 +64,19 @@ async def test_gatt_app_and_advertisement_register_with_bluez(monkeypatch):
         await asyncio.sleep(1)
         assert await _active_instances(props) == before + 1  # re-advertised with the new state
 
+        # Guards: the device list comes from BlueZ's object tree; a lockout stops
+        # advertising and resumes it. (Disconnecting is stubbed: it would drop
+        # this laptop's own Bluetooth devices.)
+        devices = await prov._connected_devices()
+        assert all(d.startswith(ble_provision.ADAPTER_PATH + "/dev_") for d in devices)
+        monkeypatch.setattr(ble_provision, "LOCKOUT_S", 2)
+        monkeypatch.setattr(prov, "_disconnect", AsyncMock())
+        lock = asyncio.get_running_loop().create_task(prov._lock())
+        await asyncio.sleep(3)  # 2 s to let the phone read "locked", then locked
+        assert await _active_instances(props) == before
+        await lock
+        assert await _active_instances(props) == before + 1
+
         prov._set_state(improv.STATE_PROVISIONED)
         await asyncio.sleep(1)
         assert await _active_instances(props) == before  # provisioned: no longer advertising

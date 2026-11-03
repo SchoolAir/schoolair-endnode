@@ -370,6 +370,19 @@ network, registers exactly as the wizard does, and reports each step back
 joining the hotspot. On a failure the hotspot comes back, so both paths stay
 usable. Writes need an encrypted link: the phone shows a pairing prompt once.
 
+A registered device that loses its network advertises too, whenever netwatch
+brings the AP up (see below). The page then sees `"registered": true` in the
+first Status value and only reconnects it to Wi-Fi: the token is validated but
+not used up, and the registration is left as it is. A registered device that is
+online doesn't advertise.
+
+Guards against someone nearby tying a unit up: a phone that stays silent for
+2 minutes (the page reads Status every 30 s while open) or stays connected
+for 15 minutes is disconnected, never mid-attempt; after 5 failed attempts in a
+row the device stops advertising and refuses writes for 5 minutes. Wi-Fi
+passwords are never logged, and the wizard shell-quotes the SSID and password
+it hands to `nmcli`.
+
 Protocol layer: `registration_wizard/improv.py`; SchoolAir payloads:
 `ble_flow.py`; BlueZ GATT server and flow: `ble_provision.py`.
 
@@ -386,14 +399,14 @@ uplink lost
     ▼ (2-minute grace period — ignores brief blips)
     │
     ▼
-AP + wizard started
+AP + wizard (+ Bluetooth) started
     │
-    ├── user connects to SchoolAir_AP and reconfigures WiFi via wizard
+    ├── user connects to SchoolAir_AP, or to the device over Bluetooth, and reconfigures WiFi
     │       └── uplink restored → AP closed → telemetry restarted
     │
     └── no manual action taken
             │
-            ▼ (every 5 minutes, if saved networks exist AND no client on AP)
+            ▼ (every 5 minutes, if saved networks exist AND no client on AP or Bluetooth)
             briefly close AP → try each saved network profile → reopen AP if failed
             │
             └── saved network available → AP closed → telemetry restarted
@@ -405,8 +418,8 @@ trigger the fallback.
 **Reconnect probe:** While the AP is up, the watchdog checks every 5 minutes
 whether any of the Pi's saved WiFi profiles are now reachable. The AP drops for
 about 10 seconds during each probe. If a client is currently connected to the
-AP hotspot, that probe cycle is skipped so as not to interrupt an active wizard
-session.
+AP hotspot, a phone is connected over Bluetooth, or a registration is running,
+that probe cycle is skipped so as not to interrupt an active wizard session.
 
 **Timing overrides** (useful when testing):
 

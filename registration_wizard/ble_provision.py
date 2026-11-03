@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""ble_provision.py — register an unregistered endnode over Bluetooth (BLE).
+"""ble_provision.py — register an endnode over Bluetooth (BLE), or put a
+registered one that lost its network back on Wi-Fi.
 
 Runs beside the hotspot wizard (deploy/schoolair-ble.service is pulled in by
 schoolair-wizard.service and stops with it). The registration web page, on
@@ -15,8 +16,20 @@ failure the network goes back to how it was (the hotspot, if it was up), so
 the installer can fix the input and retry over the same connection. On success
 the device stops advertising and hands over to the wizard's own shutdown.
 
-Only advertises while the device needs registering: a registered device
-(AUTH_TOKEN set, no identity mismatch) exits straight away.
+Advertises whenever the hotspot wizard would be useful: while the device is
+unregistered, and — like the hotspot — when a registered device has lost its
+network (netwatch.sh brought the AP up). In that second case the page only
+reconnects it to Wi-Fi: the token is checked with the server but not used up,
+and the registration is left as it is. A registered device that is online
+exits straight away.
+
+Guards against someone nearby tying the device up: a phone that goes quiet for
+IDLE_DISCONNECT_S (the page reads Status every 30 s while open) or stays
+connected past MAX_CONNECTION_S is disconnected, and after MAX_FAILED_ATTEMPTS
+failed attempts in a row the device stops advertising and refuses writes for
+LOCKOUT_S. While a phone is connected, BLE_CLIENT_FILE tells netwatch.sh not to
+close the AP for a reconnect probe (which would stop this service mid-session).
+Wi-Fi passwords are never logged.
 
 BlueZ over D-Bus, via dbus-next. Writes to the Improv RPC Command and the
 Registration characteristics need an encrypted link, so the first one makes
@@ -27,6 +40,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -50,6 +64,13 @@ AGENT_PATH   = APP_PATH + "/agent"
 DEVICE_NAME  = f"SchoolAir-{device_identity.short_id()}"
 CAPABILITIES = improv.CAP_DEVICE_INFO | improv.CAP_WIFI_SCAN  # no LED pattern for Identify yet
 INTERNET_CHECK_TIMEOUT = 10  # seconds
+
+IDLE_DISCONNECT_S   = 120
+MAX_CONNECTION_S    = 15 * 60
+CONNECTION_POLL_S   = 10
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_S           = 5 * 60
+BLE_CLIENT_FILE     = "/run/schoolair-ble-client"
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
 
@@ -102,6 +123,7 @@ class Characteristic(ServiceInterface):
         self._on_write = on_write
         self._value = b""
         self._notifying = False
+        self.on_access = None  # called with the device path on every read or write
 
     @dbus_property(access=PropertyAccess.READ)
     def UUID(self) -> "s":
@@ -122,6 +144,8 @@ class Characteristic(ServiceInterface):
     @method()
     def ReadValue(self, options: "a{sv}") -> "ay":
         offset = options["offset"].value if "offset" in options else 0
+        if self.on_access and "device" in options:
+            self.on_access(options["device"].value)
         return self._value[offset:]
 
     @method()
@@ -132,6 +156,8 @@ class Characteristic(ServiceInterface):
             return  # BlueZ asking whether a long write may be queued: yes
         offset = options["offset"].value if "offset" in options else 0
         device = options["device"].value if "device" in options else ""
+        if self.on_access and device:
+            self.on_access(device)
         self._on_write(bytes(value), offset, device)
 
     @method()
@@ -208,10 +234,17 @@ class Agent(ServiceInterface):
 # ── Provisioning ──────────────────────────────────────────────────────────────
 
 class Provisioner:
-    def __init__(self, bus: MessageBus):
+    def __init__(self, bus: MessageBus, registered_as: "str | None" = None):
+        """registered_as: the device's nickname when it is already registered and
+        only needs reconnecting to Wi-Fi; None to register it."""
         self.bus = bus
+        self.registered_as = registered_as
         self.done = asyncio.Event()
         self.registration: "dict | None" = None
+        self._failures = 0
+        self._locked_until = 0.0
+        self._connected_since: "dict[str, float]" = {}
+        self._last_activity: "dict[str, float]" = {}
         self._registration_buf = bytearray()
         self._commands = improv.CommandBuffer()
         self._busy = False
@@ -239,12 +272,22 @@ class Provisioner:
             sa_path + "/registration": self.reg_char,
             sa_path + "/status":      self.status_char,
         }
+        for char in self.characteristics.values():
+            char.on_access = self._touch
         self.advertisement = Advertisement()
 
         self.state_char.set_value(bytes([improv.STATE_AUTHORIZED]))
         self.error_char.set_value(bytes([improv.ERROR_NONE]))
         self.caps_char.set_value(bytes([CAPABILITIES]))
-        self.status_char.set_value(ble_flow.status_payload("idle"))
+        self._idle_status()
+
+    def _idle_status(self) -> None:
+        if self.registered_as is None:
+            self.status_char.set_value(ble_flow.status_payload("idle", registered=False))
+        else:
+            self.status_char.set_value(ble_flow.status_payload(
+                "idle", f'Registered as "{self.registered_as}"; not connected to a network',
+                registered=True, nickname=self.registered_as))
 
     # ── BlueZ setup ──
 
@@ -272,7 +315,8 @@ class Provisioner:
         await gatt_mgr.call_register_application(APP_PATH, {})
         self._adv_mgr = await self._bluez_interface(ADAPTER_PATH, "org.bluez.LEAdvertisingManager1")
         await self._adv_mgr.call_register_advertisement(ADV_PATH, {})
-        log(f"advertising as {DEVICE_NAME}")
+        log(f"advertising as {DEVICE_NAME}" + (" (reconnect only)" if self.registered_as is not None else ""))
+        asyncio.get_running_loop().create_task(self._watch_connections())
 
     async def _register_agent(self) -> None:
         agent_mgr = await self._bluez_interface("/org/bluez", "org.bluez.AgentManager1")
@@ -308,12 +352,18 @@ class Provisioner:
 
     # ── Writes ──
 
+    def _refuse_while_locked(self) -> None:
+        if time.monotonic() < self._locked_until:
+            raise DBusError("org.bluez.Error.NotPermitted", "Too many failed attempts; try again later")
+
     def _on_registration_write(self, value: bytes, offset: int, device: str) -> None:
+        self._refuse_while_locked()
         if offset == 0:
             self._registration_buf = bytearray()
         self._registration_buf += value
         try:
-            self.registration = ble_flow.parse_registration(bytes(self._registration_buf))
+            self.registration = ble_flow.parse_registration(bytes(self._registration_buf),
+                                                            require_nickname=self.registered_as is None)
         except ValueError as e:
             # A long write may still be arriving; only complain once it parses as JSON.
             try:
@@ -322,11 +372,16 @@ class Provisioner:
                 return
             self.registration = None
             self._status("missing_registration", str(e))
+            self._count_failure()
             return
         self._last_device = device or self._last_device
-        self._status("registration_received", f'Ready to register "{self.registration["nickname"]}"')
+        if self.registered_as is None:
+            self._status("registration_received", f'Ready to register "{self.registration["nickname"]}"')
+        else:
+            self._status("registration_received", f'Ready to reconnect "{self.registered_as}"')
 
     def _on_rpc_write(self, value: bytes, offset: int, device: str) -> None:
+        self._refuse_while_locked()
         self._last_device = device or self._last_device
         try:
             packet = self._commands.feed(value)
@@ -377,13 +432,19 @@ class Provisioner:
         ap_was_up = await backend._ap_is_active()
         self._set_state(improv.STATE_PROVISIONING)
         try:
-            if await self._attempt(ssid, password, reg):
-                await self._finish()
+            if self.registered_as is None:
+                ok, done_message = await self._attempt(ssid, password, reg), f"Registered as {DEVICE_NAME}"
+            else:
+                ok, done_message = await self._reconnect(ssid, password, reg), f'Back online on "{ssid}"'
+            if ok:
+                self._failures = 0
+                await self._finish(done_message)
             else:
                 await backend._cmd(f'nmcli con delete "{backend.TEMP_PROFILE}" 2>/dev/null; true')
                 if ap_was_up:
                     await backend._revert_to_ap()
                 self._set_state(improv.STATE_AUTHORIZED)
+                self._count_failure()
         finally:
             self._busy = False
             try:
@@ -394,11 +455,38 @@ class Provisioner:
     async def _attempt(self, ssid: str, password: str, reg: dict) -> bool:
         """One connect → check → register pass. Returns True once registered;
         on failure sets Status and the Improv error, and returns False."""
+        if not await self._join(ssid, password):
+            return False
+
+        self._status("registering", "Registering with SchoolAir…")
+        valid, vmsg = await backend._validate_token(reg["token"])
+        if not valid:
+            return self._fail("registration_rejected", backend._friendly_error(vmsg), improv.ERROR_UNKNOWN)
+        return await self._register(ssid, reg)
+
+    async def _reconnect(self, ssid: str, password: str, reg: dict) -> bool:
+        """A registered device back on Wi-Fi: the same checks as a registration,
+        but the token is only validated (not used up) and nothing is re-registered."""
+        if not await self._join(ssid, password):
+            return False
+        self._status("registering", "Checking the registration token…")
+        valid, vmsg = await backend._validate_token(reg["token"])
+        if not valid:
+            return self._fail("registration_rejected", backend._friendly_error(vmsg), improv.ERROR_UNKNOWN)
+        await backend._commit_wifi_profile(ssid)
+        return True
+
+    async def _join(self, ssid: str, password: str) -> bool:
+        """Join the network and check SchoolAir is reachable through it."""
         self._status("wifi_connecting", f'Connecting to "{ssid}"…')
+        def hide(text: str) -> str:  # nmcli's errors go to Status and the journal
+            return text.replace(password, "•••") if password else text
+
         ok, msg = await backend._setup_client_profile(ssid, password)
         if not ok:
-            return self._fail("wifi_failed", msg, improv.ERROR_UNABLE_TO_CONNECT)
+            return self._fail("wifi_failed", hide(msg), improv.ERROR_UNABLE_TO_CONNECT)
         rc, _, err = await backend._cmd(f'nmcli con up "{backend.TEMP_PROFILE}"')
+        err = hide(err)
         if rc != 0:
             code = ble_flow.wifi_error_code(err)
             text = {"wifi_auth_failed":  f'Could not join "{ssid}": check the password',
@@ -411,12 +499,9 @@ class Provisioner:
 
         if not await self._internet_ok():
             return self._fail("no_internet", f'"{ssid}" has no internet access to SchoolAir', improv.ERROR_UNABLE_TO_CONNECT)
+        return True
 
-        self._status("registering", "Registering with SchoolAir…")
-        valid, vmsg = await backend._validate_token(reg["token"])
-        if not valid:
-            return self._fail("registration_rejected", backend._friendly_error(vmsg), improv.ERROR_UNKNOWN)
-
+    async def _register(self, ssid: str, reg: dict) -> bool:
         success, hb_msg, device_auth_token = await backend._post_heartbeat({
             "token":       reg["token"],
             "mac_address": backend._get_mac_address(),
@@ -458,6 +543,91 @@ class Provisioner:
         self._set_error(improv_error)
         return False
 
+    # ── Guards ──
+
+    def _count_failure(self) -> None:
+        self._failures += 1
+        if self._failures >= MAX_FAILED_ATTEMPTS:
+            asyncio.get_running_loop().create_task(self._lock())
+
+    async def _lock(self) -> None:
+        """Too many failures in a row: stop advertising, drop the phone, refuse
+        writes for LOCKOUT_S, then start over."""
+        self._locked_until = time.monotonic() + LOCKOUT_S
+        self._failures = 0
+        log(f"{MAX_FAILED_ATTEMPTS} failed attempts — pausing for {LOCKOUT_S}s")
+        self._status("locked", f"Too many failed attempts. Try again in {LOCKOUT_S // 60} minutes.")
+        await asyncio.sleep(2)  # let the phone read why
+        try:
+            await self._adv_mgr.call_unregister_advertisement(ADV_PATH)
+        except DBusError as e:
+            log(f"could not stop advertising: {e.text}")
+        for path in await self._connected_devices():
+            await self._disconnect(path)
+        await asyncio.sleep(LOCKOUT_S)
+        self._locked_until = 0.0
+        self._idle_status()
+        try:
+            await self._adv_mgr.call_register_advertisement(ADV_PATH, {})
+            log("advertising again")
+        except DBusError as e:
+            log(f"could not resume advertising: {e.text}")
+
+    def _touch(self, device: str) -> None:
+        self._last_activity[device] = time.monotonic()
+
+    async def _connected_devices(self) -> "list[str]":
+        try:
+            om = await self._bluez_interface("/", "org.freedesktop.DBus.ObjectManager")
+            objects = await om.call_get_managed_objects()
+        except DBusError as e:
+            log(f"could not list Bluetooth devices: {e.text}")
+            return []
+        return [path for path, ifaces in objects.items()
+                if path.startswith(ADAPTER_PATH + "/")
+                and "org.bluez.Device1" in ifaces
+                and ifaces["org.bluez.Device1"].get("Connected", Variant("b", False)).value]
+
+    async def _disconnect(self, path: str) -> None:
+        try:
+            device = await self._bluez_interface(path, "org.bluez.Device1")
+            await device.call_disconnect()
+        except DBusError as e:
+            log(f"could not disconnect {path}: {e.text}")
+
+    async def _check_connections(self) -> None:
+        """Disconnect a phone that went quiet or stayed too long (never mid-attempt),
+        and keep BLE_CLIENT_FILE in step with whether one is connected."""
+        connected = await self._connected_devices()
+        now = time.monotonic()
+        for path in list(self._connected_since):
+            if path not in connected:
+                del self._connected_since[path]
+                self._last_activity.pop(path, None)
+        for path in connected:
+            since = self._connected_since.setdefault(path, now)
+            quiet = now - max(since, self._last_activity.get(path, since))
+            if self._busy:
+                continue
+            if quiet >= IDLE_DISCONNECT_S:
+                log(f"{path} idle for {int(quiet)}s — disconnecting")
+                await self._disconnect(path)
+            elif now - since >= MAX_CONNECTION_S:
+                log(f"{path} connected for {int(now - since)}s — disconnecting")
+                await self._disconnect(path)
+        try:
+            if connected:
+                Path(BLE_CLIENT_FILE).write_text(" ".join(connected))
+            else:
+                Path(BLE_CLIENT_FILE).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    async def _watch_connections(self) -> None:
+        while not self.done.is_set():
+            await asyncio.sleep(CONNECTION_POLL_S)
+            await self._check_connections()
+
     async def _internet_ok(self) -> bool:
         url = f"{backend.NEW_SERVER_BASE_URL.rstrip('/')}/health"
 
@@ -470,8 +640,8 @@ class Provisioner:
         except (urllib.error.URLError, OSError):
             return False
 
-    async def _finish(self) -> None:
-        self._status("done", f"Registered as {DEVICE_NAME}")
+    async def _finish(self, message: str) -> None:
+        self._status("done", message)
         self.result_char.set_value(improv.build_result(improv.CMD_WIFI_SETTINGS,
                                                        [backend.NEW_SERVER_BASE_URL]))
         self._set_state(improv.STATE_PROVISIONED)  # also stops advertising
@@ -488,15 +658,29 @@ class Provisioner:
         await backend._delayed_shutdown()
 
 
+async def registered_as() -> "tuple[bool, str | None]":
+    """(advertise?, nickname if only reconnecting). Registered and online: nothing
+    to do. Registered but the hotspot is up (no network): reconnect only."""
+    if not backend._has_token() or device_identity.mismatch_detected():
+        return True, None
+    if not await backend._ap_is_active():
+        return False, None
+    return True, (backend.read_wizard_registration() or {}).get("asset_name") or DEVICE_NAME
+
+
 async def main() -> None:
-    if backend._has_token() and not device_identity.mismatch_detected():
-        log("device is registered — not advertising")
+    advertise, nickname = await registered_as()
+    if not advertise:
+        log("device is registered and online — not advertising")
         return
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-    provisioner = Provisioner(bus)
-    await provisioner.start()
-    await provisioner.done.wait()
-    await asyncio.sleep(30)  # _delayed_shutdown normally stops us well before this
+    provisioner = Provisioner(bus, registered_as=nickname)
+    try:
+        await provisioner.start()
+        await provisioner.done.wait()
+        await asyncio.sleep(30)  # _delayed_shutdown normally stops us well before this
+    finally:
+        Path(BLE_CLIENT_FILE).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
