@@ -28,6 +28,9 @@
 # Run as root: at every boot (schoolair-detect-hardware.service, before the
 # flower starts), at a clone's first boot (first_boot.sh), on every setup/update
 # (schoolair_setup.sh) and on request (schoolair-redetect).
+# Each answer (fitted or not, never "unknown") also goes to the hardware
+# record (hardware_record.py), which keeps when the flower was first and last
+# seen.
 # Exit status: 0 flower fitted, 1 not fitted, 2 unknown.
 set -u
 
@@ -35,7 +38,9 @@ FLOWER_PINS="${FLOWER_PINS:-17 27 22 23}"
 FLOWER_MARKER="${FLOWER_MARKER:-/etc/schoolair-flower-fitted}"
 PINCTRL="${PINCTRL:-pinctrl}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+HW_RECORD="${HW_RECORD:-$(dirname "$(readlink -f "$0")")/hardware_record.py}"
 log() { echo "[detect_flower] $*"; }
+record() { [ -f "$HW_RECORD" ] && python3 "$HW_RECORD" part flower "$1" flower >/dev/null 2>&1; true; }
 
 keep_marker() {
     [ -e "$FLOWER_MARKER" ] && exit 0 || exit 2
@@ -73,10 +78,12 @@ done
 
 if [ -z "$hi" ]; then
     touch "$FLOWER_MARKER"
+    record yes
     log "ULN2003 driver found on GPIO${lo# } — flower fitted"
     exit 0
 elif [ -z "$lo" ]; then
     rm -f "$FLOWER_MARKER"
+    record no
     log "no driver board on GPIO${hi# } — no flower"
     exit 1
 else

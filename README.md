@@ -223,6 +223,31 @@ every setup/update. The flower is checked:
   the same command. The unit runs each id once and reports it back in the
   `X-Schoolair-Redetect-Done` header.
 
+**Hardware record.** Every check also goes to `/var/lib/schoolair/hardware.json`
+(`hardware_record.py`), which keeps a history the marker files don't:
+- one entry per part (`SEN63C`, `SEN65`, `flower`, `status_led`, and the
+  auxiliary I2C sensors such as `mgs_v2` and `o3`), with `first_seen` and
+  `last_seen`;
+- a part that goes away keeps its entry: `present` turns false, `last_seen`
+  stays its last confirmation, and `missing_since` / `last_missed` give the
+  first and the latest check that didn't find it. If it comes back, that
+  absence moves to `last_gap`. A SEN6x swap therefore shows the old model
+  missing and the new one first seen;
+- `"how": "assumed"` (with a `basis`) marks a part that is taken to be there
+  rather than detected: today the status light on indoor units;
+- `checks` gives the last check of each kind, and `first_check` /
+  `last_check` the first and latest check overall.
+
+The SEN6x and the status light are checked at every boot
+(`schoolair-hardware-check.service`, after `sen6x.service`), on every
+setup/update and by `schoolair-redetect`. The telemetry service also confirms
+the SEN6x as it reads it (every 6 h, or at once if the model changes or the
+sensor stops answering for 10 min) and records the auxiliary sensors it finds at
+start. The Bluetooth registration reads the record to tell the page which
+sensor the unit has. A check that can't tell (sensor not ready, pins in use)
+changes nothing, and `prepare_image.sh` removes the record from golden images.
+`python3 ~/schoolair/hardware_record.py show` prints it.
+
 Every request to the server carries `X-Schoolair-Hardware`: `indoor+flower`,
 `indoor`, `outdoor` or `unknown`. `prepare_image.sh` removes the flower marker
 from golden images, so each clone checks its own hardware.

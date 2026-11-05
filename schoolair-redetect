@@ -54,6 +54,10 @@ else
     log "not an indoor unit — no flower to look for"
 fi
 
+# The SEN6x and the status-light assumption, into the hardware record (the
+# flower went there with detect_flower.sh above).
+python3 "${SCHOOLAIR_DIR}/hardware_record.py" check || log "could not update the hardware record"
+
 if [ -n "$request" ]; then
     mkdir -p "$(dirname "$DONE_FILE")"
     echo "$request" > "$DONE_FILE"

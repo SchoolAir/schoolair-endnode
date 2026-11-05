@@ -11,6 +11,7 @@ test_setup_units.py.
 """
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -69,6 +70,21 @@ def test_driver_board_on_all_four_pins_marks_the_flower_fitted(tmp_path):
 def test_no_board_no_flower_and_a_stale_marker_goes(tmp_path):
     """The marker follows the hardware: a flower taken out is forgotten."""
     assert _detect(tmp_path, dict.fromkeys(PINS, "hi"), marker_exists=True)[:2] == (1, False)
+
+
+def test_each_answer_goes_to_the_hardware_record(tmp_path, hardware_file):
+    """Fitted, then taken out: the record keeps when it was last seen."""
+    _detect(tmp_path, dict.fromkeys(PINS, "lo"))
+    first = json.loads(hardware_file.read_text())["parts"]["flower"]
+    assert first["present"] is True and first["first_seen"] == first["last_seen"]
+    _detect(tmp_path, dict.fromkeys(PINS, "hi"))
+    gone = json.loads(hardware_file.read_text())["parts"]["flower"]
+    assert gone["present"] is False and gone["last_seen"] == first["last_seen"] and "missing_since" in gone
+
+
+def test_an_unknown_answer_leaves_the_record_alone(tmp_path, hardware_file):
+    _detect(tmp_path, {**dict.fromkeys(PINS, "lo"), "22": "hi"})
+    assert not hardware_file.exists()
 
 
 def test_no_jumper_pin_is_read(tmp_path):

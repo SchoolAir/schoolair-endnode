@@ -722,7 +722,7 @@ ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update wit
 step "15 / systemd services"
 DEPLOY_DIR="${SCHOOLAIR_DIR}/deploy"
 
-for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-ble.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-detect-hardware.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
+for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-ble.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-detect-hardware.service schoolair-hardware-check.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
     if [ -f "${DEPLOY_DIR}/${svc}" ]; then
         install_with_backup "${DEPLOY_DIR}/${svc}" "/etc/systemd/system/${svc}"
         ok "${svc} installed"
@@ -867,6 +867,12 @@ systemctl enable schoolair-first-boot.service 2>/dev/null || true
 systemctl enable schoolair-pigpio-setup.service 2>/dev/null || true
 systemctl enable schoolair-led.service 2>/dev/null || true
 systemctl enable schoolair-detect-hardware.service 2>/dev/null || true
+systemctl enable schoolair-hardware-check.service 2>/dev/null || true
+# The hardware record (hardware_record.py) now, not only at the next boot. On an
+# update the telemetry service is reading the sensor, and the check uses its
+# latest reading rather than reading the bus a second time.
+install -d -o "${ADMIN_USER}" -g "${ADMIN_USER}" /var/lib/schoolair
+python3 "${SCHOOLAIR_DIR}/hardware_record.py" check && ok "Hardware record updated" || warn "Hardware record not updated (non-fatal)"
 systemctl enable schoolair-update-watchdog.timer 2>/dev/null || true
 # Enabled wherever it is installed; its drop-in decides whether it runs.
 [ -f /etc/systemd/system/schoolair-flower.service ] && systemctl enable schoolair-flower.service 2>/dev/null || true

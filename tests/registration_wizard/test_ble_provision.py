@@ -249,23 +249,22 @@ async def test_start_with_the_hotspot_up_reports_no_network(backend, started, mo
     assert _status(started)["sensor"] is None and _status(started)["wifi"] is None
 
 
-@pytest.mark.parametrize("latest, age, read_out, expected", [
-    ({"data": {"sen6x": {"co2": 600}}}, 30, None, "SEN63C"),                 # fresh reading
-    ({"data": None, "error": "Sensor script failed"}, 30, None, None),       # fresh failure
-    ({"data": {"sen6x": {"co2": 600}}}, 3600, (0, '{"sen6x": {"voc": 9}}', ""), "SEN65"),  # stale: read again
-    (None, None, (1, "", "cannot detect sensor"), None),                     # no file, no sensor
-])
-async def test_detect_sensor(monkeypatch, tmp_path, latest, age, read_out, expected):
-    from datetime import datetime, timedelta, timezone
-    path = tmp_path / "latest.json"
-    if latest is not None:
-        recorded = datetime.now(timezone.utc) - timedelta(seconds=age)
-        path.write_text(json.dumps({**latest, "recorded_at": recorded.isoformat()}))
-    monkeypatch.setattr(ble_provision, "LATEST_READING_FILE", str(path))
-    cmd = AsyncMock(return_value=read_out)
-    monkeypatch.setattr(ble_provision.backend, "_cmd", cmd)
-    assert await ble_provision._detect_sensor() == expected
-    assert cmd.await_count == (read_out is not None)
+async def test_detect_sensor_reads_the_hardware_record(monkeypatch):
+    hr = ble_provision.hardware_record
+    check = MagicMock()
+    monkeypatch.setattr(hr, "check_sen6x", check)
+    hr.update(hr.sen6x_observations("SEN65"))
+    assert await ble_provision._detect_sensor() == "SEN65"
+    hr.update(hr.sen6x_observations(None))          # unplugged since
+    assert await ble_provision._detect_sensor() is None
+    check.assert_not_called()                       # the record answered
+
+
+async def test_detect_sensor_checks_and_records_when_the_record_has_none(monkeypatch):
+    hr = ble_provision.hardware_record
+    monkeypatch.setattr(hr, "check_sen6x", MagicMock(return_value=("SEN63C", True)))
+    assert await ble_provision._detect_sensor() == "SEN63C"
+    assert hr.sen6x_model(hr.load()) == (True, "SEN63C")
 
 
 async def test_registers_over_the_current_network_without_wifi_settings(backend, prov):

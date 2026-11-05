@@ -109,21 +109,6 @@ def parse_registration(raw: bytes, require_nickname: bool = True) -> dict:
     }
 
 
-def sensor_model(reading: "dict | None") -> "str | None":
-    """Which SEN6x a reading came from, as detect_unit_type.sh tells them apart:
-    the SEN63C measures CO2 (indoor units), the SEN65 VOC (outdoor units).
-    `reading` is read-sensor.sh's JSON, {"sen6x": {...}}; other sensors' keys
-    (an MGS-V2 also reports "voc") don't count. None: no SEN6x reading."""
-    sen6x = (reading or {}).get("sen6x")
-    if not isinstance(sen6x, dict):
-        return None
-    if "co2" in sen6x:
-        return "SEN63C"
-    if "voc" in sen6x:
-        return "SEN65"
-    return None
-
-
 def wifi_error_code(nmcli_error: str) -> str:
     """Best-effort reading of `nmcli con up`'s error text. NetworkManager
     reports a wrong WPA password as missing secrets (it asked for them again,

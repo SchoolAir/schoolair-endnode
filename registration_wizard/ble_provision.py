@@ -25,7 +25,7 @@ registration is left as it is (the page can still ask for a fresh
 registration). A registered device that is online exits straight away.
 
 The first Status value tells the page which SEN6x the device has (from the
-latest reading, so the page can suggest indoor or outdoor) and the network it
+hardware record, so the page can suggest indoor or outdoor) and the network it
 is already on, if any: an unregistered device on Wi-Fi can register over that
 network, with no Wi-Fi settings sent.
 
@@ -60,6 +60,7 @@ import ble_flow
 import improv
 import wizard as backend  # the wizard's Wi-Fi, token and registration helpers
 import device_identity    # importable once wizard has set up sys.path
+import hardware_record
 
 BLUEZ        = "org.bluez"
 ADAPTER_PATH = "/org/bluez/hci0"
@@ -69,9 +70,6 @@ AGENT_PATH   = APP_PATH + "/agent"
 DEVICE_NAME  = f"SchoolAir-{device_identity.short_id()}"
 CAPABILITIES = improv.CAP_DEVICE_INFO | improv.CAP_WIFI_SCAN  # no LED pattern for Identify yet
 INTERNET_CHECK_TIMEOUT = 10  # seconds
-SENSOR_READ   = str(Path(__file__).resolve().parent.parent / "read-sensor.sh")
-LATEST_READING_FILE = "/run/schoolair/latest.json"  # state.py's, kept fresh by schoolair.service
-LATEST_MAX_AGE_S    = 5 * 60
 
 IDLE_DISCONNECT_S   = 120
 MAX_CONNECTION_S    = 15 * 60
@@ -97,19 +95,21 @@ def _firmware_version() -> str:
 
 
 async def _detect_sensor() -> "str | None":
-    """"SEN63C", "SEN65" or None (no SEN6x answering). The telemetry service's
-    latest reading if it is recent, else one read of our own."""
+    """"SEN63C", "SEN65" or None (no SEN6x answering), from the hardware
+    record (hardware_record.py: checked at every boot and kept current by the
+    telemetry service). A unit without one yet (older install) is checked now,
+    and the answer recorded."""
+    known, model = hardware_record.sen6x_model(hardware_record.load())
+    if known:
+        return model
+    def check():
+        model, conclusive = hardware_record.check_sen6x()
+        hardware_record.update(hardware_record.sen6x_observations(model, conclusive))
+        return model
     try:
-        latest = json.loads(Path(LATEST_READING_FILE).read_text())
-        age = time.time() - backend.datetime.fromisoformat(latest["recorded_at"]).timestamp()
-        if age <= LATEST_MAX_AGE_S:
-            return ble_flow.sensor_model(latest.get("data"))
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    rc, out, _ = await backend._cmd(f'timeout 15 "{SENSOR_READ}"')
-    try:
-        return ble_flow.sensor_model(json.loads(out)) if rc == 0 else None
-    except ValueError:
+        return await asyncio.get_running_loop().run_in_executor(None, check)
+    except OSError as e:
+        log(f"could not check the sensor: {e}")
         return None
 
 

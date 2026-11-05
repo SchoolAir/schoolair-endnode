@@ -60,18 +60,6 @@ def test_registration_flags_must_be_true_not_truthy():
     assert reg["current_wifi"] is True and reg["reregister"] is True
 
 
-@pytest.mark.parametrize("reading, model", [
-    ({"sen6x": {"co2": 512, "pm25": 1.0}}, "SEN63C"),
-    ({"sen6x": {"co2": None, "temp": 20}}, "SEN63C"),            # warming up: the key is there
-    ({"sen6x": {"voc": 100, "nox": 1}}, "SEN65"),
-    ({"sen6x": {"co2": 512}, "mgs_v2": {"voc": 155}}, "SEN63C"),
-    ({"mgs_v2": {"voc": 155}}, None),                            # an MGS-V2's VOC is not a SEN65
-    (None, None),                                                # latest.json after a failed read
-])
-def test_sensor_model(reading, model):
-    assert ble_flow.sensor_model(reading) == model
-
-
 def test_idle_status_can_say_the_device_is_registered():
     payload = json.loads(ble_flow.status_payload("idle", "", registered=True, nickname="Room 12"))
     assert payload == {"code": "idle", "message": "", "registered": True, "nickname": "Room 12"}

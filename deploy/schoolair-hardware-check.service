@@ -1,0 +1,20 @@
+[Unit]
+Description=SchoolAir: record the SEN6x and the status-light assumption at every boot
+# hardware_record.py check: which SEN6x answers (or none) and whether a status
+# light is assumed, into /var/lib/schoolair/hardware.json with when each part
+# was first and last seen. The flower is recorded by detect_flower.sh
+# (schoolair-detect-hardware.service). After sen6x.service, whose --init starts
+# the sensor (or fails without one: the check then records it missing), and
+# before the telemetry service starts reading the bus.
+After=sen6x.service schoolair-detect-hardware.service
+Before=schoolair.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/admin/schoolair/hardware_record.py check
+TimeoutStartSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

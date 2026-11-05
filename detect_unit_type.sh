@@ -17,12 +17,18 @@
 # Only does fast, offline-safe work (I2C probe + a local cmdline.txt edit):
 # first_boot.sh runs before the AP hotspot can come up. Installing pigpiod needs
 # the network, so that is schoolair-pigpio-setup.service's job.
+# Also records what it found in the hardware record (hardware_record.py):
+# the sensor model, or none, and whether a status light is assumed. The unit
+# type itself stays put when the sensor doesn't answer; the record says so.
 # Exit status: 0 type written, 1 sensor not identified.
 set -u
 
 SEN6X_READ="${SEN6X_READ:-/home/admin/i2c/sen6x/sen6x_read}"
 UNIT_TYPE_FILE="${UNIT_TYPE_FILE:-/etc/schoolair-unit-type}"
+HW_RECORD="${HW_RECORD:-$(dirname "$(readlink -f "$0")")/hardware_record.py}"
 log() { echo "[detect_unit_type] $*"; }
+# hardware_record.py ARGS… (never fails the detection)
+record() { [ -f "$HW_RECORD" ] && python3 "$HW_RECORD" "$@" >/dev/null 2>&1; true; }
 
 if [ ! -x "$SEN6X_READ" ]; then
     log "sen6x_read not found — skipping unit-type detection"
@@ -30,7 +36,9 @@ if [ ! -x "$SEN6X_READ" ]; then
 fi
 
 log "Detecting sensor type…"
-reading="$("$SEN6X_READ" --init 2>&1)" || true
+reading="$("$SEN6X_READ" --init 2>&1)"
+status=$?
+printf '%s' "$reading" | record sen6x "$status"
 
 if echo "$reading" | grep -q '"co2"'; then
     log "SEN63C detected — indoor unit"
@@ -51,3 +59,4 @@ else
     log "WARNING: could not identify sensor type — leaving defaults"
     exit 1
 fi
+record led

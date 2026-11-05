@@ -38,9 +38,10 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from services.sensor import (read_sensor, extract_metric, average_readings, probe_aux_sensors,
-                             read_aux_sensor, set_temperature_offset)
+                             read_aux_sensor, set_temperature_offset, SENSOR_REGISTRY)
 import db.queue as queue
 import device_identity
+import hardware_record
 from atomic_file import write_atomic
 import jobs.aggregate as aggregate
 from jobs.incident import IncidentDetector, load_config as load_incident_config
@@ -1160,6 +1161,44 @@ def _read_all_sensors(active_sensors: list) -> dict:
     return data
 
 
+# ── Hardware record ───────────────────────────────────────────────────────────
+#
+# hardware_record.py keeps when each part was first and last seen. The read
+# loop confirms the SEN6x model as it reads it: at most every SEN6X_REFRESH_S
+# while nothing changes (the record lives on the SD card), and at once when the
+# model changes or the sensor has stopped answering for SEN6X_MISSING_AFTER_S
+# (one failed read is not a missing sensor). Best effort: never stops a read.
+
+SEN6X_REFRESH_S       = 6 * 3600
+SEN6X_MISSING_AFTER_S = 10 * 60
+_hw_sen6x_noted: tuple | None = None    # (model or None, monotonic time) last written
+_sensor_failing_since: float | None = None
+
+
+def _note_sen6x(model: str | None, now: float) -> None:
+    global _hw_sen6x_noted
+    if _hw_sen6x_noted and _hw_sen6x_noted[0] == model and now - _hw_sen6x_noted[1] < SEN6X_REFRESH_S:
+        return
+    _hw_sen6x_noted = (model, now)
+    try:
+        hardware_record.update(hardware_record.sen6x_observations(model))
+    except Exception as e:
+        print(f"[hardware] could not update the hardware record: {e}")
+
+
+def _note_aux_sensors(active_sensors: list) -> None:
+    """The auxiliary I2C sensors probed at start: found, or not (any that were
+    there before are kept as missing)."""
+    active = {s["name"]: s for s in active_sensors}
+    try:
+        hardware_record.update([
+            {"part": s["name"], "found": s["name"] in active, "kind": "aux_sensor",
+             "extra": {"address": f"0x{active[s['name']]['detected_addr']:02x}"} if s["name"] in active else None}
+            for s in SENSOR_REGISTRY])
+    except Exception as e:
+        print(f"[hardware] could not update the hardware record: {e}")
+
+
 async def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: bool = False) -> dict | None:
     """Read the sensors once, publish the result locally and keep it for the
     next upload's mean. Returns the reading, or None if the SEN6x read failed
@@ -1169,7 +1208,7 @@ async def _take_sample(active_sensors: list, recorded_at: str | None = None, kee
     per SAMPLE_SECONDS goes into the upload mean (or this one when `keep`,
     the upload-boundary sample), so incident-mode readings every 10 s don't
     weigh more in the 5/15-minute average than a calm minute does."""
-    global _last_kept_mono, _sensor_failing
+    global _last_kept_mono, _sensor_failing, _sensor_failing_since
     if recorded_at is None:
         recorded_at = datetime.now(timezone.utc).isoformat()
     try:
@@ -1177,6 +1216,9 @@ async def _take_sample(active_sensors: list, recorded_at: str | None = None, kee
     except RuntimeError as e:
         print(f"Sensor read failed: {e}")
         _sensor_failing = True
+        failing_since = _sensor_failing_since = _sensor_failing_since or _time_mod.monotonic()
+        if _time_mod.monotonic() - failing_since >= SEN6X_MISSING_AFTER_S:
+            _note_sen6x(None, _time_mod.monotonic())
         _set_led_state("no_sensor")
         state.publish_error(str(e), recorded_at)
         return None
@@ -1190,6 +1232,10 @@ async def _take_sample(active_sensors: list, recorded_at: str | None = None, kee
             _set_led_state("ap" if _identity_locked else "thinking")
 
     now = _time_mod.monotonic()
+    _sensor_failing_since = None
+    model = hardware_record.model_in_reading(data)
+    if model:
+        _note_sen6x(model, now)
     change = _incident.observe(data, now)
     state.set(data, recorded_at, mode=_mode())
     if change == "start":
@@ -1496,6 +1542,7 @@ async def ingest_loop():
     # restart on the sensor, so changing it back to 0 must reach it too.
     set_temperature_offset(_temperature_offset(_settings))
     active_sensors = probe_aux_sensors()
+    _note_aux_sensors(active_sensors)
     print(
         f"Ingest started — "
         f"samples every {SAMPLE_SECONDS}s, uploads {READ_ACTIVE_SECONDS}s/{READ_IDLE_SECONDS}s (active/idle) | "

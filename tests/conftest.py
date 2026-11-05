@@ -36,6 +36,20 @@ def fake_settings():
 
 
 @pytest.fixture(autouse=True)
+def hardware_file(tmp_path, monkeypatch):
+    """Every test writes the hardware record to its own temp file, never
+    /var/lib/schoolair, and the read loop starts with nothing noted."""
+    import hardware_record
+    import jobs.ingest as ingest
+    path = tmp_path / "hardware.json"
+    monkeypatch.setattr(hardware_record, "HARDWARE_FILE", str(path))
+    monkeypatch.setenv("HARDWARE_FILE", str(path))  # scripts the tests run
+    monkeypatch.setattr(ingest, "_hw_sen6x_noted", None)
+    monkeypatch.setattr(ingest, "_sensor_failing_since", None)
+    return path
+
+
+@pytest.fixture(autouse=True)
 def reset_sampling_state():
     """The read loop's sampling state is module-level in jobs.ingest; tests in
     several files drive it, so every test starts from a clean, inactive one."""
