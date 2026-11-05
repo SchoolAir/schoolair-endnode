@@ -168,6 +168,7 @@ async def test_identify_is_not_offered(backend, prov):
 def reconnect_prov(monkeypatch):
     monkeypatch.setattr(ble_provision.asyncio, "sleep", AsyncMock())
     p = ble_provision.Provisioner(bus=None, registered_as="Room 12")
+    p.advertiser_name = p.advertiser.name
     p.advertiser = AsyncMock(state=improv.STATE_AUTHORIZED)
     p.adapter = AsyncMock()
     p._bluez_interface = AsyncMock(return_value=p.adapter)
@@ -177,7 +178,9 @@ def reconnect_prov(monkeypatch):
 async def test_registered_device_says_so_and_only_reconnects(backend, reconnect_prov):
     p = reconnect_prov
     assert _status(p) == {"code": "idle", "registered": True, "nickname": "Room 12",
+                          "sensor": None, "wifi": None,
                           "message": 'Registered as "Room 12"; not connected to a network'}
+    assert p.advertiser_name == "SchoolAir-" + ble_provision.device_identity.short_id() + " (registered)"
 
     p._on_registration_write(b'{"token": "tok-1"}', 0, "/org/bluez/hci0/dev_AA")  # no name needed
     assert _status(p)["code"] == "registration_received"
@@ -202,8 +205,100 @@ async def test_reconnect_needs_a_valid_token(backend, reconnect_prov):
     backend["_revert_to_ap"].assert_awaited_once()
 
 
+async def test_registered_device_can_be_registered_again(backend, reconnect_prov):
+    p = reconnect_prov
+    p._on_registration_write(json.dumps({**REG, "reregister": True}).encode(), 0, "")
+    assert _status(p) == {"code": "registration_received", "message": 'Ready to register "Room 12"'}
+    await p._handle(improv.CMD_WIFI_SETTINGS, _wifi())
+
+    assert _status(p)["code"] == "done"
+    backend["_post_heartbeat"].assert_awaited_once()   # a real registration this time
+    backend["write_status"].assert_called_once()
+
+
 async def test_unregistered_idle_status_says_not_registered(prov):
     assert _status(prov)["registered"] is False
+
+
+# ── What the device tells the page before anything is sent ────────────────────
+
+@pytest.fixture
+def started(backend, prov, monkeypatch):
+    """prov.start() up to the BlueZ calls, which are mocked."""
+    prov.bus = MagicMock()
+    prov._register_agent = AsyncMock()
+    prov.advertiser.name = ble_provision.DEVICE_NAME
+    loop = MagicMock()
+    loop.create_task.side_effect = lambda coro: coro.close()  # no connection watcher
+    monkeypatch.setattr(ble_provision.asyncio, "get_running_loop", MagicMock(return_value=loop))
+    return prov
+
+
+async def test_start_reports_the_sensor_and_the_current_network(backend, started, monkeypatch):
+    monkeypatch.setattr(ble_provision, "_detect_sensor", AsyncMock(return_value="SEN65"))
+    backend["_ap_is_active"].return_value = False
+    monkeypatch.setattr(ble_provision.backend, "_current_wifi", AsyncMock(return_value=("schoolair-Home", "Home")))
+    await started.start()
+    assert _status(started) == {"code": "idle", "message": "", "registered": False, "sensor": "SEN65", "wifi": "Home"}
+
+
+async def test_start_with_the_hotspot_up_reports_no_network(backend, started, monkeypatch):
+    monkeypatch.setattr(ble_provision, "_detect_sensor", AsyncMock(return_value=None))
+    monkeypatch.setattr(ble_provision.backend, "_current_wifi", AsyncMock(return_value=("", "")))
+    await started.start()
+    assert _status(started)["sensor"] is None and _status(started)["wifi"] is None
+
+
+@pytest.mark.parametrize("latest, age, read_out, expected", [
+    ({"data": {"sen6x": {"co2": 600}}}, 30, None, "SEN63C"),                 # fresh reading
+    ({"data": None, "error": "Sensor script failed"}, 30, None, None),       # fresh failure
+    ({"data": {"sen6x": {"co2": 600}}}, 3600, (0, '{"sen6x": {"voc": 9}}', ""), "SEN65"),  # stale: read again
+    (None, None, (1, "", "cannot detect sensor"), None),                     # no file, no sensor
+])
+async def test_detect_sensor(monkeypatch, tmp_path, latest, age, read_out, expected):
+    from datetime import datetime, timedelta, timezone
+    path = tmp_path / "latest.json"
+    if latest is not None:
+        recorded = datetime.now(timezone.utc) - timedelta(seconds=age)
+        path.write_text(json.dumps({**latest, "recorded_at": recorded.isoformat()}))
+    monkeypatch.setattr(ble_provision, "LATEST_READING_FILE", str(path))
+    cmd = AsyncMock(return_value=read_out)
+    monkeypatch.setattr(ble_provision.backend, "_cmd", cmd)
+    assert await ble_provision._detect_sensor() == expected
+    assert cmd.await_count == (read_out is not None)
+
+
+async def test_registers_over_the_current_network_without_wifi_settings(backend, prov):
+    prov.wifi = "Home"
+    backend["_ap_is_active"].return_value = False
+    prov._on_registration_write(json.dumps({**REG, "current_wifi": True}).encode(), 0, "")
+    await prov.attempt
+
+    assert _status(prov)["code"] == "done"
+    backend["_setup_client_profile"].assert_not_awaited()   # no network change
+    backend["_commit_wifi_profile"].assert_not_awaited()
+    assert backend["write_status"].call_args.args[0]["ssid"] == "Home"
+    backend["_post_heartbeat"].assert_awaited_once()
+
+
+async def test_current_network_without_internet_fails_and_stays_put(backend, prov, monkeypatch):
+    monkeypatch.setattr(ble_provision.Provisioner, "_internet_ok", AsyncMock(return_value=False))
+    prov.wifi = "Home"
+    backend["_ap_is_active"].return_value = False
+    prov._on_registration_write(json.dumps({**REG, "current_wifi": True}).encode(), 0, "")
+    await prov.attempt
+
+    assert _status(prov)["code"] == "no_internet"
+    backend["_revert_to_ap"].assert_not_awaited()
+    backend["_post_heartbeat"].assert_not_awaited()
+
+
+async def test_current_network_refused_when_not_on_wifi(backend, prov, reconnect_prov):
+    prov._on_registration_write(json.dumps({**REG, "current_wifi": True}).encode(), 0, "")
+    assert _status(prov)["code"] == "missing_registration" and prov.attempt is None
+    reconnect_prov.wifi = "Home"  # a reconnect is a Wi-Fi change by definition
+    reconnect_prov._on_registration_write(b'{"token": "t", "current_wifi": true}', 0, "")
+    assert _status(reconnect_prov)["code"] == "missing_registration"
 
 
 @pytest.mark.parametrize("has_token,mismatch,ap_up,expected", [
@@ -382,7 +477,8 @@ async def test_advertiser_adds_the_improv_advertisement_with_the_full_name_in_th
     name = ble_provision.DEVICE_NAME.encode()
     scan_response = (bytes([len(name) + 1, 0x09]) + name).hex()
     btmgmt.assert_awaited_once_with("add-adv", "-c", "-g", "-d", data, "-s", scan_response, "1")
-    assert len(name) + 2 <= 31  # the whole name fits a scan response
+    registered = (ble_provision.DEVICE_NAME + ble_provision.ble_flow.REGISTERED_SUFFIX).encode()
+    assert len(registered) + 2 <= 31  # the whole name fits a scan response, suffix and all
 
 
 async def test_advertiser_raises_when_the_kernel_refuses(monkeypatch):

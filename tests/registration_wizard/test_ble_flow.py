@@ -14,7 +14,8 @@ import ble_flow
 
 def test_registration_needs_a_token_and_a_name():
     reg = ble_flow.parse_registration(json.dumps({"token": " t1 ", "nickname": "Room 12"}).encode())
-    assert reg == {"token": "t1", "nickname": "Room 12", "site": "", "environment": "indoor", "migrate": False}
+    assert reg == {"token": "t1", "nickname": "Room 12", "site": "", "environment": "indoor", "migrate": False,
+                   "current_wifi": False, "reregister": False}
     with pytest.raises(ValueError, match="token"):
         ble_flow.parse_registration(b'{"nickname": "Room 12"}')
     with pytest.raises(ValueError, match="name"):
@@ -48,6 +49,27 @@ def test_reconnecting_a_registered_device_needs_only_the_token():
     assert reg["token"] == "t1" and reg["nickname"] == ""
     with pytest.raises(ValueError, match="token"):
         ble_flow.parse_registration(b'{"nickname": "Room 12"}', require_nickname=False)
+    with pytest.raises(ValueError, match="Asset name"):  # registering it again needs one
+        ble_flow.parse_registration(b'{"token": "t1", "reregister": true}', require_nickname=False)
+
+
+def test_registration_flags_must_be_true_not_truthy():
+    reg = ble_flow.parse_registration(b'{"token": "t", "nickname": "n", "current_wifi": "no", "reregister": 1}')
+    assert reg["current_wifi"] is False and reg["reregister"] is False
+    reg = ble_flow.parse_registration(b'{"token": "t", "nickname": "n", "current_wifi": true, "reregister": true}')
+    assert reg["current_wifi"] is True and reg["reregister"] is True
+
+
+@pytest.mark.parametrize("reading, model", [
+    ({"sen6x": {"co2": 512, "pm25": 1.0}}, "SEN63C"),
+    ({"sen6x": {"co2": None, "temp": 20}}, "SEN63C"),            # warming up: the key is there
+    ({"sen6x": {"voc": 100, "nox": 1}}, "SEN65"),
+    ({"sen6x": {"co2": 512}, "mgs_v2": {"voc": 155}}, "SEN63C"),
+    ({"mgs_v2": {"voc": 155}}, None),                            # an MGS-V2's VOC is not a SEN65
+    (None, None),                                                # latest.json after a failed read
+])
+def test_sensor_model(reading, model):
+    assert ble_flow.sensor_model(reading) == model
 
 
 def test_idle_status_can_say_the_device_is_registered():

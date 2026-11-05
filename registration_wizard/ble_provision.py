@@ -18,10 +18,16 @@ the device stops advertising and hands over to the wizard's own shutdown.
 
 Advertises whenever the hotspot wizard would be useful: while the device is
 unregistered, and — like the hotspot — when a registered device has lost its
-network (netwatch.sh brought the AP up). In that second case the page only
-reconnects it to Wi-Fi: the token is checked with the server but not used up,
-and the registration is left as it is. A registered device that is online
-exits straight away.
+network (netwatch.sh brought the AP up). In that second case the advertised
+name ends in REGISTERED_SUFFIX and the page normally only reconnects it to
+Wi-Fi: the token is checked with the server but not used up, and the
+registration is left as it is (the page can still ask for a fresh
+registration). A registered device that is online exits straight away.
+
+The first Status value tells the page which SEN6x the device has (from the
+latest reading, so the page can suggest indoor or outdoor) and the network it
+is already on, if any: an unregistered device on Wi-Fi can register over that
+network, with no Wi-Fi settings sent.
 
 Guards against someone nearby tying the device up: a phone that goes quiet for
 IDLE_DISCONNECT_S (the page reads Status every 30 s while open) or stays
@@ -63,6 +69,9 @@ AGENT_PATH   = APP_PATH + "/agent"
 DEVICE_NAME  = f"SchoolAir-{device_identity.short_id()}"
 CAPABILITIES = improv.CAP_DEVICE_INFO | improv.CAP_WIFI_SCAN  # no LED pattern for Identify yet
 INTERNET_CHECK_TIMEOUT = 10  # seconds
+SENSOR_READ   = str(Path(__file__).resolve().parent.parent / "read-sensor.sh")
+LATEST_READING_FILE = "/run/schoolair/latest.json"  # state.py's, kept fresh by schoolair.service
+LATEST_MAX_AGE_S    = 5 * 60
 
 IDLE_DISCONNECT_S   = 120
 MAX_CONNECTION_S    = 15 * 60
@@ -85,6 +94,23 @@ def _firmware_version() -> str:
         return m.group(1) if m else "unknown"
     except OSError:
         return "unknown"
+
+
+async def _detect_sensor() -> "str | None":
+    """"SEN63C", "SEN65" or None (no SEN6x answering). The telemetry service's
+    latest reading if it is recent, else one read of our own."""
+    try:
+        latest = json.loads(Path(LATEST_READING_FILE).read_text())
+        age = time.time() - backend.datetime.fromisoformat(latest["recorded_at"]).timestamp()
+        if age <= LATEST_MAX_AGE_S:
+            return ble_flow.sensor_model(latest.get("data"))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    rc, out, _ = await backend._cmd(f'timeout 15 "{SENSOR_READ}"')
+    try:
+        return ble_flow.sensor_model(json.loads(out)) if rc == 0 else None
+    except ValueError:
+        return None
 
 
 def _hardware_model() -> str:
@@ -190,12 +216,13 @@ class Advertiser:
 
     INSTANCE = 1
 
-    def __init__(self):
+    def __init__(self, name: str = DEVICE_NAME):
+        self.name = name
         self.state = improv.STATE_AUTHORIZED
 
     async def start(self) -> None:
         data = improv.advertising_data(self.state, CAPABILITIES).hex()
-        name = DEVICE_NAME.encode()
+        name = self.name.encode()
         scan_response = (bytes([1 + len(name), 0x09]) + name).hex()  # 0x09: complete local name
         out = await self._btmgmt("add-adv", "-c", "-g", "-d", data, "-s", scan_response, str(self.INSTANCE))
         if "Instance added" not in out:
@@ -267,6 +294,9 @@ class Provisioner:
         self._commands = improv.CommandBuffer()
         self._busy = False
         self._last_device = ""
+        self.sensor: "str | None" = None  # filled in by start()
+        self.wifi: "str | None" = None    # SSID the device is on, if any
+        self.attempt: "asyncio.Task | None" = None  # a registration over the current network
 
         improv_path = APP_PATH + "/improv"
         sa_path     = APP_PATH + "/schoolair"
@@ -292,7 +322,8 @@ class Provisioner:
         }
         for char in self.characteristics.values():
             char.on_access = self._touch
-        self.advertiser = Advertiser()
+        self.advertiser = Advertiser(DEVICE_NAME if registered_as is None
+                                     else DEVICE_NAME + ble_flow.REGISTERED_SUFFIX)
 
         self.state_char.set_value(bytes([improv.STATE_AUTHORIZED]))
         self.error_char.set_value(bytes([improv.ERROR_NONE]))
@@ -300,12 +331,13 @@ class Provisioner:
         self._idle_status()
 
     def _idle_status(self) -> None:
+        about = {"sensor": self.sensor, "wifi": self.wifi}
         if self.registered_as is None:
-            self.status_char.set_value(ble_flow.status_payload("idle", registered=False))
+            self.status_char.set_value(ble_flow.status_payload("idle", registered=False, **about))
         else:
             self.status_char.set_value(ble_flow.status_payload(
                 "idle", f'Registered as "{self.registered_as}"; not connected to a network',
-                registered=True, nickname=self.registered_as))
+                registered=True, nickname=self.registered_as, **about))
 
     # ── BlueZ setup ──
 
@@ -314,10 +346,14 @@ class Provisioner:
         return self.bus.get_proxy_object(BLUEZ, path, introspection).get_interface(name)
 
     async def start(self) -> None:
+        self.sensor = await _detect_sensor()
+        self.wifi = None if await backend._ap_is_active() else ((await backend._current_wifi())[1] or None)
+        self._idle_status()
+
         await backend._cmd("rfkill unblock bluetooth 2>/dev/null; true")
         props = await self._bluez_interface(ADAPTER_PATH, "org.freedesktop.DBus.Properties")
         await props.call_set("org.bluez.Adapter1", "Powered", Variant("b", True))
-        await props.call_set("org.bluez.Adapter1", "Alias", Variant("s", DEVICE_NAME))
+        await props.call_set("org.bluez.Adapter1", "Alias", Variant("s", self.advertiser.name))
         await props.call_set("org.bluez.Adapter1", "Pairable", Variant("b", True))
 
         for path, service in self.services.items():
@@ -331,7 +367,7 @@ class Provisioner:
         gatt_mgr = await self._bluez_interface(ADAPTER_PATH, "org.bluez.GattManager1")
         await gatt_mgr.call_register_application(APP_PATH, {})
         await self.advertiser.start()
-        log(f"advertising as {DEVICE_NAME}" + (" (reconnect only)" if self.registered_as is not None else ""))
+        log(f"advertising as {self.advertiser.name} (sensor: {self.sensor or 'none'}, Wi-Fi: {self.wifi or 'none'})")
         asyncio.get_running_loop().create_task(self._watch_connections())
 
     async def _register_agent(self) -> None:
@@ -392,10 +428,17 @@ class Provisioner:
             self._count_failure()
             return
         self._last_device = device or self._last_device
-        if self.registered_as is None:
-            self._status("registration_received", f'Ready to register "{self.registration["nickname"]}"')
+        reg = self.registration
+        if reg["current_wifi"] and (self.wifi is None or (self.registered_as is not None and not reg["reregister"])):
+            self.registration = None
+            self._status("missing_registration", "The device is not on Wi-Fi: send Wi-Fi settings too")
+            return
+        if self.registered_as is None or reg["reregister"]:
+            self._status("registration_received", f'Ready to register "{reg["nickname"]}"')
         else:
             self._status("registration_received", f'Ready to reconnect "{self.registered_as}"')
+        if reg["current_wifi"]:
+            self.attempt = asyncio.get_running_loop().create_task(self._provision(None, None))
 
     def _on_rpc_write(self, value: bytes, offset: int, device: str) -> None:
         self._refuse_while_locked()
@@ -428,7 +471,8 @@ class Provisioner:
 
     # ── The registration attempt ──
 
-    async def _provision(self, ssid: str, password: str) -> None:
+    async def _provision(self, ssid: "str | None", password: "str | None") -> None:
+        """ssid None: register over the network the device is already on."""
         reg = self.registration
         if reg is None:
             self._status("missing_registration", "Send the registration details before the Wi-Fi settings")
@@ -449,7 +493,7 @@ class Provisioner:
         ap_was_up = await backend._ap_is_active()
         self._set_state(improv.STATE_PROVISIONING)
         try:
-            if self.registered_as is None:
+            if self.registered_as is None or reg["reregister"]:
                 ok, done_message = await self._attempt(ssid, password, reg), f"Registered as {DEVICE_NAME}"
             else:
                 ok, done_message = await self._reconnect(ssid, password, reg), f'Back online on "{ssid}"'
@@ -469,10 +513,15 @@ class Provisioner:
             except FileNotFoundError:
                 pass
 
-    async def _attempt(self, ssid: str, password: str, reg: dict) -> bool:
-        """One connect → check → register pass. Returns True once registered;
-        on failure sets Status and the Improv error, and returns False."""
-        if not await self._join(ssid, password):
+    async def _attempt(self, ssid: "str | None", password: "str | None", reg: dict) -> bool:
+        """One connect → check → register pass (no connect when ssid is None:
+        the current network). Returns True once registered; on failure sets
+        Status and the Improv error, and returns False."""
+        if ssid is None:
+            if not await self._internet_ok():
+                return self._fail("no_internet", f'"{self.wifi}" has no internet access to SchoolAir',
+                                  improv.ERROR_UNABLE_TO_CONNECT)
+        elif not await self._join(ssid, password):
             return False
 
         self._status("registering", "Registering with SchoolAir…")
@@ -518,7 +567,7 @@ class Provisioner:
             return self._fail("no_internet", f'"{ssid}" has no internet access to SchoolAir', improv.ERROR_UNABLE_TO_CONNECT)
         return True
 
-    async def _register(self, ssid: str, reg: dict) -> bool:
+    async def _register(self, ssid: "str | None", reg: dict) -> bool:
         success, hb_msg, device_auth_token = await backend._post_heartbeat({
             "token":       reg["token"],
             "mac_address": backend._get_mac_address(),
@@ -532,13 +581,14 @@ class Provisioner:
             return self._fail("registration_rejected", backend._friendly_error(hb_msg), improv.ERROR_UNKNOWN)
 
         # Saved exactly as run_registration() saves a wizard registration.
-        await backend._commit_wifi_profile(ssid)
+        if ssid is not None:
+            await backend._commit_wifi_profile(ssid)
         backend.write_status({
             "token":         reg["token"],
             "site":          reg["site"],
             "asset_name":    reg["nickname"],
             "environment":   reg["environment"],
-            "ssid":          ssid,
+            "ssid":          ssid or self.wifi,
             "registered_at": backend.datetime.now(backend.timezone.utc).isoformat(),
             "via":           "ble",
         })

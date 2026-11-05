@@ -6,15 +6,21 @@ service (ble_provision.py) adds two characteristics, whose payloads live here:
 
   Registration (write, encrypted)  JSON from the page, written before Improv's
                                    Send Wi-Fi settings:
-                                   {"token", "nickname", "site"?, "environment"?, "migrate"?}
+                                   {"token", "nickname", "site"?, "environment"?,
+                                    "migrate"?, "current_wifi"?, "reregister"?}
+                                   With "current_wifi": true the attempt starts
+                                   right away on the network the device is
+                                   already on; no Wi-Fi settings follow.
   Status (read, notify)            JSON {"code", "message"}, one of STATUS_CODES,
                                    updated at every step of the attempt. The
-                                   first value ("idle") also says whether the
-                                   device is already registered:
-                                   {"registered": true, "nickname": "Room 12"}
-                                   — it lost its network, and the page only
-                                   reconnects it to Wi-Fi (the token is checked,
-                                   not used up).
+                                   first value ("idle") also describes the device:
+                                   {"registered": bool, "nickname"?: "Room 12",
+                                    "sensor": "SEN63C" | "SEN65" | null,
+                                    "wifi": "<SSID it is on>" | null}
+                                   A registered one has lost its network: the
+                                   page reconnects it to Wi-Fi (the token is
+                                   checked, not used up), unless it asks to
+                                   register it again ("reregister": true).
 
 Kept free of D-Bus so it can be unit-tested on a laptop.
 """
@@ -58,6 +64,7 @@ LED_STATES = {
 }
 
 ENVIRONMENTS = ("indoor", "outdoor")
+REGISTERED_SUFFIX = " (registered)"  # after the advertised name, for the phone's device list
 MAX_REGISTRATION_BYTES = 512  # the largest attribute value BLE allows
 
 
@@ -70,7 +77,8 @@ def status_payload(code: str, message: str = "", **extra) -> bytes:
 def parse_registration(raw: bytes, require_nickname: bool = True) -> dict:
     """The Registration characteristic's JSON -> the fields run_registration
     needs. Raises ValueError with a message fit for the Status characteristic.
-    Reconnecting a registered device needs only the token (require_nickname=False)."""
+    Reconnecting a registered device needs only the token (require_nickname=False),
+    unless it is to be registered again."""
     if len(raw) > MAX_REGISTRATION_BYTES:
         raise ValueError("Registration data is too long")
     try:
@@ -84,8 +92,8 @@ def parse_registration(raw: bytes, require_nickname: bool = True) -> dict:
     nickname = str(data.get("nickname", "")).strip()
     if not token:
         raise ValueError("Registration token is missing")
-    if not nickname and require_nickname:
-        raise ValueError("Device name is missing")
+    if not nickname and (require_nickname or data.get("reregister") is True):
+        raise ValueError("Asset name is missing")
     environment = str(data.get("environment") or "indoor").strip().lower()
     if environment not in ENVIRONMENTS:
         raise ValueError("Environment must be indoor or outdoor")
@@ -96,7 +104,24 @@ def parse_registration(raw: bytes, require_nickname: bool = True) -> dict:
         "site":        str(data.get("site") or "").strip(),
         "environment": environment,
         "migrate":     bool(data.get("migrate", False)),
+        "current_wifi": data.get("current_wifi") is True,
+        "reregister":  data.get("reregister") is True,
     }
+
+
+def sensor_model(reading: "dict | None") -> "str | None":
+    """Which SEN6x a reading came from, as detect_unit_type.sh tells them apart:
+    the SEN63C measures CO2 (indoor units), the SEN65 VOC (outdoor units).
+    `reading` is read-sensor.sh's JSON, {"sen6x": {...}}; other sensors' keys
+    (an MGS-V2 also reports "voc") don't count. None: no SEN6x reading."""
+    sen6x = (reading or {}).get("sen6x")
+    if not isinstance(sen6x, dict):
+        return None
+    if "co2" in sen6x:
+        return "SEN63C"
+    if "voc" in sen6x:
+        return "SEN65"
+    return None
 
 
 def wifi_error_code(nmcli_error: str) -> str:
