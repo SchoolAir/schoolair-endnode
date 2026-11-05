@@ -431,7 +431,7 @@ class Provisioner:
         reg = self.registration
         if reg["current_wifi"] and (self.wifi is None or (self.registered_as is not None and not reg["reregister"])):
             self.registration = None
-            self._status("missing_registration", "The device is not on Wi-Fi: send Wi-Fi settings too")
+            self._status("missing_registration", "The unit is not on Wi-Fi: send Wi-Fi settings too")
             return
         if self.registered_as is None or reg["reregister"]:
             self._status("registration_received", f'Ready to register "{reg["nickname"]}"')
@@ -479,7 +479,7 @@ class Provisioner:
             self._set_error(improv.ERROR_UNKNOWN)
             return
         if self._busy or os.path.exists(backend.WIZARD_BUSY_FILE):
-            self._status("busy", "A registration is already running on this device")
+            self._status("busy", "A registration is already running on this unit")
             self._set_error(improv.ERROR_UNKNOWN)
             return
 
