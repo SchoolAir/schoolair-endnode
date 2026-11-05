@@ -87,3 +87,13 @@ def test_scan_result_keeps_strongest_networks_that_fit_one_packet():
 
 def test_service_data_is_state_capabilities_and_four_reserved_bytes():
     assert improv.service_data(improv.STATE_AUTHORIZED, 0x06) == bytes([2, 6, 0, 0, 0, 0])
+
+
+def test_advertising_data_fits_a_bluetooth_4_advertisement_with_the_flags():
+    data = improv.advertising_data(improv.STATE_AUTHORIZED, 0x06)
+    assert len(data) + 3 <= 31  # the kernel adds the 3-byte flags
+    # 128-bit service UUID list, little-endian
+    assert data[:2] == bytes([17, 0x07])
+    assert data[2:18] == bytes.fromhex("00467768-6228-2272-4663-277478268000".replace("-", ""))[::-1]
+    # service data under 0x4677: state, capabilities, 4 reserved
+    assert data[18:] == bytes([9, 0x16, 0x77, 0x46, 2, 6, 0, 0, 0, 0])

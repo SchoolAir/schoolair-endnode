@@ -5,18 +5,20 @@ the real BlueZ on this machine (system D-Bus, adapter hci0). The wizard's
 network and cloud helpers are stubbed, so nothing touches Wi-Fi.
 
 Opt-in, since it advertises from the local adapter and renames it for a few
-seconds (the old name is put back):
-    SCHOOLAIR_BLE_SYSTEM_TEST=1 pytest tests/registration_wizard/test_ble_bluez_system.py
+seconds (the old name is put back). Run as root: the advertisement goes to the
+kernel through btmgmt (see Advertiser in ble_provision.py):
+    sudo SCHOOLAIR_BLE_SYSTEM_TEST=1 python3 -m pytest tests/registration_wizard/test_ble_bluez_system.py
 
 What it proves: BlueZ accepts the services, characteristics and flags
-(RegisterApplication validates them through our ObjectManager), accepts the
-advertisement with the Improv service data, and follows state changes —
+(RegisterApplication validates them through our ObjectManager), the kernel
+accepts the advertisement with the Improv service data, and it follows state changes —
 re-advertising while provisioning, stopping once provisioned. It cannot pair
 or connect: that needs a second device (a phone).
 """
 
 import asyncio
 import os
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -33,11 +35,13 @@ import ble_provision  # noqa: E402
 import improv         # noqa: E402
 
 ADAPTER = "org.bluez.Adapter1"
-ADV_MGR = "org.bluez.LEAdvertisingManager1"
 
 
 async def _active_instances(props) -> int:
-    return (await props.call_get(ADV_MGR, "ActiveInstances")).value
+    """Advertising instances in the kernel ("Instances list with N item(s)")."""
+    proc = await asyncio.create_subprocess_exec("btmgmt", "advinfo", stdout=asyncio.subprocess.PIPE)
+    out, _ = await proc.communicate()
+    return int(re.search(r"Instances list with (\d+)", out.decode()).group(1))
 
 
 async def test_gatt_app_and_advertisement_register_with_bluez(monkeypatch):
@@ -55,7 +59,7 @@ async def test_gatt_app_and_advertisement_register_with_bluez(monkeypatch):
 
     prov = ble_provision.Provisioner(bus)
     try:
-        await prov.start()  # raises if BlueZ rejects the application or the advertisement
+        await prov.start()  # raises if BlueZ rejects the application or the kernel the advertisement
 
         assert (await props.call_get(ADAPTER, "Alias")).value == ble_provision.DEVICE_NAME
         assert await _active_instances(props) == before + 1
@@ -81,6 +85,7 @@ async def test_gatt_app_and_advertisement_register_with_bluez(monkeypatch):
         await asyncio.sleep(1)
         assert await _active_instances(props) == before  # provisioned: no longer advertising
     finally:
+        await prov.advertiser.stop()
         gatt_mgr = adapter_obj.get_interface("org.bluez.GattManager1")
         try:
             await gatt_mgr.call_unregister_application(ble_provision.APP_PATH)

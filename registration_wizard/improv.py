@@ -64,6 +64,17 @@ def service_data(state: int, capabilities: int) -> bytes:
     return bytes([state, capabilities, 0, 0, 0, 0])
 
 
+def advertising_data(state: int, capabilities: int) -> bytes:
+    """The advertisement's AD structures (length, type, value…): the service
+    UUID (complete list of 128-bit UUIDs) and the service data under its 16-bit
+    UUID, both little-endian. 28 bytes; the kernel adds the 3-byte flags, which
+    fills the 31 a Bluetooth 4.x controller allows."""
+    uuid128 = bytes.fromhex(SERVICE_UUID.replace("-", ""))[::-1]
+    uuid16 = bytes.fromhex(SERVICE_DATA_UUID[4:8])[::-1]
+    data = uuid16 + service_data(state, capabilities)
+    return bytes([1 + len(uuid128), 0x07]) + uuid128 + bytes([1 + len(data), 0x16]) + data
+
+
 class CommandBuffer:
     """Collects RPC Command writes until a whole packet is in.
 

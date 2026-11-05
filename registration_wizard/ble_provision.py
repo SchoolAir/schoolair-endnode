@@ -58,7 +58,6 @@ import device_identity    # importable once wizard has set up sys.path
 BLUEZ        = "org.bluez"
 ADAPTER_PATH = "/org/bluez/hci0"
 APP_PATH     = "/org/schoolair/ble"
-ADV_PATH     = APP_PATH + "/advertisement"
 AGENT_PATH   = APP_PATH + "/agent"
 
 DEVICE_NAME  = f"SchoolAir-{device_identity.short_id()}"
@@ -174,33 +173,52 @@ class Characteristic(ServiceInterface):
             self.emit_properties_changed({"Value": self._value})
 
 
-class Advertisement(ServiceInterface):
-    """Improv requires the service UUID and its service data in the advertisement
-    itself; BlueZ moves the name to the scan response when the 31 bytes are full."""
+class Advertiser:
+    """The advertisement, registered with the kernel directly (btmgmt add-adv),
+    not through BlueZ's LEAdvertisingManager1. On Raspberry Pi OS trixie
+    (kernel 6.18, BlueZ 5.82) on a Pi Zero W, BlueZ's path fails for any
+    advertisement, even bluetoothctl's own ("Add Extended Advertising Data:
+    Invalid Parameters"), while the kernel's plain Add Advertising accepts the
+    same bytes. BlueZ still serves the GATT application and the pairing.
+
+    The Improv service UUID and service data fill the advertisement (31 bytes
+    with the flags on a Bluetooth 4.x controller), so the name goes in the scan
+    response, which browsers request since they scan actively. It is written
+    there in full: the kernel's own "local-name" flag (-n) cuts any name longer
+    than 10 characters to "SchoolAir-". Adding the same instance again replaces
+    it, which is how a state change reaches the advertisement."""
+
+    INSTANCE = 1
 
     def __init__(self):
-        super().__init__("org.bluez.LEAdvertisement1")
         self.state = improv.STATE_AUTHORIZED
 
-    @dbus_property(access=PropertyAccess.READ)
-    def Type(self) -> "s":
-        return "peripheral"
+    async def start(self) -> None:
+        data = improv.advertising_data(self.state, CAPABILITIES).hex()
+        name = DEVICE_NAME.encode()
+        scan_response = (bytes([1 + len(name), 0x09]) + name).hex()  # 0x09: complete local name
+        out = await self._btmgmt("add-adv", "-c", "-g", "-d", data, "-s", scan_response, str(self.INSTANCE))
+        if "Instance added" not in out:
+            raise RuntimeError(f"btmgmt add-adv: {out or 'no answer'}")
 
-    @dbus_property(access=PropertyAccess.READ)
-    def ServiceUUIDs(self) -> "as":
-        return [improv.SERVICE_UUID]
+    async def stop(self) -> None:
+        await self._btmgmt("rm-adv", str(self.INSTANCE))
 
-    @dbus_property(access=PropertyAccess.READ)
-    def ServiceData(self) -> "a{sv}":
-        return {improv.SERVICE_DATA_UUID: Variant("ay", improv.service_data(self.state, CAPABILITIES))}
-
-    @dbus_property(access=PropertyAccess.READ)
-    def LocalName(self) -> "s":
-        return DEVICE_NAME
-
-    @method()
-    def Release(self):
-        log("advertisement released by BlueZ")
+    @staticmethod
+    async def _btmgmt(*args: str) -> str:
+        """btmgmt's output. Its stdin must stay open until it is done: at
+        end-of-file (stdin is /dev/null under systemd) it hangs without sending
+        the command, so not backend._cmd."""
+        proc = await asyncio.create_subprocess_exec(
+            "btmgmt", *args, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            out = await asyncio.wait_for(proc.stdout.read(), 10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            out = b""
+        await proc.wait()
+        return out.decode(errors="replace").strip()
 
 
 class Agent(ServiceInterface):
@@ -274,7 +292,7 @@ class Provisioner:
         }
         for char in self.characteristics.values():
             char.on_access = self._touch
-        self.advertisement = Advertisement()
+        self.advertiser = Advertiser()
 
         self.state_char.set_value(bytes([improv.STATE_AUTHORIZED]))
         self.error_char.set_value(bytes([improv.ERROR_NONE]))
@@ -306,15 +324,13 @@ class Provisioner:
             self.bus.export(path, service)
         for path, char in self.characteristics.items():
             self.bus.export(path, char)
-        self.bus.export(ADV_PATH, self.advertisement)
         self.bus.export(AGENT_PATH, Agent())
 
         await self._register_agent()
 
         gatt_mgr = await self._bluez_interface(ADAPTER_PATH, "org.bluez.GattManager1")
         await gatt_mgr.call_register_application(APP_PATH, {})
-        self._adv_mgr = await self._bluez_interface(ADAPTER_PATH, "org.bluez.LEAdvertisingManager1")
-        await self._adv_mgr.call_register_advertisement(ADV_PATH, {})
+        await self.advertiser.start()
         log(f"advertising as {DEVICE_NAME}" + (" (reconnect only)" if self.registered_as is not None else ""))
         asyncio.get_running_loop().create_task(self._watch_connections())
 
@@ -324,20 +340,21 @@ class Provisioner:
         await agent_mgr.call_request_default_agent(AGENT_PATH)
 
     async def _readvertise(self) -> None:
-        """Improv clients read the state from the advertisement too; BlueZ only
-        reads its properties on registration, so re-register after a change."""
+        """Improv clients read the state from the advertisement too, so it
+        follows each change; once provisioned, the device stops advertising."""
         try:
-            await self._adv_mgr.call_unregister_advertisement(ADV_PATH)
-            if self.advertisement.state != improv.STATE_PROVISIONED:
-                await self._adv_mgr.call_register_advertisement(ADV_PATH, {})
-        except DBusError as e:
-            log(f"could not update advertisement: {e.text}")
+            if self.advertiser.state == improv.STATE_PROVISIONED:
+                await self.advertiser.stop()
+            else:
+                await self.advertiser.start()
+        except RuntimeError as e:
+            log(f"could not update advertisement: {e}")
 
     # ── State reporting ──
 
     def _set_state(self, state: int) -> None:
         self.state_char.set_value(bytes([state]))
-        self.advertisement.state = state
+        self.advertiser.state = state
         asyncio.get_running_loop().create_task(self._readvertise())
 
     def _set_error(self, code: int) -> None:
@@ -558,20 +575,17 @@ class Provisioner:
         log(f"{MAX_FAILED_ATTEMPTS} failed attempts — pausing for {LOCKOUT_S}s")
         self._status("locked", f"Too many failed attempts. Try again in {LOCKOUT_S // 60} minutes.")
         await asyncio.sleep(2)  # let the phone read why
-        try:
-            await self._adv_mgr.call_unregister_advertisement(ADV_PATH)
-        except DBusError as e:
-            log(f"could not stop advertising: {e.text}")
+        await self.advertiser.stop()
         for path in await self._connected_devices():
             await self._disconnect(path)
         await asyncio.sleep(LOCKOUT_S)
         self._locked_until = 0.0
         self._idle_status()
         try:
-            await self._adv_mgr.call_register_advertisement(ADV_PATH, {})
+            await self.advertiser.start()
             log("advertising again")
-        except DBusError as e:
-            log(f"could not resume advertising: {e.text}")
+        except RuntimeError as e:
+            log(f"could not resume advertising: {e}")
 
     def _touch(self, device: str) -> None:
         self._last_activity[device] = time.monotonic()
@@ -680,6 +694,7 @@ async def main() -> None:
         await provisioner.done.wait()
         await asyncio.sleep(30)  # _delayed_shutdown normally stops us well before this
     finally:
+        await provisioner.advertiser.stop()  # the kernel would keep advertising after we exit
         Path(BLE_CLIENT_FILE).unlink(missing_ok=True)
 
 

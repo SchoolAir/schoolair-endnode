@@ -64,7 +64,7 @@ def backend(monkeypatch, tmp_path):
 def prov(monkeypatch):
     monkeypatch.setattr(ble_provision.asyncio, "sleep", AsyncMock())
     p = ble_provision.Provisioner(bus=None)
-    p._adv_mgr = AsyncMock()
+    p.advertiser = AsyncMock(state=improv.STATE_AUTHORIZED)
     p.adapter = AsyncMock()
     p._bluez_interface = AsyncMock(return_value=p.adapter)
     return p
@@ -168,7 +168,7 @@ async def test_identify_is_not_offered(backend, prov):
 def reconnect_prov(monkeypatch):
     monkeypatch.setattr(ble_provision.asyncio, "sleep", AsyncMock())
     p = ble_provision.Provisioner(bus=None, registered_as="Room 12")
-    p._adv_mgr = AsyncMock()
+    p.advertiser = AsyncMock(state=improv.STATE_AUTHORIZED)
     p.adapter = AsyncMock()
     p._bluez_interface = AsyncMock(return_value=p.adapter)
     return p
@@ -277,10 +277,10 @@ async def test_lock_stops_advertising_drops_the_phone_and_refuses_writes(prov, m
     await prov._lock()
 
     assert seen["status"] == "locked"
-    prov._adv_mgr.call_unregister_advertisement.assert_awaited_once()
+    prov.advertiser.stop.assert_awaited_once()
     prov._disconnect.assert_awaited_once_with(phone)
     # …and afterwards it starts over.
-    prov._adv_mgr.call_register_advertisement.assert_awaited_once()
+    prov.advertiser.start.assert_awaited_once()
     assert _status(prov)["code"] == "idle"
     prov._on_registration_write(json.dumps(REG).encode(), 0, phone)
     assert _status(prov)["code"] == "registration_received"
@@ -368,3 +368,34 @@ async def asyncio_tick():
         fut = loop.create_future()
         loop.call_soon(fut.set_result, None)
         await fut
+
+
+# ── Advertising through the kernel ────────────────────────────────────────────
+
+async def test_advertiser_adds_the_improv_advertisement_with_the_full_name_in_the_scan_response(monkeypatch):
+    btmgmt = AsyncMock(return_value="Instance added: 1")
+    monkeypatch.setattr(ble_provision.Advertiser, "_btmgmt", btmgmt)
+    adv = ble_provision.Advertiser()
+    adv.state = improv.STATE_PROVISIONING
+    await adv.start()
+    data = improv.advertising_data(improv.STATE_PROVISIONING, ble_provision.CAPABILITIES).hex()
+    name = ble_provision.DEVICE_NAME.encode()
+    scan_response = (bytes([len(name) + 1, 0x09]) + name).hex()
+    btmgmt.assert_awaited_once_with("add-adv", "-c", "-g", "-d", data, "-s", scan_response, "1")
+    assert len(name) + 2 <= 31  # the whole name fits a scan response
+
+
+async def test_advertiser_raises_when_the_kernel_refuses(monkeypatch):
+    monkeypatch.setattr(ble_provision.Advertiser, "_btmgmt", AsyncMock(
+        return_value="Add Advertising failed with status 0x0d (Invalid Parameters)"))
+    with pytest.raises(RuntimeError, match="Invalid Parameters"):
+        await ble_provision.Advertiser().start()
+
+
+async def test_state_changes_readvertise_and_provisioned_stops(prov):
+    prov.advertiser.state = improv.STATE_PROVISIONING
+    await prov._readvertise()
+    prov.advertiser.start.assert_awaited()
+    prov.advertiser.state = improv.STATE_PROVISIONED
+    await prov._readvertise()
+    prov.advertiser.stop.assert_awaited_once()

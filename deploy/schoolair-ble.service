@@ -14,6 +14,10 @@ StartLimitBurst=3
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 -u /home/admin/schoolair/registration_wizard/ble_provision.py
+# The advertisement lives in the kernel (see Advertiser in ble_provision.py) and
+# would outlast the process; stopping, SIGTERM and crashes all end up here.
+# btmgmt hangs at end-of-file on stdin, so it gets an open pipe.
+ExecStopPost=-/bin/sh -c 'sleep 3 | timeout 10 /usr/bin/btmgmt rm-adv 1'
 WorkingDirectory=/home/admin/schoolair/registration_wizard
 User=root
 Restart=on-failure
