@@ -72,3 +72,48 @@ def test_aux_sensors_found_and_gone(hardware_file):
     assert parts["o3"]["kind"] == "aux_sensor" and "mgs_v2" not in parts   # never had one
     ingest._note_aux_sensors([])
     assert _parts(hardware_file)["o3"]["present"] is False
+
+
+# ── Sent to the server ────────────────────────────────────────────────────────
+
+def _client(status=200):
+    from unittest.mock import AsyncMock, MagicMock
+    import httpx
+    resp = MagicMock(status_code=status)
+    resp.raise_for_status = MagicMock()
+    if status >= 400:
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError("err", request=MagicMock(), response=resp)
+    resp.json.return_value = {}
+    client = AsyncMock()
+    client.post = AsyncMock(return_value=resp)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    return client
+
+
+async def _post_bodies(monkeypatch, statuses):
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://server/ingest")
+    bodies = []
+    for status in statuses:
+        client = _client(status)
+        with patch("httpx.AsyncClient", return_value=client):
+            await ingest._try_post([{"recorded_at": "t", "data": {}}], 0)
+        bodies.append(client.post.call_args.kwargs["json"])
+    return bodies
+
+
+async def test_the_record_is_sent_until_accepted_then_only_when_it_changes(hardware_file, monkeypatch):
+    ingest.hardware_record.update(ingest.hardware_record.sen6x_observations("SEN63C"))
+    first, retry, quiet = await _post_bodies(monkeypatch, [500, 200, 200])
+    assert first["hardware"]["parts"]["SEN63C"]["present"] is True
+    assert "hardware" in retry                   # the server didn't take it the first time
+    assert "hardware" not in quiet               # accepted, unchanged
+
+    ingest.hardware_record.update(ingest.hardware_record.sen6x_observations(None))  # unplugged
+    (changed,) = await _post_bodies(monkeypatch, [200])
+    assert changed["hardware"]["parts"]["SEN63C"]["present"] is False
+
+
+async def test_no_record_no_hardware_field(hardware_file, monkeypatch):
+    (body,) = await _post_bodies(monkeypatch, [200])
+    assert "hardware" not in body

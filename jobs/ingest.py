@@ -706,7 +706,10 @@ async def _try_post(
       readings        — always an array; single element for live readings
       backlog_readings — count still in SQLite after this batch (0 = no backlog)
       bytes_per_reading — serialised size of one reading; present only when backlog > 0
+      hardware        — the hardware record (hardware_record.py), when it changed
+                        since the server last accepted it
     """
+    global _hw_sent
     if _identity_locked:
         return None
     body: dict = {"readings": readings, "backlog_readings": backlog_count}
@@ -717,6 +720,9 @@ async def _try_post(
     pending_acks = wifi_state.get("pending_acks", [])
     if pending_acks:
         body["wifi_acks"] = pending_acks
+    hardware, hardware_text = _hardware_for_upload()
+    if hardware:
+        body["hardware"] = hardware
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -739,6 +745,8 @@ async def _try_post(
         if pending_acks:
             wifi_state["pending_acks"] = []
             _save_wifi_state(wifi_state)
+        if hardware_text:
+            _hw_sent = hardware_text
 
         return res.json()
 
@@ -1184,6 +1192,21 @@ def _note_sen6x(model: str | None, now: float) -> None:
         hardware_record.update(hardware_record.sen6x_observations(model))
     except Exception as e:
         print(f"[hardware] could not update the hardware record: {e}")
+
+
+# The record goes to the server in an upload's body ("hardware") whenever it
+# differs from what the server last accepted: after a start, and after each
+# change (at most a few times a day). The dashboard shows it per unit.
+_hw_sent: str | None = None
+
+
+def _hardware_for_upload() -> tuple[dict | None, str | None]:
+    """(record, its canonical text) when it should be sent, else (None, None)."""
+    record = hardware_record.load()
+    if not record:
+        return None, None
+    text = json.dumps(record, sort_keys=True)
+    return (record, text) if text != _hw_sent else (None, None)
 
 
 def _note_aux_sensors(active_sensors: list) -> None:

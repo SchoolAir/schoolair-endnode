@@ -46,6 +46,7 @@ def hardware_file(tmp_path, monkeypatch):
     monkeypatch.setenv("HARDWARE_FILE", str(path))  # scripts the tests run
     monkeypatch.setattr(ingest, "_hw_sen6x_noted", None)
     monkeypatch.setattr(ingest, "_sensor_failing_since", None)
+    monkeypatch.setattr(ingest, "_hw_sent", None)
     return path
 
 
