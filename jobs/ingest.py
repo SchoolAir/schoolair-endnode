@@ -31,6 +31,7 @@ the device can be re-registered.
 import asyncio
 import json
 import os
+import re
 import random
 import time as _time_mod
 from datetime import datetime, timezone, timedelta, time
@@ -639,6 +640,9 @@ def _channel() -> str:
 UNIT_TYPE_FILE = "/etc/schoolair-unit-type"
 FLOWER_MARKER = "/etc/schoolair-flower-fitted"
 REDETECT_DONE_FILE = "/var/lib/schoolair-redetect-done"
+BLUETOOTH_DONE_FILE = "/var/lib/schoolair-bluetooth-done"
+BLUETOOTH_MAX_MINUTES = 60
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 def _hardware() -> str:
@@ -659,8 +663,17 @@ def _hardware() -> str:
 
 def _redetect_done() -> str:
     """Id of the server's last re-check request this unit carried out, or ""."""
+    return _read_done(REDETECT_DONE_FILE)
+
+
+def _bluetooth_done() -> str:
+    """Id of the server's last Bluetooth request this unit carried out, or ""."""
+    return _read_done(BLUETOOTH_DONE_FILE)
+
+
+def _read_done(path: str) -> str:
     try:
-        with open(REDETECT_DONE_FILE) as f:
+        with open(path) as f:
             return f.read().strip()
     except OSError:
         return ""
@@ -686,6 +699,9 @@ def _auth_headers() -> dict:
     done = _redetect_done()
     if done:
         headers["X-Schoolair-Redetect-Done"] = done
+    done = _bluetooth_done()
+    if done:
+        headers["X-Schoolair-Bluetooth-Done"] = done
     mac, serial = device_identity.read_mac(), device_identity.read_cpu_serial()
     if mac != device_identity.UNKNOWN:
         headers["X-Device-Mac"] = mac
@@ -919,6 +935,50 @@ async def _run_redetect(request: str) -> None:
         _redetect_in_progress = False
 
 
+# ── Bluetooth on request ──────────────────────────────────────────────────────
+
+def _maybe_open_bluetooth(response: dict) -> None:
+    """The server asks to open Bluetooth registration with {"bluetooth": {"id":
+    "<id>", "minutes": N}} and keeps sending it until X-Schoolair-Bluetooth-Done
+    carries that id. Each id is carried out once. Only the server can ask: this
+    comes in the reply to our own upload, and is ignored unless that went over
+    HTTPS (certificate checked), so nobody on the network can fake it."""
+    request = response.get("bluetooth")
+    if not isinstance(request, dict) or not _PRIMARY_INGEST_URL.startswith("https://"):
+        return
+    rid, minutes = request.get("id"), request.get("minutes")
+    if (not isinstance(rid, str) or not _REQUEST_ID_RE.match(rid) or rid == _bluetooth_done()
+            or type(minutes) is not int or not 1 <= minutes <= BLUETOOTH_MAX_MINUTES):
+        return
+    asyncio.create_task(_run_bluetooth(rid, minutes))
+
+
+_bluetooth_starting = False
+
+
+async def _run_bluetooth(request: str, minutes: int) -> None:
+    global _bluetooth_starting
+    if _bluetooth_starting:  # the server repeats the request, so a skipped one comes back
+        return
+    _bluetooth_starting = True
+    print(f"[bluetooth] Server asked to open Bluetooth registration for {minutes} min ({request})")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "/usr/local/bin/schoolair-bluetooth", str(minutes), request,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        if stdout:
+            print(stdout.decode(errors="replace")[-1000:].rstrip())
+        if proc.returncode != 0:
+            print(f"[bluetooth] schoolair-bluetooth exited {proc.returncode}")
+    except Exception as e:
+        print(f"[bluetooth] Could not open Bluetooth: {e}")
+    finally:
+        _bluetooth_starting = False
+
+
 # ── WiFi push ─────────────────────────────────────────────────────────────────
 
 _WIFI_STATE_FILE  = "config/wifi_state.json"
@@ -1070,6 +1130,7 @@ async def _handle_response(response: dict) -> None:
         save_criteria(response["criteria"])
     _maybe_trigger_update(response)
     _maybe_redetect(response)
+    _maybe_open_bluetooth(response)
     schedule = response.get("schedule")
     if schedule and "active_start" in schedule and "active_end" in schedule:
         new_window = {"start": schedule["active_start"], "end": schedule["active_end"]}

@@ -1282,6 +1282,7 @@ def hw_files(tmp_path, monkeypatch):
     monkeypatch.setattr(ingest, "UNIT_TYPE_FILE", str(tmp_path / "unit-type"))
     monkeypatch.setattr(ingest, "FLOWER_MARKER", str(tmp_path / "flower-fitted"))
     monkeypatch.setattr(ingest, "REDETECT_DONE_FILE", str(tmp_path / "redetect-done"))
+    monkeypatch.setattr(ingest, "BLUETOOTH_DONE_FILE", str(tmp_path / "bluetooth-done"))
     return tmp_path
 
 
@@ -1331,6 +1332,60 @@ async def test_redetect_ignores_bad_requests_and_waits_for_an_update(hw_files):
             await ingest._run_redetect("req-9")
         finally:
             ingest._update_in_progress = False
+        await asyncio.sleep(0)
+        mock_exec.assert_not_called()
+
+
+# ── Bluetooth on request ──────────────────────────────────────────────────────
+
+def test_auth_headers_report_the_last_bluetooth_request_done(hw_files):
+    assert "X-Schoolair-Bluetooth-Done" not in _auth_headers()
+    (hw_files / "bluetooth-done").write_text("bt-1\n")
+    assert _auth_headers()["X-Schoolair-Bluetooth-Done"] == "bt-1"
+
+
+@pytest.fixture
+def https_server(monkeypatch):
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "https://dashboard.example/aqc/v1/ingest")
+
+
+async def test_bluetooth_request_runs_the_root_script_once_per_id(hw_files, https_server):
+    mock_proc = AsyncMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate.return_value = (b"", b"")
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        ingest._maybe_open_bluetooth({"bluetooth": {"id": "bt-2", "minutes": 15}})
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert mock_exec.call_args.args == ("sudo", "-n", "/usr/local/bin/schoolair-bluetooth", "15", "bt-2")
+        (hw_files / "bluetooth-done").write_text("bt-2")
+        mock_exec.reset_mock()
+        ingest._maybe_open_bluetooth({"bluetooth": {"id": "bt-2", "minutes": 15}})
+        await asyncio.sleep(0)
+        mock_exec.assert_not_called()
+
+
+@pytest.mark.parametrize("request_", [
+    {}, {"bluetooth": None}, {"bluetooth": "bt-3"},
+    {"bluetooth": {"id": "bt-3"}},                        # no minutes
+    {"bluetooth": {"id": "bt-3", "minutes": 0}},
+    {"bluetooth": {"id": "bt-3", "minutes": 61}},
+    {"bluetooth": {"id": "bt-3", "minutes": 15.5}},
+    {"bluetooth": {"id": "bt-3", "minutes": True}},
+    {"bluetooth": {"id": "../etc/x", "minutes": 15}},
+    {"bluetooth": {"id": "", "minutes": 15}},
+])
+async def test_bluetooth_request_ignores_malformed_requests(hw_files, https_server, request_):
+    with patch("asyncio.create_subprocess_exec", AsyncMock()) as mock_exec:
+        ingest._maybe_open_bluetooth(request_)
+        await asyncio.sleep(0)
+        mock_exec.assert_not_called()
+
+
+async def test_bluetooth_request_ignored_over_plain_http(hw_files, monkeypatch):
+    monkeypatch.setattr(ingest, "_PRIMARY_INGEST_URL", "http://54.252.165.86:3000/aqc/v1/ingest")
+    with patch("asyncio.create_subprocess_exec", AsyncMock()) as mock_exec:
+        ingest._maybe_open_bluetooth({"bluetooth": {"id": "bt-4", "minutes": 15}})
         await asyncio.sleep(0)
         mock_exec.assert_not_called()
 

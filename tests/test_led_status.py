@@ -1103,3 +1103,24 @@ def test_shutdown_skips_wave_halt_while_flower_moves(monkeypatch):
     pi.wave_clear.assert_not_called()
     pi.write.assert_called_with(led_status.GPIO_LED, 0)
     pi.stop.assert_called_once()
+
+
+# ── Bluetooth window ──────────────────────────────────────────────────────────
+
+def test_ble_window_double_blinks_over_ok_but_not_over_a_crash(monkeypatch):
+    monkeypatch.setattr(led_status, "_is_registered", lambda: True)
+    assert led_status._resolve_state(_healthy(), 0.0, raw_state="ok", ble_window=True) == "ap"
+    assert led_status._resolve_state(_healthy(), 0.0, raw_state="error", ble_window=True) == "ap"
+    assert led_status._resolve_state({"unhealthy_until": 100.0}, 50.0, raw_state="ok", ble_window=True) == "error"
+    assert led_status._resolve_state(_healthy(), 0.0, raw_state="ok", ble_window=False) == "ok"
+
+
+def test_ble_window_open_until_its_end(monkeypatch, tmp_path):
+    f = tmp_path / "ble-window"
+    monkeypatch.setattr(led_status, "BLE_WINDOW_FILE", str(f))
+    assert not led_status._ble_window_open(1000.0)          # no file
+    f.write_text("1060\n")
+    assert led_status._ble_window_open(1000.0)
+    assert not led_status._ble_window_open(1060.0)
+    f.write_text("garbage")
+    assert not led_status._ble_window_open(1000.0)

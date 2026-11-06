@@ -22,7 +22,11 @@ network (netwatch.sh brought the AP up). In that second case the advertised
 name ends in REGISTERED_SUFFIX and the page normally only reconnects it to
 Wi-Fi: the token is checked with the server but not used up, and the
 registration is left as it is (the page can still ask for a fresh
-registration). A registered device that is online exits straight away.
+registration). A registered device that is online exits straight away,
+unless a Bluetooth window is open: the server asked for one (schoolair-bluetooth
+wrote its end to BLE_WINDOW_FILE). Then it advertises as registered, like the
+offline case, until the window ends (an attempt in progress is finished
+first); asking again moves the end. led_status.py double-blinks meanwhile.
 
 The first Status value tells the page which SEN6x the device has (from the
 hardware record, so the page can suggest indoor or outdoor) and the network it
@@ -77,6 +81,8 @@ CONNECTION_POLL_S   = 10
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_S           = 5 * 60
 BLE_CLIENT_FILE     = "/run/schoolair-ble-client"
+BLE_WINDOW_FILE     = "/run/schoolair-ble-window"  # end of a window the server asked for (Unix time)
+WINDOW_POLL_S       = 5
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
 
@@ -335,8 +341,9 @@ class Provisioner:
         if self.registered_as is None:
             self.status_char.set_value(ble_flow.status_payload("idle", registered=False, **about))
         else:
+            where = f'on "{self.wifi}"' if self.wifi else "not connected to a network"
             self.status_char.set_value(ble_flow.status_payload(
-                "idle", f'Registered as "{self.registered_as}"; not connected to a network',
+                "idle", f'Registered as "{self.registered_as}"; {where}',
                 registered=True, nickname=self.registered_as, **about))
 
     # ── BlueZ setup ──
@@ -722,14 +729,37 @@ class Provisioner:
         await backend._delayed_shutdown()
 
 
+def window_left(now: "float | None" = None) -> float:
+    """Seconds left in the Bluetooth window the server asked for, or 0."""
+    try:
+        until = float(Path(BLE_WINDOW_FILE).read_text().strip())
+    except (OSError, ValueError):
+        return 0.0
+    return max(0.0, until - (time.time() if now is None else now))
+
+
 async def registered_as() -> "tuple[bool, str | None]":
-    """(advertise?, nickname if only reconnecting). Registered and online: nothing
-    to do. Registered but the hotspot is up (no network): reconnect only."""
+    """(advertise?, nickname if registered). Registered and online: nothing to
+    do, unless a Bluetooth window is open. Registered but the hotspot is up
+    (no network): reconnect only."""
     if not backend._has_token() or device_identity.mismatch_detected():
         return True, None
-    if not await backend._ap_is_active():
+    if not await backend._ap_is_active() and window_left() <= 0:
         return False, None
     return True, (backend.read_wizard_registration() or {}).get("asset_name") or DEVICE_NAME
+
+
+async def until_window_closes(provisioner: "Provisioner") -> None:
+    """Window mode: until a registration finishes, or the window ends with no
+    attempt in progress. The end is re-read, so asking again extends it."""
+    while not provisioner.done.is_set():
+        if window_left() <= 0 and not provisioner._busy:
+            log("Bluetooth window ended — no longer advertising")
+            return
+        try:
+            await asyncio.wait_for(provisioner.done.wait(), WINDOW_POLL_S)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def main() -> None:
@@ -737,15 +767,24 @@ async def main() -> None:
     if not advertise:
         log("device is registered and online — not advertising")
         return
+    windowed = nickname is not None and not await backend._ap_is_active()
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
     provisioner = Provisioner(bus, registered_as=nickname)
     try:
         await provisioner.start()
-        await provisioner.done.wait()
-        await asyncio.sleep(30)  # _delayed_shutdown normally stops us well before this
+        if windowed:
+            log(f"Bluetooth window open for {int(window_left()) // 60} more min")
+            await until_window_closes(provisioner)
+        else:
+            await provisioner.done.wait()
+        if provisioner.done.is_set():
+            # _delayed_shutdown normally stops us well before this; with no
+            # wizard running (a window), it still needs the time to finish.
+            await asyncio.sleep(30)
     finally:
         await provisioner.advertiser.stop()  # the kernel would keep advertising after we exit
         Path(BLE_CLIENT_FILE).unlink(missing_ok=True)
+        Path(BLE_WINDOW_FILE).unlink(missing_ok=True)  # Bluetooth is closed: the LED stops too
 
 
 if __name__ == "__main__":

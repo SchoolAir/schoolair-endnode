@@ -399,7 +399,18 @@ A registered device that loses its network advertises too, whenever netwatch
 brings the AP up (see below). The page then sees `"registered": true` in the
 first Status value and only reconnects it to Wi-Fi: the token is validated but
 not used up, and the registration is left as it is. A registered device that is
-online doesn't advertise.
+online doesn't advertise, unless Bluetooth was opened on request.
+
+**On request.** `sudo schoolair-bluetooth MINUTES` opens Bluetooth registration
+for 1-60 minutes, even on a registered unit that is online. The LED
+double-blinks meanwhile; asking again moves the end, and a registration in
+progress is finished before it closes. The server asks for it with
+`"bluetooth": {"id": "<id>", "minutes": N}` in an ingest response (sent with
+`scripts/unit-request bluetooth <unit>` in schoolair-server). The unit runs each
+id once and reports it back in the `X-Schoolair-Bluetooth-Done` header. Only the
+server can ask: the request arrives in the reply to the unit's own HTTPS upload,
+and the unit opens no port. It is picked up with the next upload, within 5
+minutes during the active window and 15 outside it.
 
 Guards against someone nearby tying a unit up: a phone that stays silent for
 2 minutes (the page reads Status every 30 s while open) or stays connected

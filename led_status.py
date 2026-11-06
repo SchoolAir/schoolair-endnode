@@ -32,6 +32,10 @@ reaches the code that writes to LED_STATE_FILE at all, so a stale "ok"
 from before the crash would otherwise just sit there being rendered
 forever. See _check_watched_services().
 
+While a Bluetooth window the server asked for is open (BLE_WINDOW_FILE, see
+schoolair-bluetooth), the LED double-blinks like "ap": the unit can be
+registered from a phone. Only a crashed service (below) shows instead.
+
 While the setup hotspot is up (_ap_active), "ap" beats "error" from any
 source, the health check included: a person standing in front of the device
 must see that it's waiting for them. The error they'd otherwise have seen is
@@ -62,6 +66,9 @@ LED_STATE_FILE = "/run/schoolair-led-state"
 # cutting it mid-move loses the flower's position (it has no sensor). The LED
 # holds a steady glow on plain PWM instead, which pigpiod times independently.
 FLOWER_MOVING_FLAG = "/run/schoolair-flower/moving"
+# End (Unix time) of the Bluetooth window schoolair-bluetooth opened; the
+# Bluetooth service removes it when it stops advertising.
+BLE_WINDOW_FILE = "/run/schoolair-ble-window"
 # The flower service writes "thinking" here while it holds still for want of a
 # valid reading (sensor fault, reading too old), so the LED says "no data"
 # instead of breathing "all's well". It has its own file because LED_STATE_FILE
@@ -379,6 +386,14 @@ def _flower_request(mtime_ns: "int | None", now_wall: float) -> "str | None":
         return None
 
 
+def _ble_window_open(now_wall: float) -> bool:
+    try:
+        with open(BLE_WINDOW_FILE) as f:
+            return float(f.read().strip()) > now_wall
+    except (OSError, ValueError):
+        return False
+
+
 def _flower_request_mtime() -> "int | None":
     try:
         return os.stat(FLOWER_LED_REQUEST_FILE).st_mtime_ns
@@ -387,7 +402,8 @@ def _flower_request_mtime() -> "int | None":
 
 
 def _resolve_state(health: dict, now_mono: float, raw_state: "str | None" = None,
-                   ap_active: bool = False, flower_request: "str | None" = None) -> str:
+                   ap_active: bool = False, flower_request: "str | None" = None,
+                   ble_window: bool = False) -> str:
     """Precedence, highest to lowest:
       0. AP mode (ap_active): "error" from any source below shows as "ap" — the
          device is waiting for someone to set it up, and the error itself is
@@ -405,10 +421,14 @@ def _resolve_state(health: dict, now_mono: float, raw_state: "str | None" = None
          problem in either mode.
       3. The wilting flower's request (flower_request, see
          FLOWER_LED_REQUEST_FILE): "thinking" replaces "ok" only. Uploading
-         fine while the sensor has no valid CO2 is not "all's well"."""
+         fine while the sensor has no valid CO2 is not "all's well".
+      Above 2 and 3, below 1: a Bluetooth window (ble_window) shows "ap", the
+      double blink, whatever LED_STATE_FILE says."""
     state = raw_state if raw_state is not None else _read_state()
     if state == "ok" and flower_request == "thinking":
         state = "thinking"
+    if ble_window:
+        state = "ap"
     if state == "error" and not _is_registered():
         state = "ap"
     if now_mono < health["unhealthy_until"]:
@@ -718,7 +738,8 @@ def main() -> None:
                 flower_mtime = fmtime
             elif flower_request and time.time() - flower_mtime / 1e9 > FLOWER_REQUEST_MAX_AGE_S:
                 flower_request = None            # not refreshed: the flower has stopped asking
-            state = _resolve_state(health, now_mono, raw_state, ap_active, flower_request)
+            ble_window = _ble_window_open(time.time())
+            state = _resolve_state(health, now_mono, raw_state, ap_active, flower_request, ble_window)
             reason = _error_reason(health, now_mono)
             if reason != last_reason:
                 _publish_error(reason)
@@ -754,7 +775,7 @@ def main() -> None:
                         wave_id = new_wave
                     print(f"[led] state {last_state} -> {state} "
                           f"(state file: {_read_state()}, flower request: {flower_request}, health override: "
-                          f"{now_mono < health['unhealthy_until']}, AP: {ap_active}; "
+                          f"{now_mono < health['unhealthy_until']}, AP: {ap_active}, Bluetooth window: {ble_window}; "
                           f"{len(segments)} pulses, {sum(us for _, us in segments) / 1e6:.2f}s cycle)")
                     last_state = state
             # Heartbeat: raises if pigpiod has gone away (crashed/restarted —

@@ -504,6 +504,11 @@ install_with_backup "${SCHOOLAIR_DIR}/schoolair-redetect" /usr/local/bin/schoola
 chmod 755 /usr/local/bin/schoolair-redetect
 chown root:root /usr/local/bin/schoolair-redetect
 ok "schoolair-redetect  →  /usr/local/bin/  (root-owned)"
+# Bluetooth registration on request (by hand or from the server; see its header).
+install_with_backup "${SCHOOLAIR_DIR}/schoolair-bluetooth" /usr/local/bin/schoolair-bluetooth
+chmod 755 /usr/local/bin/schoolair-bluetooth
+chown root:root /usr/local/bin/schoolair-bluetooth
+ok "schoolair-bluetooth  →  /usr/local/bin/  (root-owned)"
 
 # ── 6. Registration wizard TLS certificate ────────────────────────────────────
 step "6 / Registration wizard TLS certificate"
@@ -714,6 +719,8 @@ ${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl start schoolair-wizard
 ${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/schoolair-update
 # Allow it to re-check the fitted hardware when the server asks (fixed, root-owned script)
 ${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/schoolair-redetect
+# Allow it to open Bluetooth registration when the server asks (fixed, root-owned script)
+${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/schoolair-bluetooth
 EOF
 chmod 440 "$SUDOERS_FILE"
 ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update without password"

@@ -6,6 +6,7 @@ helpers mocked out. Needs dbus-next (the Pi's system python has it; skipped
 where it isn't installed).
 """
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -300,19 +301,63 @@ async def test_current_network_refused_when_not_on_wifi(backend, prov, reconnect
     assert _status(reconnect_prov)["code"] == "missing_registration"
 
 
-@pytest.mark.parametrize("has_token,mismatch,ap_up,expected", [
-    (False, False, False, (True, None)),       # unregistered: register
-    (True,  True,  False, (True, None)),       # card from another Pi: register
-    (True,  False, False, (False, None)),      # registered and online: stay quiet
-    (True,  False, True,  (True, "Room 12")),  # registered, network lost: reconnect only
+@pytest.mark.parametrize("has_token,mismatch,ap_up,window,expected", [
+    (False, False, False, 0,   (True, None)),       # unregistered: register
+    (True,  True,  False, 0,   (True, None)),       # card from another Pi: register
+    (True,  False, False, 0,   (False, None)),      # registered and online: stay quiet
+    (True,  False, True,  0,   (True, "Room 12")),  # registered, network lost: reconnect only
+    (True,  False, False, 600, (True, "Room 12")),  # registered and online, server opened a window
 ])
-async def test_when_to_advertise(monkeypatch, has_token, mismatch, ap_up, expected):
+async def test_when_to_advertise(monkeypatch, has_token, mismatch, ap_up, window, expected):
     b = ble_provision.backend
+    monkeypatch.setattr(ble_provision, "window_left", lambda: window)
     monkeypatch.setattr(b, "_has_token", lambda: has_token)
     monkeypatch.setattr(b, "_ap_is_active", AsyncMock(return_value=ap_up))
     monkeypatch.setattr(b, "read_wizard_registration", lambda: {"asset_name": "Room 12"})
     monkeypatch.setattr(ble_provision.device_identity, "mismatch_detected", lambda: mismatch)
     assert await ble_provision.registered_as() == expected
+
+
+def test_window_left_reads_the_end_from_the_window_file(monkeypatch, tmp_path):
+    f = tmp_path / "ble-window"
+    monkeypatch.setattr(ble_provision, "BLE_WINDOW_FILE", str(f))
+    assert ble_provision.window_left(now=1000.0) == 0
+    f.write_text("1600\n")
+    assert ble_provision.window_left(now=1000.0) == 600
+    assert ble_provision.window_left(now=2000.0) == 0
+    f.write_text("x")
+    assert ble_provision.window_left(now=1000.0) == 0
+
+
+async def test_window_mode_runs_until_the_end_but_finishes_an_attempt(monkeypatch):
+    monkeypatch.setattr(ble_provision, "WINDOW_POLL_S", 0.01)
+    left = [600.0]
+    monkeypatch.setattr(ble_provision, "window_left", lambda: left[0])
+    p = ble_provision.Provisioner(bus=None, registered_as="Room 12")
+    task = asyncio.create_task(ble_provision.until_window_closes(p))
+    await asyncio.sleep(0.05)
+    assert not task.done()                     # window open
+    p._busy, left[0] = True, 0.0
+    await asyncio.sleep(0.05)
+    assert not task.done()                     # ended, but an attempt is in progress
+    p._busy = False
+    await asyncio.wait_for(task, 1)            # attempt over: closes
+
+
+async def test_window_mode_ends_when_a_registration_finishes(monkeypatch):
+    monkeypatch.setattr(ble_provision, "window_left", lambda: 600.0)
+    p = ble_provision.Provisioner(bus=None, registered_as="Room 12")
+    task = asyncio.create_task(ble_provision.until_window_closes(p))
+    p.done.set()
+    await asyncio.wait_for(task, 1)
+
+
+def test_idle_status_of_a_registered_unit_says_where_it_is():
+    p = ble_provision.Provisioner(bus=None, registered_as="Room 12")
+    assert _status(p)["message"] == 'Registered as "Room 12"; not connected to a network'
+    p.wifi = "School"
+    p._idle_status()
+    assert _status(p)["message"] == 'Registered as "Room 12"; on "School"'
 
 
 # ── Guards ─────────────────────────────────────────────────────────────────────
