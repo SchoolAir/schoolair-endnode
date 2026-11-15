@@ -98,8 +98,13 @@ do_check() {
     # recorded in the pending file at update time — any increase since then
     # means it crashed at least once after the update, regardless of
     # whether it happens to be up again right this moment.
-    local svc unhealthy="" baseline now_restarts
-    for svc in sen6x.service schoolair.service schoolair-netwatch.service; do
+    # The services the update held itself to ("watched": sen6x only where it
+    # was running before the update); all three for a pending file written
+    # before that list existed.
+    local svc unhealthy="" baseline now_restarts watched
+    watched="$(python3 -c "import json; print(' '.join(json.load(open('${PENDING_FILE}'))['watched']))" 2>/dev/null)" \
+        || watched="sen6x.service schoolair.service schoolair-netwatch.service"
+    for svc in $watched; do
         systemctl is-active --quiet "$svc" || unhealthy="${unhealthy} ${svc}(inactive)"
         baseline="$(python3 -c "import json; print(json.load(open('${PENDING_FILE}')).get('restart_baseline', {}).get('${svc}', 0))" 2>/dev/null || echo 0)"
         now_restarts="$(systemctl show "$svc" -p NRestarts --value 2>/dev/null || echo 0)"

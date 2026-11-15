@@ -904,6 +904,13 @@ if [[ "$MODE" == "--update" ]]; then
         ok "NEW_SERVER_URL already up to date (no migration needed)"
     fi
 
+    # The services the health check (15c) and the rollback watchdog hold this
+    # update to. sen6x only where it was running before: without a working
+    # sensor it can't start, and the update was rolled back on every such unit
+    # (found on a sensorless bench unit, 2026-11-15).
+    _WATCHED="schoolair.service schoolair-netwatch.service"
+    systemctl is-active --quiet sen6x.service && _WATCHED="sen6x.service ${_WATCHED}"
+
     if systemctl is-active --quiet nginx; then systemctl restart nginx; fi
     # schoolair-led.service restarts FIRST, before schoolair.service — it
     # unconditionally resets the shared LED_STATE_FILE to "thinking" on its
@@ -978,7 +985,7 @@ if [[ "$MODE" == "--update" ]]; then
 
     sleep 20
     _UNHEALTHY=""
-    for svc in sen6x.service schoolair.service schoolair-netwatch.service; do
+    for svc in $_WATCHED; do
         if ! systemctl is-active --quiet "$svc"; then
             _UNHEALTHY="${_UNHEALTHY} ${svc}(inactive)"
         fi
@@ -992,16 +999,17 @@ if [[ "$MODE" == "--update" ]]; then
     _NOW_SEN6X="$(systemctl show sen6x.service              -p NRestarts --value 2>/dev/null || echo 0)"
     _NOW_SCHOOLAIR="$(systemctl show schoolair.service       -p NRestarts --value 2>/dev/null || echo 0)"
     _NOW_NETWATCH="$(systemctl show schoolair-netwatch.service -p NRestarts --value 2>/dev/null || echo 0)"
-    [ "$_NOW_SEN6X"     -gt "$_BASE_SEN6X" ]     && _UNHEALTHY="${_UNHEALTHY} sen6x.service(crash-looping)"
+    [[ " $_WATCHED " == *" sen6x.service "* ]] && [ "$_NOW_SEN6X" -gt "$_BASE_SEN6X" ] \
+        && _UNHEALTHY="${_UNHEALTHY} sen6x.service(crash-looping)"
     [ "$_NOW_SCHOOLAIR" -gt "$_BASE_SCHOOLAIR" ] && _UNHEALTHY="${_UNHEALTHY} schoolair.service(crash-looping)"
     [ "$_NOW_NETWATCH"  -gt "$_BASE_NETWATCH" ]  && _UNHEALTHY="${_UNHEALTHY} schoolair-netwatch.service(crash-looping)"
-    for svc in sen6x.service schoolair.service schoolair-netwatch.service; do
+    for svc in $_WATCHED; do
         systemctl is-active --quiet "$svc" || _UNHEALTHY="${_UNHEALTHY} ${svc}(inactive)"
     done
     if [ -n "$_UNHEALTHY" ]; then
         die "Service(s) crash-looping or inactive after update:${_UNHEALTHY} — rolling back."
     fi
-    ok "sen6x, schoolair, schoolair-netwatch all active post-update, no restarts since"
+    ok "${_WATCHED//.service/} all active post-update, no restarts since"
 
     # schoolair-led is checked separately, non-fatally: it's a status
     # indicator, not core functionality, so it must never trigger a
@@ -1043,6 +1051,7 @@ json.dump(
         'from_version': '${_PRE_UPDATE_VERSION}',
         'to_version': '${_NEW_VERSION}',
         'deadline': time.time() + 2400,
+        'watched': '${_WATCHED}'.split(),
         'restart_baseline': {
             'sen6x.service': ${_NOW_SEN6X},
             'schoolair.service': ${_NOW_SCHOOLAIR},

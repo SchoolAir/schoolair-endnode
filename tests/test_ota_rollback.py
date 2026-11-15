@@ -117,14 +117,19 @@ def sandbox(tmp_path, monkeypatch):
             with self.manifest.open("a") as f:
                 f.write(f"{real_path}\n")
 
-        def write_pending(self, deadline_offset_seconds: float, restart_baseline: dict | None = None):
+        def write_pending(self, deadline_offset_seconds: float, restart_baseline: dict | None = None,
+                          watched: list[str] | None = None):
+            """watched=None writes a pending file from before the "watched" list."""
             self.pending_file.parent.mkdir(parents=True, exist_ok=True)
-            self.pending_file.write_text(json.dumps({
+            pending = {
                 "from_version": "1.0.0",
                 "to_version": "1.0.1",
                 "deadline": time.time() + deadline_offset_seconds,
                 "restart_baseline": restart_baseline or {},
-            }))
+            }
+            if watched is not None:
+                pending["watched"] = watched
+            self.pending_file.write_text(json.dumps(pending))
 
         def run(self, *args) -> subprocess.CompletedProcess:
             return subprocess.run(
@@ -313,3 +318,38 @@ def test_check_all_watched_services_healthy_matches_real_service_names(sandbox):
         assert result.returncode == 0, result.stderr
         assert target.read_text() == "GOOD", f"{svc} unhealthy should have triggered rollback"
         sandbox.set_unhealthy()  # reset for next iteration
+
+
+def test_check_ignores_sen6x_where_the_update_did_not_watch_it(sandbox):
+    """A unit whose sensor is missing or dead: sen6x.service can't start, and
+    the update left it out of "watched". Found on a sensorless bench unit
+    (2026-11-15): every update there was rolled back."""
+    target = sandbox.tmp_path / "app" / "version.txt"
+    target.parent.mkdir(parents=True)
+    sandbox.back_up(target, "GOOD")
+    target.write_text("CURRENT")
+    sandbox.write_pending(deadline_offset_seconds=3600,
+                          watched=["schoolair.service", "schoolair-netwatch.service"])
+    sandbox.set_unhealthy("sen6x.service")
+
+    result = sandbox.run("--check")
+
+    assert result.returncode == 0, result.stderr
+    assert sandbox.pending_file.exists(), "should still be waiting for confirmation"
+    assert target.read_text() == "CURRENT"
+
+
+def test_check_rolls_back_when_a_watched_sen6x_stops(sandbox):
+    """sen6x ran before the update (so it is watched) and doesn't now."""
+    target = sandbox.tmp_path / "app" / "version.txt"
+    target.parent.mkdir(parents=True)
+    sandbox.back_up(target, "GOOD")
+    target.write_text("CURRENT")
+    sandbox.write_pending(deadline_offset_seconds=3600, watched=list(WATCHED_SERVICES))
+    sandbox.set_unhealthy("sen6x.service")
+
+    result = sandbox.run("--check")
+
+    assert result.returncode == 0, result.stderr
+    assert target.read_text() == "GOOD"
+    assert not sandbox.pending_file.exists()
