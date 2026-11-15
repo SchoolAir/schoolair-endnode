@@ -1084,6 +1084,11 @@ chk "main.py present"                      test -f "${SCHOOLAIR_DIR}/main.py"
 chk "first_boot.sh executable"            test -x "${ADMIN_HOME}/first_boot.sh"
 chk "schoolair command available"         test -L /usr/local/bin/schoolair
 chk "schoolair-update installed"          test -x /usr/local/bin/schoolair-update
+chk "schoolair-redetect installed"        test -x /usr/local/bin/schoolair-redetect
+chk "schoolair-bluetooth installed"       test -x /usr/local/bin/schoolair-bluetooth
+chk "Bluetooth tools (bluez)"             command -v btmgmt
+chk "dbus-next importable"                python3 -c "import dbus_next"
+chk "schoolair-ble.service installed"     test -f /etc/systemd/system/schoolair-ble.service
 chk "NM hotspot '${AP_CONN}'"             nmcli con show "$AP_CONN"
 chk "Captive-portal DNS config"           test -f /etc/NetworkManager/dnsmasq-shared.d/schoolair-captive.conf
 chk "Avahi service file"                  test -f /etc/avahi/services/schoolair.service
