@@ -33,11 +33,15 @@ LATEST_READING_FILE = os.getenv("LATEST_READING_FILE", "/run/schoolair/latest.js
 _write_failed_once = False
 
 
-def set(data: dict, recorded_at: str) -> None:
-    global latest_data, latest_recorded_at
+latest_mode: str = "normal"       # "normal" | "incident" | "demo": what drives the read cadence
+
+
+def set(data: dict, recorded_at: str, mode: str = "normal") -> None:
+    global latest_data, latest_recorded_at, latest_mode
     latest_data = data
     latest_recorded_at = recorded_at
-    _publish(data, recorded_at)
+    latest_mode = mode
+    _publish(data, recorded_at, mode=mode)
 
 
 def publish_error(message: str, recorded_at: str) -> None:
@@ -45,7 +49,7 @@ def publish_error(message: str, recorded_at: str) -> None:
     _publish(None, recorded_at, error=message)
 
 
-def _publish(data: dict | None, recorded_at: str, error: str | None = None) -> None:
+def _publish(data: dict | None, recorded_at: str, error: str | None = None, mode: str | None = None) -> None:
     """Atomically write the reading for other local services. Never raises."""
     global _write_failed_once
     path = LATEST_READING_FILE
@@ -55,6 +59,8 @@ def _publish(data: dict | None, recorded_at: str, error: str | None = None) -> N
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
             doc = {"data": data, "recorded_at": recorded_at}
+            if mode:
+                doc["mode"] = mode
             if error:
                 doc["error"] = error
             json.dump(doc, f)

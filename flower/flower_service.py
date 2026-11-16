@@ -42,6 +42,7 @@ Usage:
   flower_service.py --score         print the latest reading and the height it maps to
   flower_service.py --goto 40       move to 40 mm and exit (assumes position is known)
   flower_service.py --home          home only
+  flower_service.py --home --goto 57   home, then climb to 57 mm (slow recovery climb out of the stop first)
 Run as the same user that owns calibration.json; needs pigpiod running.
 """
 import json, os, sqlite3, sys, time, signal, logging
@@ -77,7 +78,14 @@ def save_cal(cal):
 # is declared interrupted and the position becomes unknown.
 MOVING_FLAG = os.environ.get("FLOWER_MOVING_FLAG", "/run/schoolair-flower/moving")
 LED_REQUEST_FILE = "/run/schoolair-flower/led-request"   # read by schoolair-led, see Flower._led
-LED_YIELD_S = 1.5
+DEMO_FLAG = "/run/schoolair/demo"   # present = demo mode; shared with the firmware (reads every ~3 s, deletes it after demo.max_minutes); cleared by a reboot
+
+def demo_mode():
+    """Demonstrations only: the firmware reads every few seconds while this file
+    exists, and the flower polls and smooths faster (mapping.demo). Checked on every
+    cycle so it can be toggled by hand without restarting anything."""
+    return os.path.exists(DEMO_FLAG)
+LED_YIELD_S = 3.0      # the LED daemon polls the flag about once a second; 1.5 s lost a race on 2026-10-01
 MOVE_GRACE_S = 3.0
 WAVE_CHAIN = 9998      # pigpio wave_tx_at(): a chain of several waves is playing (a one-wave chain reports that wave's id)
 WAVE_NONE = 9999       # pigpio wave_tx_at(): nothing is playing
@@ -322,6 +330,9 @@ class Flower:
         self._started = time.time()   # heartbeat waits a full interval after start
         mv = self.cal["moves"]
         self.down_us, self.up_us, self.up_full = mv["down_us"], mv["up_us"], mv["up_full_step"]
+        # Homing ends in a deliberate stall on the stop: keep it gentle even when the
+        # working down speed is fast (the bench runs 1.5 ms since 2026-10-01).
+        self.home_us = mv.get("home_us", max(mv["down_us"], 3000))
 
     def _save(self, state="known", note=None):
         # Re-read the file and change only the position keys, so an edit made to
@@ -355,12 +366,13 @@ class Flower:
             dist = (self.cal["travel_stop_to_stop_mm"] - stop) + self.cal["homing"]["overshoot_mm"]
         log.info("homing: down %.1f mm to the bottom stop", dist)
         self._save(state="moving", note="homing")
-        self._move(dist, "down", self.down_us)
+        self._move(dist, "down", self.home_us)
         # Where the stop physically is, in the frame all positions are measured in.
         # 0 on the original lid; 25 once the stop spacer (or the Rev H+ 32.5 mm post)
         # puts the stop at the wilted height. Positions and tables stay unchanged.
         self.pos = float(self.cal["homing"].get("stop_position_mm", 0.0))
         self.just_homed = True
+        self._homed_at = time.localtime()   # a home after tonight's hour counts as tonight's
         self._save(note="homed " + time.strftime("%Y-%m-%d %H:%M"))
 
     def goto(self, mm):
@@ -407,7 +419,9 @@ class Flower:
             return {"status": "invalid reading", "problem": problem, "recorded_at": r.get("recorded_at"),
                     "held_at_mm": self.pos}
         # Keep the valid readings of the last smoothing window and score their median.
-        window = float(self.cal["mapping"].get("smoothing_window_s", 0))
+        demo = demo_mode()
+        m = self.cal["mapping"]
+        window = float((m.get("demo", {}) if demo else m).get("smoothing_window_s", m.get("smoothing_window_s", 0)))
         t = _epoch(r)
         if not self.recent or r.get("recorded_at") != self.recent[-1].get("recorded_at"):
             self.recent.append(r)
@@ -422,9 +436,12 @@ class Flower:
         moved = False
         if self.pos is None or abs(target - self.pos) >= hyst:
             self.goto(target); moved = True
-        return {"status": "ok", "co2": sm.get("co2"), "pm25": sm.get("pm25"), "n": len(self.recent),
-                "age_min": round(age or 0, 1), "heights": per_metric, "target_mm": target,
-                "position_mm": self.pos, "moved": moved}
+        out = {"status": "ok", "co2": sm.get("co2"), "pm25": sm.get("pm25"), "n": len(self.recent),
+               "age_min": round(age or 0, 1), "heights": per_metric, "target_mm": target,
+               "position_mm": self.pos, "moved": moved}
+        if demo:
+            out["demo"] = True
+        return out
 
     # ------------------------------------------------------------ cold boot
     def _is_cold_boot(self):
@@ -466,7 +483,12 @@ class Flower:
     def self_test(self):
         """Home, rise to erect, then settle on the current reading."""
         last_known = self.pos if self.cal.get("position_state") == "known" else None
-        log.info("cold boot: self-test (home, erect, then current reading)")
+        log.info("cold boot: self-test (full home, erect, then current reading)")
+        # After a power cut the saved position cannot be trusted: the carriage may
+        # have moved unpowered, or a move was cut off before its count was saved.
+        # On 2026-10-03 a short home from a stale position set a wrong zero and the
+        # flower sat far below where it believed. Always home blind on a cold boot.
+        self.cal["position_state"] = "unknown"
         self.home()
         self.goto(self.cal["working_max_mm"])
         s = self.step()
@@ -513,6 +535,38 @@ class Flower:
         log.info("nod x%d (%s then %s, %.0f mm) at %.1f mm", repeats, first, second, dip, self.pos)
         return True
 
+    def maybe_nightly_home(self, status):
+        """Once a night (nightly_home.at, local time, default 04:00) re-home and return,
+        so an unexplained loss of position (2026-10-02: the carriage was found 25 mm
+        below the count after a quiet night) never lasts longer than a day. Only
+        while the flower is otherwise idle, and never twice on the same date."""
+        nh = self.cal.get("nightly_home", {})
+        if not nh.get("enabled", False) or status.get("moved"):
+            return
+        now = time.localtime()
+        try:
+            hh, mm = (int(x) for x in nh.get("at", "04:00").split(":"))
+        except ValueError:
+            return
+        if (now.tm_hour, now.tm_min) < (hh, mm):
+            return
+        today = time.strftime("%Y-%m-%d", now)
+        if getattr(self, "_nightly_done", None) == today:
+            return
+        # Already homed today after the hour (e.g. the cold-boot self-test after a power
+        # cut, 2026-10-07): homing again minutes later only grinds the stop a second time.
+        h = getattr(self, "_homed_at", None)
+        if h and time.strftime("%Y-%m-%d", h) == today and (h.tm_hour, h.tm_min) >= (hh, mm):
+            self._nightly_done = today; return
+        if time.time() - self._started < 120:        # a service that starts at 04:00 is not "due"
+            self._nightly_done = today; return
+        back_to = self.pos
+        log.info("nightly home (%s): re-homing, then back to %s mm", nh.get("at", "04:00"), back_to)
+        self.home()
+        if isinstance(back_to, (int, float)):
+            self.goto(back_to)
+        self._nightly_done = today
+
     def maybe_nod(self, status):
         hb = self.cal.get("heartbeat", {})
         if not hb.get("enabled", False) or status.get("status") != "ok" or status.get("moved"):
@@ -529,6 +583,7 @@ class Flower:
 
     def run(self):
         poll = self.cal["mapping"]["poll_seconds"]
+        self._demo_logged = False
         try:
             if self.cal.get("self_test", {}).get("on_cold_boot", True) and self._is_cold_boot():
                 self.self_test()
@@ -550,9 +605,13 @@ class Flower:
                 else:
                     self._led_clear()
                 self.maybe_nod(s)
+                self.maybe_nightly_home(s)
             except MoveInterrupted:
                 pass                             # logged by _move; goto() homes on the next cycle
-            time.sleep(poll)
+            demo = demo_mode()
+            if demo != self._demo_logged:
+                log.info("demo mode %s (%s)", "on" if demo else "off", DEMO_FLAG); self._demo_logged = demo
+            time.sleep(self.cal["mapping"].get("demo", {}).get("poll_seconds", poll) if demo else poll)
 
 def main(argv):
     fl = Flower()
@@ -585,7 +644,10 @@ def _dispatch(fl, argv):
         print(json.dumps({"reading": r, "heights": h, "target_mm": None if problem else t,
                           "problem": problem}, indent=2)); return
     if "--home" in argv:
-        fl.home(); return
+        fl.home()
+        if "--goto" not in argv: return
+        # --home --goto X: the same process still knows it just homed, so the climb
+        # out of the stop uses the slow recovery setting (a separate --goto would not).
     if "--nod" in argv:
         fl.nod(); return
     if "--self-test" in argv:

@@ -297,8 +297,8 @@ if [[ "$MODE" == "setup" ]]; then
     step "2 / System packages"
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades
-    ok "git python3-pip i2c-tools nginx avahi-daemon gcc make unattended-upgrades"
+        git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades bluez
+    ok "git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades bluez"
 
     systemctl disable nginx 2>/dev/null || true
     systemctl stop    nginx 2>/dev/null || true
@@ -310,15 +310,40 @@ fi
 # Runs in both setup and update mode — changes are idempotent.
 step "2b / SD card longevity"
 
-# journald volatile: journal lives in /run (already tmpfs) — never writes to SD
-mkdir -p /etc/systemd/journald.conf.d
-cat > /etc/systemd/journald.conf.d/00-schoolair.conf << 'EOF'
+# journald persistent, capped. Until 2.3.21 the journal lived in RAM only
+# (Storage=volatile) to spare the SD card, which meant the boot before a
+# reboot could never be read: twice in two days (2026-09-30, 2026-10-02) a
+# reboot's cause was lost. Martin, 2026-10-02: keep logs on the card on all
+# units. The cost is bounded: a 64 MB ring, flushed once a minute, rate
+# limited; the app's own chatter is already low (no per-sample log lines).
+# `journalctl --list-boots` then shows previous boots and `journalctl -b -1`
+# reads the last one.
+# Named 90-…: Raspberry Pi OS ships /usr/lib/systemd/journald.conf.d/
+# 40-rpi-volatile-storage.conf (Storage=volatile), and drop-ins apply in name
+# order across both directories, so 00-schoolair.conf lost to it (found on the
+# bench after 2.3.21: /var/log/journal stayed empty).
+mkdir -p /etc/systemd/journald.conf.d /var/log/journal
+rm -f /etc/systemd/journald.conf.d/00-schoolair.conf
+cat > /etc/systemd/journald.conf.d/90-schoolair.conf << 'EOF'
 [Journal]
-Storage=volatile
+Storage=persistent
+SystemMaxUse=64M
+SystemMaxFileSize=8M
 RuntimeMaxUse=32M
+SyncIntervalSec=1min
+RateLimitIntervalSec=30s
+RateLimitBurst=1000
 EOF
+# Ownership and ACLs journald expects on /var/log/journal (the admin user keeps
+# read access through the systemd-journal group this grants).
+systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 systemctl restart systemd-journald 2>/dev/null || true
-ok "journald: volatile storage, 32 MB RAM cap"
+# A restart alone keeps writing to /run: journald moves to /var/log/journal only
+# when asked to flush, which systemd-journal-flush.service does at boot. Without
+# this a unit stayed RAM-only from the update until its next reboot (seen on a
+# unit updated to 2.3.22) — the reboot whose cause these logs are for.
+journalctl --flush 2>/dev/null || true
+ok "journald: persistent on the card, 64 MB cap, synced every minute"
 
 # Disable swap — Pi Zero 512 MB is sufficient; SD swap is the #1 card killer
 systemctl disable dphys-swapfile 2>/dev/null || true
@@ -361,6 +386,32 @@ Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "03:00";
 EOF
 ok "unattended-upgrades: security origins, minimal steps, reboot at 03:00 if needed"
+
+# ── 2c. Bluetooth: Low Energy only ────────────────────────────────────────────
+# Runs in both setup and update mode. Registration is BLE only, and with Classic
+# (BR/EDR) on as well, a computer running BlueZ (Chromium/Chrome on Linux) saw
+# the unit as dual-mode and tried a Classic connection, which the unit never
+# answers: the registration page hung on "connecting" (found 2026-11-16; phones
+# connect over LE and were unaffected). In LE-only mode the advertisement says
+# "BR/EDR not supported". Restarting bluetoothd drops a phone that is connected
+# right now, so only when the setting changes; schoolair-ble restarts by itself.
+step "2c / Bluetooth: Low Energy only"
+BT_CONF=/etc/bluetooth/main.conf
+if [ -f "$BT_CONF" ]; then
+    if grep -qE '^ControllerMode *= *le$' "$BT_CONF"; then
+        ok "bluetoothd already in LE-only mode"
+    else
+        if grep -qE '^#? *ControllerMode *=' "$BT_CONF"; then
+            sed -i -E 's/^#? *ControllerMode *=.*/ControllerMode = le/' "$BT_CONF"
+        else
+            sed -i '0,/^\[General\]/s//[General]\nControllerMode = le/' "$BT_CONF"
+        fi
+        systemctl try-restart bluetooth.service 2>/dev/null || true
+        ok "bluetoothd: LE only (ControllerMode = le)"
+    fi
+else
+    warn "${BT_CONF} not found — Bluetooth left as it is"
+fi
 
 # ── 3. Clone / update SchoolAir app ───────────────────────────────────────────
 step "3 / Clone SchoolAir app  →  ${SCHOOLAIR_DIR}"
@@ -412,15 +463,41 @@ rm -rf "$REPO_DIR"
 # executable bit on scripts systemd invokes directly. netwatch.sh was once
 # committed non-executable and every OTA silently reproduced the crash-loop
 # until this was added.
-chmod +x "${WIZARD_DIR}/launcher.sh" "${WIZARD_DIR}/netwatch.sh" "${SCHOOLAIR_DIR}/detect_flower.sh" 2>/dev/null || true
+chmod +x "${WIZARD_DIR}/launcher.sh" "${WIZARD_DIR}/netwatch.sh" "${SCHOOLAIR_DIR}/detect_flower.sh" \
+    "${SCHOOLAIR_DIR}/detect_unit_type.sh" 2>/dev/null || true
 
 # ── 4. Python dependencies ─────────────────────────────────────────────────────
 step "4 / Python dependencies"
 pip3 install --quiet --break-system-packages --root-user-action=ignore \
-    "microdot>=2.0.0" simple-websocket httpx python-dotenv questionary netifaces
+    "microdot>=2.0.0" simple-websocket httpx python-dotenv questionary netifaces dbus-next
 python3 -c "import microdot" 2>/dev/null \
     || die "microdot failed to import after install."
-ok "microdot, simple-websocket, httpx, python-dotenv, questionary, netifaces installed"
+# Bluetooth registration (schoolair-ble.service) only; the hotspot wizard works without it.
+python3 -c "import dbus_next" 2>/dev/null \
+    || warn "dbus-next failed to import — Bluetooth registration will not start."
+ok "microdot, simple-websocket, httpx, python-dotenv, questionary, netifaces, dbus-next installed"
+
+# The telemetry service runs from its own venv (deploy/schoolair.service:
+# ExecStart=.venv/bin/python), with the versions pinned in requirements.txt;
+# the wizard and the helper scripts use the system python above. Nothing used
+# to create the venv: on a fresh install schoolair.service failed at every
+# start. An update keeps the venv (install_dir_with_backup only adds files)
+# and installs whatever requirements.txt added; there a failed pip is only a
+# warning, since the post-restart health check rolls back an app that can't
+# start.
+VENV="${SCHOOLAIR_DIR}/.venv"
+if [ ! -x "${VENV}/bin/python" ]; then
+    sudo -u "$ADMIN_USER" python3 -m venv "$VENV" || die "could not create ${VENV}"
+    ok "venv created  →  ${VENV}"
+fi
+if sudo -u "$ADMIN_USER" "${VENV}/bin/pip" install --quiet --disable-pip-version-check \
+        -r "${SCHOOLAIR_DIR}/requirements.txt"; then
+    ok "venv: requirements.txt installed"
+elif [[ "$MODE" == "setup" ]]; then
+    die "pip install -r requirements.txt into ${VENV} failed — see above."
+else
+    warn "pip install -r requirements.txt into ${VENV} failed — keeping the venv as it is"
+fi
 
 # ── 5. Device utility scripts ─────────────────────────────────────────────────
 step "5 / Device utility scripts  →  ${ADMIN_HOME}/"
@@ -448,6 +525,16 @@ if [ -f "${SCHOOLAIR_DIR}/schoolair-update" ]; then
 else
     warn "schoolair-update not found in app dir — OTA updates unavailable"
 fi
+# Hardware re-check on request (by hand or from the server; see its header).
+install_with_backup "${SCHOOLAIR_DIR}/schoolair-redetect" /usr/local/bin/schoolair-redetect
+chmod 755 /usr/local/bin/schoolair-redetect
+chown root:root /usr/local/bin/schoolair-redetect
+ok "schoolair-redetect  →  /usr/local/bin/  (root-owned)"
+# Bluetooth registration on request (by hand or from the server; see its header).
+install_with_backup "${SCHOOLAIR_DIR}/schoolair-bluetooth" /usr/local/bin/schoolair-bluetooth
+chmod 755 /usr/local/bin/schoolair-bluetooth
+chown root:root /usr/local/bin/schoolair-bluetooth
+ok "schoolair-bluetooth  →  /usr/local/bin/  (root-owned)"
 
 # ── 6. Registration wizard TLS certificate ────────────────────────────────────
 step "6 / Registration wizard TLS certificate"
@@ -490,6 +577,18 @@ if [[ "$MODE" == "setup" ]]; then
 step "8 / I2C enable + baudrate"
 raspi-config nonint do_i2c 0
 ok "I2C enabled (takes effect after reboot)"
+
+# Indoor or outdoor? Everything indoor-only (pigpiod, the status LED, the
+# flower) hangs off /etc/schoolair-unit-type, and only first_boot.sh wrote it,
+# on a golden-image clone's first boot. A fresh install never got one. do_i2c
+# above also turns I2C on right away, so the sensor can be probed now.
+if [ -s /etc/schoolair-unit-type ]; then
+    ok "Unit type already known: $(cat /etc/schoolair-unit-type)"
+elif bash "${SCHOOLAIR_DIR}/detect_unit_type.sh"; then
+    ok "Unit type: $(cat /etc/schoolair-unit-type)"
+else
+    warn "Sensor not identified — unit type unknown (indoor-only parts are skipped; re-run setup with the sensor connected)"
+fi
 
 if   [ -f /boot/firmware/config.txt ]; then CFG=/boot/firmware/config.txt
 elif [ -f /boot/config.txt ];           then CFG=/boot/config.txt
@@ -574,7 +673,9 @@ systemctl restart avahi-daemon
 ok "Avahi configured (schoolair.local + regiwiz.local)"
 
 # ── 12. dhcpcd (Bullseye only) ────────────────────────────────────────────────
-if [ -f /etc/dhcpcd.conf ]; then
+# Only where dhcpcd actually runs: Bookworm and later ship /etc/dhcpcd.conf
+# (dhcpcd-base) without the service.
+if [ -f /etc/dhcpcd.conf ] && systemctl is-enabled --quiet dhcpcd 2>/dev/null; then
     step "12 / dhcpcd conflict prevention  (Bullseye)"
     if grep -q "denyinterfaces ${AP_IFACE}" /etc/dhcpcd.conf; then
         ok "Already configured"
@@ -642,6 +743,10 @@ cat > "$SUDOERS_FILE" << EOF
 ${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl start schoolair-wizard
 # Allow the telemetry server to trigger an OTA update (fixed, root-owned script)
 ${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/schoolair-update
+# Allow it to re-check the fitted hardware when the server asks (fixed, root-owned script)
+${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/schoolair-redetect
+# Allow it to open Bluetooth registration when the server asks (fixed, root-owned script)
+${ADMIN_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/schoolair-bluetooth
 EOF
 chmod 440 "$SUDOERS_FILE"
 ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update without password"
@@ -650,7 +755,7 @@ ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update wit
 step "15 / systemd services"
 DEPLOY_DIR="${SCHOOLAIR_DIR}/deploy"
 
-for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-launcher.service schoolair-pigpio-setup.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
+for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-ble.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-detect-hardware.service schoolair-hardware-check.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
     if [ -f "${DEPLOY_DIR}/${svc}" ]; then
         install_with_backup "${DEPLOY_DIR}/${svc}" "/etc/systemd/system/${svc}"
         ok "${svc} installed"
@@ -681,7 +786,10 @@ fi
 # installing it needs no network and no GitHub access. It is installed on every
 # indoor unit (a few tens of KB), so a golden image carries it; the drop-in
 # deploy/schoolair-flower-fitted.conf lets it run only where detect_flower.sh
-# found the dock's strap and pigpiod is installed. Everything it replaces goes
+# found the flower's driver board and pigpiod is installed. On an update the
+# check catches a newly fitted flower; one already running keeps its pins and
+# its marker (a removed flower is caught at the next boot, or by
+# schoolair-redetect). Everything it replaces goes
 # through install_with_backup, so an OTA rollback restores the previous flower
 # too.
 FLOWER_CHANGED=0
@@ -785,11 +893,19 @@ fi
 
 systemctl daemon-reload
 systemctl enable schoolair-launcher.service
+systemctl enable schoolair-netwatch.service
 systemctl enable schoolair.service
 systemctl enable sen6x.service
 systemctl enable schoolair-first-boot.service 2>/dev/null || true
 systemctl enable schoolair-pigpio-setup.service 2>/dev/null || true
 systemctl enable schoolair-led.service 2>/dev/null || true
+systemctl enable schoolair-detect-hardware.service 2>/dev/null || true
+systemctl enable schoolair-hardware-check.service 2>/dev/null || true
+# The hardware record (hardware_record.py) now, not only at the next boot. On an
+# update the telemetry service is reading the sensor, and the check uses its
+# latest reading rather than reading the bus a second time.
+install -d -o "${ADMIN_USER}" -g "${ADMIN_USER}" /var/lib/schoolair
+python3 "${SCHOOLAIR_DIR}/hardware_record.py" check && ok "Hardware record updated" || warn "Hardware record not updated (non-fatal)"
 systemctl enable schoolair-update-watchdog.timer 2>/dev/null || true
 # Enabled wherever it is installed; its drop-in decides whether it runs.
 [ -f /etc/systemd/system/schoolair-flower.service ] && systemctl enable schoolair-flower.service 2>/dev/null || true
@@ -813,6 +929,13 @@ if [[ "$MODE" == "--update" ]]; then
     else
         ok "NEW_SERVER_URL already up to date (no migration needed)"
     fi
+
+    # The services the health check (15c) and the rollback watchdog hold this
+    # update to. sen6x only where it was running before: without a working
+    # sensor it can't start, and the update was rolled back on every such unit
+    # (found on a sensorless bench unit, 2026-11-15).
+    _WATCHED="schoolair.service schoolair-netwatch.service"
+    systemctl is-active --quiet sen6x.service && _WATCHED="sen6x.service ${_WATCHED}"
 
     if systemctl is-active --quiet nginx; then systemctl restart nginx; fi
     # schoolair-led.service restarts FIRST, before schoolair.service — it
@@ -846,10 +969,13 @@ if [[ "$MODE" == "--update" ]]; then
     systemctl restart sen6x.service           || warn "sen6x.service restart failed"
     systemctl restart schoolair.service       || warn "schoolair.service restart failed"
     # New flower code only takes effect on restart; same wait as for pigpiod.
-    # try-restart: leaves it stopped on units where its drop-in keeps it off.
+    # restart, not try-restart: on the update that first installs the flower it
+    # isn't running yet, and try-restart left it stopped until the next reboot.
+    # Its drop-in's conditions still keep it off where no flower is fitted (an
+    # unmet condition skips the start; it is not a failure).
     if [ "$FLOWER_CHANGED" = 1 ]; then
         wait_for_flower_move
-        systemctl try-restart schoolair-flower.service || warn "schoolair-flower.service restart failed"
+        systemctl restart schoolair-flower.service || warn "schoolair-flower.service restart failed"
     fi
     # schoolair-netwatch.service is a long-running bash process — cp'ing a new
     # netwatch.sh to disk does NOT make its already-running interpreter pick up
@@ -885,7 +1011,7 @@ if [[ "$MODE" == "--update" ]]; then
 
     sleep 20
     _UNHEALTHY=""
-    for svc in sen6x.service schoolair.service schoolair-netwatch.service; do
+    for svc in $_WATCHED; do
         if ! systemctl is-active --quiet "$svc"; then
             _UNHEALTHY="${_UNHEALTHY} ${svc}(inactive)"
         fi
@@ -899,16 +1025,17 @@ if [[ "$MODE" == "--update" ]]; then
     _NOW_SEN6X="$(systemctl show sen6x.service              -p NRestarts --value 2>/dev/null || echo 0)"
     _NOW_SCHOOLAIR="$(systemctl show schoolair.service       -p NRestarts --value 2>/dev/null || echo 0)"
     _NOW_NETWATCH="$(systemctl show schoolair-netwatch.service -p NRestarts --value 2>/dev/null || echo 0)"
-    [ "$_NOW_SEN6X"     -gt "$_BASE_SEN6X" ]     && _UNHEALTHY="${_UNHEALTHY} sen6x.service(crash-looping)"
+    [[ " $_WATCHED " == *" sen6x.service "* ]] && [ "$_NOW_SEN6X" -gt "$_BASE_SEN6X" ] \
+        && _UNHEALTHY="${_UNHEALTHY} sen6x.service(crash-looping)"
     [ "$_NOW_SCHOOLAIR" -gt "$_BASE_SCHOOLAIR" ] && _UNHEALTHY="${_UNHEALTHY} schoolair.service(crash-looping)"
     [ "$_NOW_NETWATCH"  -gt "$_BASE_NETWATCH" ]  && _UNHEALTHY="${_UNHEALTHY} schoolair-netwatch.service(crash-looping)"
-    for svc in sen6x.service schoolair.service schoolair-netwatch.service; do
+    for svc in $_WATCHED; do
         systemctl is-active --quiet "$svc" || _UNHEALTHY="${_UNHEALTHY} ${svc}(inactive)"
     done
     if [ -n "$_UNHEALTHY" ]; then
         die "Service(s) crash-looping or inactive after update:${_UNHEALTHY} — rolling back."
     fi
-    ok "sen6x, schoolair, schoolair-netwatch all active post-update, no restarts since"
+    ok "${_WATCHED//.service/} all active post-update, no restarts since"
 
     # schoolair-led is checked separately, non-fatally: it's a status
     # indicator, not core functionality, so it must never trigger a
@@ -950,6 +1077,7 @@ json.dump(
         'from_version': '${_PRE_UPDATE_VERSION}',
         'to_version': '${_NEW_VERSION}',
         'deadline': time.time() + 2400,
+        'watched': '${_WATCHED}'.split(),
         'restart_baseline': {
             'sen6x.service': ${_NOW_SEN6X},
             'schoolair.service': ${_NOW_SCHOOLAIR},
@@ -980,7 +1108,8 @@ chk() {
 chk "hostname is schoolair-*"              bash -c '[[ "$(hostname)" == schoolair-* ]]'
 chk "automatic apt runs disabled"        grep -q 'Unattended-Upgrade "0"' /etc/apt/apt.conf.d/20auto-upgrades
 chk "unattended-upgrade available"       command -v unattended-upgrade
-chk "journald volatile"                   grep -q "Storage=volatile" /etc/systemd/journald.conf.d/00-schoolair.conf
+chk "journald persistent, capped"        grep -q "Storage=persistent" /etc/systemd/journald.conf.d/90-schoolair.conf
+chk "journal written to the card"        test -e /run/systemd/journal/flushed
 chk "swap disabled"                       bash -c "! systemctl is-enabled dphys-swapfile 2>/dev/null"
 chk "microdot importable"                  python3 -c "import microdot"
 chk "httpx importable"                     python3 -c "import httpx"
@@ -990,10 +1119,18 @@ chk "main.py present"                      test -f "${SCHOOLAIR_DIR}/main.py"
 chk "first_boot.sh executable"            test -x "${ADMIN_HOME}/first_boot.sh"
 chk "schoolair command available"         test -L /usr/local/bin/schoolair
 chk "schoolair-update installed"          test -x /usr/local/bin/schoolair-update
+chk "schoolair-redetect installed"        test -x /usr/local/bin/schoolair-redetect
+chk "schoolair-bluetooth installed"       test -x /usr/local/bin/schoolair-bluetooth
+chk "Bluetooth tools (bluez)"             command -v btmgmt
+chk "Bluetooth LE only"                   grep -qE '^ControllerMode *= *le$' /etc/bluetooth/main.conf
+chk "dbus-next importable"                python3 -c "import dbus_next"
+chk "schoolair-ble.service installed"     test -f /etc/systemd/system/schoolair-ble.service
 chk "NM hotspot '${AP_CONN}'"             nmcli con show "$AP_CONN"
 chk "Captive-portal DNS config"           test -f /etc/NetworkManager/dnsmasq-shared.d/schoolair-captive.conf
 chk "Avahi service file"                  test -f /etc/avahi/services/schoolair.service
 chk "schoolair-launcher enabled"          systemctl is-enabled schoolair-launcher.service
+chk "schoolair-netwatch enabled"          systemctl is-enabled schoolair-netwatch.service
+chk "telemetry venv works"                "${SCHOOLAIR_DIR}/.venv/bin/python" -c "import httpx, microdot, dotenv"
 chk "schoolair.service enabled"           systemctl is-enabled schoolair.service
 chk "sen6x.service enabled"              systemctl is-enabled sen6x.service
 chk "schoolair-first-boot enabled"        systemctl is-enabled schoolair-first-boot.service

@@ -33,3 +33,34 @@ def fake_settings():
     return {
         "active_window": {"start": "07:00", "end": "16:00"},
     }
+
+
+@pytest.fixture(autouse=True)
+def hardware_file(tmp_path, monkeypatch):
+    """Every test writes the hardware record to its own temp file, never
+    /var/lib/schoolair, and the read loop starts with nothing noted."""
+    import hardware_record
+    import jobs.ingest as ingest
+    path = tmp_path / "hardware.json"
+    monkeypatch.setattr(hardware_record, "HARDWARE_FILE", str(path))
+    monkeypatch.setenv("HARDWARE_FILE", str(path))  # scripts the tests run
+    monkeypatch.setattr(ingest, "_hw_sen6x_noted", None)
+    monkeypatch.setattr(ingest, "_sensor_failing_since", None)
+    monkeypatch.setattr(ingest, "_hw_sent", None)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def reset_sampling_state():
+    """The read loop's sampling state is module-level in jobs.ingest; tests in
+    several files drive it, so every test starts from a clean, inactive one."""
+    import jobs.ingest as ingest
+    ingest._samples.clear()
+    ingest._last_kept_mono = None
+    ingest._incident = ingest.IncidentDetector()
+    ingest._demo = ingest.DemoSwitch(path="/nonexistent/schoolair-demo")
+    yield
+    ingest._samples.clear()
+    ingest._last_kept_mono = None
+    ingest._incident = ingest.IncidentDetector()
+    ingest._demo = ingest.DemoSwitch(path="/nonexistent/schoolair-demo")

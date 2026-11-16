@@ -5,7 +5,7 @@ Write-through pipeline with local fallback and server-controlled backlog drain:
   Read loop   — samples the sensors every SAMPLE_SECONDS and publishes each
                 sample locally (state.set → /run/schoolair/latest.json), so
                 services on this Pi such as the wilting flower follow the room
-                within a minute. Every READ_ACTIVE_SECONDS (active window) or
+                within seconds. Every READ_ACTIVE_SECONDS (active window) or
                 READ_IDLE_SECONDS (outside it), aligned to the device's upload
                 offset, the mean of that interval's samples becomes the one
                 reading to upload, and _live_event is signalled. Sampling faster
@@ -31,6 +31,7 @@ the device can be re-registered.
 import asyncio
 import json
 import os
+import re
 import random
 import time as _time_mod
 from datetime import datetime, timezone, timedelta, time
@@ -38,12 +39,14 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from services.sensor import (read_sensor, extract_metric, average_readings, probe_aux_sensors,
-                             read_aux_sensor, set_temperature_offset)
+                             read_aux_sensor, set_temperature_offset, SENSOR_REGISTRY)
 import db.queue as queue
 import device_identity
+import hardware_record
 from atomic_file import write_atomic
 import jobs.aggregate as aggregate
 from jobs.incident import IncidentDetector, load_config as load_incident_config
+from jobs.demo import DemoSwitch, load_config as load_demo_config
 import state
 
 load_dotenv()
@@ -74,6 +77,17 @@ def _get_led_state() -> "str | None":
         return None
 
 
+# True from a failed SEN6x read until the next good one. While it is set the LED
+# keeps "no_sensor": uploading the interval's earlier samples, or a server
+# ping, must not turn a failing sensor back into "ok".
+_sensor_failing = False
+
+
+def _set_led_ok() -> None:
+    if not _sensor_failing:
+        _set_led_state("ok")
+
+
 # Held by the registration wizard for the whole of a connect-and-register attempt
 # (see registration_wizard/wizard.py run_registration). While it exists the wizard
 # owns the LED ("thinking" is its own), so don't second-guess it.
@@ -100,7 +114,7 @@ def _confirm_update_if_pending() -> None:
     except OSError as e:
         print(f"[OTA] Warning: could not clear pending-update marker: {e}")
 
-VERSION = "2.3.17"
+VERSION = "2.3.26"
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
@@ -131,7 +145,7 @@ READ_IDLE_SECONDS     = int(os.getenv("READ_INTERVAL_IDLE",    900))   # 15 min
 # Local sample interval: how often the sensor is read and latest.json updated.
 # Samples between two uploads are averaged into that upload. At or above the
 # upload interval, every sample is an upload again (the original behaviour).
-SAMPLE_SECONDS        = int(os.getenv("SAMPLE_INTERVAL",        60))   # 1 min
+SAMPLE_SECONDS        = int(os.getenv("SAMPLE_INTERVAL",        15))   # 15 s (was 60 until 2.3.20; Martin, 2026-10-02)
 
 # Drain interval constants kept as reference (no longer drive a timer)
 DRAIN_ACTIVE_SECONDS  = int(os.getenv("DRAIN_INTERVAL_ACTIVE", 1800))
@@ -153,6 +167,7 @@ NTP_STEP_THRESHOLD_S = 30  # divergence above this (seconds) indicates an NTP st
 _samples:           list[dict]    = []     # this upload interval's samples, oldest first
 _last_kept_mono:    float | None  = None   # when the last sample went into _samples (monotonic)
 _incident:          IncidentDetector = IncidentDetector()   # reconfigured from settings.json in ingest_loop()
+_demo:              DemoSwitch = DemoSwitch()                 # /run/schoolair/demo; see jobs/demo.py
 _pending_live:      dict | None   = None   # reading ready to POST (set by _run_read)
 _live_event:        asyncio.Event | None = None  # signalled when _pending_live is ready
 _credit_bytes:      int   = 0              # server-granted byte budget; always overwritten
@@ -457,7 +472,7 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
         await asyncio.sleep(10)
         r1_at = datetime.now(timezone.utc).isoformat()
         try:
-            r1 = read_sensor()
+            r1 = await _read_off_loop(read_sensor)
         except RuntimeError as e:
             print(f"[verify/{metrics_str}] T+10s read failed: {e} — aborting")
             entry["severity"] = sev
@@ -469,7 +484,7 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
         await asyncio.sleep(20)
         r2_at = datetime.now(timezone.utc).isoformat()
         try:
-            r2 = read_sensor()
+            r2 = await _read_off_loop(read_sensor)
         except RuntimeError as e:
             print(f"[verify/{metrics_str}] T+30s read failed: {e} — aborting")
             entry["severity"] = sev
@@ -491,7 +506,7 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
         await asyncio.sleep(30)
         r3_at = datetime.now(timezone.utc).isoformat()
         try:
-            r3 = read_sensor()
+            r3 = await _read_off_loop(read_sensor)
         except RuntimeError as e:
             print(f"[verify/{metrics_str}] T+1m read failed: {e} — inconclusive")
             entry["severity"] = sev
@@ -505,7 +520,7 @@ async def _verify_all(breaching: list[tuple[str, dict]], entry: dict) -> None:
         r4_at = datetime.now(timezone.utc).isoformat()
         r4: dict | None = None
         try:
-            r4 = read_sensor()
+            r4 = await _read_off_loop(read_sensor)
         except RuntimeError as e:
             print(f"[verify/{metrics_str}] T+2m read failed: {e} — partial stage 2")
         if r4 is not None:
@@ -622,6 +637,48 @@ def _channel() -> str:
         return "stable"
 
 
+UNIT_TYPE_FILE = "/etc/schoolair-unit-type"
+FLOWER_MARKER = "/etc/schoolair-flower-fitted"
+REDETECT_DONE_FILE = "/var/lib/schoolair-redetect-done"
+BLUETOOTH_DONE_FILE = "/var/lib/schoolair-bluetooth-done"
+BLUETOOTH_MAX_MINUTES = 60
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _hardware() -> str:
+    """What this unit found it is: "indoor+flower", "indoor", "outdoor" or
+    "unknown" (detect_unit_type.sh / detect_flower.sh). Reported so the server
+    can tell, and can ask for a re-check (see _maybe_redetect)."""
+    try:
+        with open(UNIT_TYPE_FILE) as f:
+            unit = f.read().strip()
+    except OSError:
+        return "unknown"
+    if unit not in ("indoor", "outdoor"):
+        return "unknown"
+    if unit == "indoor" and os.path.exists(FLOWER_MARKER):
+        return "indoor+flower"
+    return unit
+
+
+def _redetect_done() -> str:
+    """Id of the server's last re-check request this unit carried out, or ""."""
+    return _read_done(REDETECT_DONE_FILE)
+
+
+def _bluetooth_done() -> str:
+    """Id of the server's last Bluetooth request this unit carried out, or ""."""
+    return _read_done(BLUETOOTH_DONE_FILE)
+
+
+def _read_done(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def _auth_headers() -> dict:
     """Headers for every call to the primary server.
 
@@ -637,7 +694,14 @@ def _auth_headers() -> dict:
         "Content-Type":       "application/json",
         "X-Schoolair-Version": VERSION,
         "X-Schoolair-Channel": _channel(),   # "dev" or "stable"; see schoolair-dev-update
+        "X-Schoolair-Hardware": _hardware(),
     }
+    done = _redetect_done()
+    if done:
+        headers["X-Schoolair-Redetect-Done"] = done
+    done = _bluetooth_done()
+    if done:
+        headers["X-Schoolair-Bluetooth-Done"] = done
     mac, serial = device_identity.read_mac(), device_identity.read_cpu_serial()
     if mac != device_identity.UNKNOWN:
         headers["X-Device-Mac"] = mac
@@ -658,7 +722,10 @@ async def _try_post(
       readings        — always an array; single element for live readings
       backlog_readings — count still in SQLite after this batch (0 = no backlog)
       bytes_per_reading — serialised size of one reading; present only when backlog > 0
+      hardware        — the hardware record (hardware_record.py), when it changed
+                        since the server last accepted it
     """
+    global _hw_sent
     if _identity_locked:
         return None
     body: dict = {"readings": readings, "backlog_readings": backlog_count}
@@ -669,6 +736,9 @@ async def _try_post(
     pending_acks = wifi_state.get("pending_acks", [])
     if pending_acks:
         body["wifi_acks"] = pending_acks
+    hardware, hardware_text = _hardware_for_upload()
+    if hardware:
+        body["hardware"] = hardware
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -691,6 +761,8 @@ async def _try_post(
         if pending_acks:
             wifi_state["pending_acks"] = []
             _save_wifi_state(wifi_state)
+        if hardware_text:
+            _hw_sent = hardware_text
 
         return res.json()
 
@@ -737,7 +809,7 @@ async def _startup_connectivity_ping() -> bool:
         if not res.is_success:
             _maybe_trigger_update_from_error(res)
             return False
-        _set_led_state("ok")
+        _set_led_ok()
         print("[startup] connectivity confirmed")
         try:
             response = res.json()
@@ -822,6 +894,89 @@ async def _trigger_update():
     except Exception as e:
         print(f"[OTA] Update failed: {e}")
     _update_in_progress = False  # only reached on failure
+
+
+# ── Hardware re-check ─────────────────────────────────────────────────────────
+
+_redetect_in_progress = False
+
+
+def _maybe_redetect(response: dict) -> None:
+    """The server asks for a hardware re-check with {"redetect": "<id>"} and
+    keeps sending it until X-Schoolair-Redetect-Done carries that id. Each id
+    is carried out once."""
+    request = response.get("redetect")
+    if not isinstance(request, str) or not request or request == _redetect_done():
+        return
+    asyncio.create_task(_run_redetect(request))
+
+
+async def _run_redetect(request: str) -> None:
+    global _redetect_in_progress
+    # An update re-checks too, and both start and stop the flower: one at a
+    # time. The server repeats the request, so a skipped one comes back.
+    if _redetect_in_progress or _update_in_progress:
+        return
+    _redetect_in_progress = True
+    print(f"[hardware] Server asked for a re-check ({request}) — running schoolair-redetect")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "/usr/local/bin/schoolair-redetect", request,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        if stdout:
+            print(stdout.decode(errors="replace")[-2000:].rstrip())
+        print(f"[hardware] Re-check finished (exit {proc.returncode}) — now {_hardware()}")
+    except Exception as e:
+        print(f"[hardware] Re-check failed: {e}")
+    finally:
+        _redetect_in_progress = False
+
+
+# ── Bluetooth on request ──────────────────────────────────────────────────────
+
+def _maybe_open_bluetooth(response: dict) -> None:
+    """The server asks to open Bluetooth registration with {"bluetooth": {"id":
+    "<id>", "minutes": N}} and keeps sending it until X-Schoolair-Bluetooth-Done
+    carries that id. Each id is carried out once. Only the server can ask: this
+    comes in the reply to our own upload, and is ignored unless that went over
+    HTTPS (certificate checked), so nobody on the network can fake it."""
+    request = response.get("bluetooth")
+    if not isinstance(request, dict) or not _PRIMARY_INGEST_URL.startswith("https://"):
+        return
+    rid, minutes = request.get("id"), request.get("minutes")
+    if (not isinstance(rid, str) or not _REQUEST_ID_RE.match(rid) or rid == _bluetooth_done()
+            or type(minutes) is not int or not 1 <= minutes <= BLUETOOTH_MAX_MINUTES):
+        return
+    asyncio.create_task(_run_bluetooth(rid, minutes))
+
+
+_bluetooth_starting = False
+
+
+async def _run_bluetooth(request: str, minutes: int) -> None:
+    global _bluetooth_starting
+    if _bluetooth_starting:  # the server repeats the request, so a skipped one comes back
+        return
+    _bluetooth_starting = True
+    print(f"[bluetooth] Server asked to open Bluetooth registration for {minutes} min ({request})")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "/usr/local/bin/schoolair-bluetooth", str(minutes), request,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        if stdout:
+            print(stdout.decode(errors="replace")[-1000:].rstrip())
+        if proc.returncode != 0:
+            print(f"[bluetooth] schoolair-bluetooth exited {proc.returncode}")
+    except Exception as e:
+        print(f"[bluetooth] Could not open Bluetooth: {e}")
+    finally:
+        _bluetooth_starting = False
 
 
 # ── WiFi push ─────────────────────────────────────────────────────────────────
@@ -974,6 +1129,8 @@ async def _handle_response(response: dict) -> None:
     if response.get("criteria") and response["criteria"] != load_criteria():
         save_criteria(response["criteria"])
     _maybe_trigger_update(response)
+    _maybe_redetect(response)
+    _maybe_open_bluetooth(response)
     schedule = response.get("schedule")
     if schedule and "active_start" in schedule and "active_end" in schedule:
         new_window = {"start": schedule["active_start"], "end": schedule["active_end"]}
@@ -1048,7 +1205,91 @@ async def _ntp_correction_task():
 # ── Read step ─────────────────────────────────────────────────────────────────
 
 
-def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: bool = False) -> dict | None:
+_sensor_lock: asyncio.Lock | None = None
+
+
+async def _read_off_loop(read, *args):
+    """Run a sensor read in a worker thread. A read is a subprocess: about a
+    second normally, up to 10 s on a timeout, 15 s per aux driver, and 90 s when
+    read_sensor() re-initialises the SEN6x. Run on the event loop, as it was,
+    that froze the dashboard, uploads and the ping loop at every sample. One
+    read at a time: the read loop and _verify_all share the I2C bus."""
+    global _sensor_lock
+    if _sensor_lock is None:
+        _sensor_lock = asyncio.Lock()
+    async with _sensor_lock:
+        return await asyncio.to_thread(read, *args)
+
+
+def _read_all_sensors(active_sensors: list) -> dict:
+    data = read_sensor()
+    for sensor in active_sensors:
+        reading = read_aux_sensor(sensor)
+        if reading:
+            data.update(reading)
+    return data
+
+
+# ── Hardware record ───────────────────────────────────────────────────────────
+#
+# hardware_record.py keeps when each part was first and last seen. The read
+# loop confirms the SEN6x model as it reads it: at most every SEN6X_REFRESH_S
+# while nothing changes (the record lives on the SD card), and at once when the
+# model changes or the sensor has stopped answering for SEN6X_MISSING_AFTER_S
+# (one failed read is not a missing sensor). Best effort: never stops a read.
+
+SEN6X_REFRESH_S       = 6 * 3600
+SEN6X_MISSING_AFTER_S = 10 * 60
+_hw_sen6x_noted: tuple | None = None    # (model or None, monotonic time) last written
+_sensor_failing_since: float | None = None
+
+
+def _note_sen6x(model: str | None, now: float) -> None:
+    global _hw_sen6x_noted
+    if _hw_sen6x_noted and _hw_sen6x_noted[0] == model and now - _hw_sen6x_noted[1] < SEN6X_REFRESH_S:
+        return
+    _hw_sen6x_noted = (model, now)
+    try:
+        hardware_record.update(hardware_record.sen6x_observations(model))
+    except Exception as e:
+        print(f"[hardware] could not update the hardware record: {e}")
+
+
+def _sen6x_missing() -> bool:
+    """No SEN6x has answered for SEN6X_MISSING_AFTER_S."""
+    return (_sensor_failing_since is not None
+            and _time_mod.monotonic() - _sensor_failing_since >= SEN6X_MISSING_AFTER_S)
+
+
+# The record goes to the server in an upload's body ("hardware") whenever it
+# differs from what the server last accepted: after a start, and after each
+# change (at most a few times a day). The dashboard shows it per unit.
+_hw_sent: str | None = None
+
+
+def _hardware_for_upload() -> tuple[dict | None, str | None]:
+    """(record, its canonical text) when it should be sent, else (None, None)."""
+    record = hardware_record.load()
+    if not record:
+        return None, None
+    text = json.dumps(record, sort_keys=True)
+    return (record, text) if text != _hw_sent else (None, None)
+
+
+def _note_aux_sensors(active_sensors: list) -> None:
+    """The auxiliary I2C sensors probed at start: found, or not (any that were
+    there before are kept as missing)."""
+    active = {s["name"]: s for s in active_sensors}
+    try:
+        hardware_record.update([
+            {"part": s["name"], "found": s["name"] in active, "kind": "aux_sensor",
+             "extra": {"address": f"0x{active[s['name']]['detected_addr']:02x}"} if s["name"] in active else None}
+            for s in SENSOR_REGISTRY])
+    except Exception as e:
+        print(f"[hardware] could not update the hardware record: {e}")
+
+
+async def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: bool = False) -> dict | None:
     """Read the sensors once, publish the result locally and keep it for the
     next upload's mean. Returns the reading, or None if the SEN6x read failed
     (aux sensors are optional: a failed one is just missing from the reading).
@@ -1057,26 +1298,36 @@ def _take_sample(active_sensors: list, recorded_at: str | None = None, keep: boo
     per SAMPLE_SECONDS goes into the upload mean (or this one when `keep`,
     the upload-boundary sample), so incident-mode readings every 10 s don't
     weigh more in the 5/15-minute average than a calm minute does."""
-    global _last_kept_mono
+    global _last_kept_mono, _sensor_failing, _sensor_failing_since
     if recorded_at is None:
         recorded_at = datetime.now(timezone.utc).isoformat()
     try:
-        data = read_sensor()
+        data = await _read_off_loop(_read_all_sensors, active_sensors)
     except RuntimeError as e:
         print(f"Sensor read failed: {e}")
+        _sensor_failing = True
+        failing_since = _sensor_failing_since = _sensor_failing_since or _time_mod.monotonic()
+        if _time_mod.monotonic() - failing_since >= SEN6X_MISSING_AFTER_S:
+            _note_sen6x(None, _time_mod.monotonic())
         _set_led_state("no_sensor")
         state.publish_error(str(e), recorded_at)
         return None
 
-    for sensor in active_sensors:
-        reading = read_aux_sensor(sensor)
-        if reading:
-            data.update(reading)
-
-    state.set(data, recorded_at)
+    if _sensor_failing:
+        # The sensor is back. Without this the LED kept "no_sensor" until the
+        # next upload, up to 15 min after one missed sample. "thinking", not
+        # "ok": the ping loop confirms the server within _PING_RECHECK_S.
+        _sensor_failing = False
+        if _get_led_state() == "no_sensor":
+            _set_led_state("ap" if _identity_locked else "thinking")
 
     now = _time_mod.monotonic()
+    _sensor_failing_since = None
+    model = hardware_record.model_in_reading(data)
+    if model:
+        _note_sen6x(model, now)
     change = _incident.observe(data, now)
+    state.set(data, recorded_at, mode=_mode())
     if change == "start":
         print(f"[incident] air changing fast — reading every {_incident.cfg['sample_seconds']}s")
     elif change == "end":
@@ -1098,10 +1349,20 @@ async def _run_read(settings: dict, active_sensors: list):
     global _pending_live, _samples
 
     recorded_at = datetime.now(timezone.utc).isoformat()
-    data = _take_sample(active_sensors, recorded_at, keep=True)
+    data = await _take_sample(active_sensors, recorded_at, keep=True)
     samples, _samples = _samples, []
     if not samples:
-        return  # no successful read this interval: nothing to send
+        if not _sen6x_missing():
+            return  # no successful read this interval: nothing to send
+        # No SEN6x has answered for SEN6X_MISSING_AFTER_S (none fitted, or it
+        # died): upload the unit's own state instead, as the ESP32's sensorless
+        # units do, so it still reports its version and hears the server's
+        # requests (an OTA, Bluetooth on request, a hardware re-check). Without
+        # it such a unit never contacted the server again (found on the
+        # sensorless bench Pi, 2026-11-16).
+        _pending_live = {"data": {"unit": {"sensor": None}}, "recorded_at": recorded_at, "severity": 0}
+        _get_live_event().set()
+        return
 
     entry = {"data": average_readings(samples), "recorded_at": recorded_at, "severity": 0}
 
@@ -1283,7 +1544,7 @@ async def _upload_loop() -> None:
         asyncio.create_task(_mirror_batch([_format_reading(entry)]))
         await _handle_response(response)
         print(f"[upload] live reading sent (backlog: {backlog_count})")
-        _set_led_state("ok")
+        _set_led_ok()
         _confirm_update_if_pending()
 
         if backlog_count > 0 and _credit_bytes > 0:
@@ -1316,15 +1577,22 @@ async def _read_loop(active_sensors: list):
         await _sample_until_boundary(delay, active_sensors)
 
 
+def _mode() -> str:
+    """What drives the read cadence right now, for latest.json and the dashboard."""
+    if _demo.active():
+        return "demo"
+    return "incident" if _incident.active else "normal"
+
+
 async def _sample_until_boundary(seconds: float, active_sensors: list) -> None:
     """Between two uploads: take a sample every SAMPLE_SECONDS (or every few
     seconds during an incident, see jobs/incident.py) until the next upload
     boundary, `seconds` from now. Returns at the boundary, or early when the
     active window changes (the read loop then uploads at once, as before).
-    Samples are not logged: one line a minute would only wear the SD card."""
+    Samples are not logged: a line every 15 s would only wear the SD card."""
     deadline = _time_mod.monotonic() + seconds
     while True:
-        step = _incident.sample_seconds or SAMPLE_SECONDS
+        step = _demo.sample_seconds if _demo.active() else (_incident.sample_seconds or SAMPLE_SECONDS)
         remaining = deadline - _time_mod.monotonic()
         if remaining <= step:
             await _wait_for_boundary(remaining)
@@ -1332,7 +1600,10 @@ async def _sample_until_boundary(seconds: float, active_sensors: list) -> None:
         await _wait_for_boundary(step)
         if _settings_event is not None and _settings_event.is_set():
             return
-        _take_sample(active_sensors)
+        await _take_sample(active_sensors)
+        # The window may also change during the read; the next wait would clear it.
+        if _settings_event is not None and _settings_event.is_set():
+            return
 
 
 async def _enter_identity_lockout() -> None:
@@ -1360,16 +1631,18 @@ async def _enter_identity_lockout() -> None:
 
 async def ingest_loop():
     """Initialise SQLite, probe aux sensors, run read / upload / NTP tasks."""
-    global _settings, _settings_event, _incident
+    global _settings, _settings_event, _incident, _demo
     queue.init()
     _settings = load_settings()
     validate_settings(_settings)
     _settings_event = asyncio.Event()
     _incident = IncidentDetector(load_incident_config(_settings))   # settings.json "incident"
+    _demo = DemoSwitch(load_demo_config(_settings))                 # settings.json "demo"
     # Always sent, 0 included: an offset set earlier survives a service
     # restart on the sensor, so changing it back to 0 must reach it too.
     set_temperature_offset(_temperature_offset(_settings))
     active_sensors = probe_aux_sensors()
+    _note_aux_sensors(active_sensors)
     print(
         f"Ingest started — "
         f"samples every {SAMPLE_SECONDS}s, uploads {READ_ACTIVE_SECONDS}s/{READ_IDLE_SECONDS}s (active/idle) | "

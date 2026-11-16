@@ -23,7 +23,7 @@ Live testing on a Raspberry Pi with a **SEN63C** sensor.
 ### 1.1  Flash the SD card
 
 - [ ] Open Raspberry Pi Imager
-- [ ] OS: **Raspberry Pi OS Lite (64-bit, Bookworm)**
+- [ ] OS: **Raspberry Pi OS Lite (Trixie)** — 32-bit for a Pi Zero W, 64-bit for newer boards
 - [ ] In "Advanced settings" (⚙):
   - Set username: `admin`
   - Set password (note it)
@@ -43,7 +43,7 @@ Live testing on a Raspberry Pi with a **SEN63C** sensor.
 ### 1.3  Run the setup script
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/SchoolAir/schoolair/oded-dev/gateway/schoolair_setup.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/SchoolAir/schoolair-endnode/main/schoolair_setup.sh | sudo bash
 ```
 
 Expected: each step prints `✓`. The final block should read:

@@ -7,13 +7,23 @@ sensor reading, data ingestion to the central server, and local alert detection.
 
 ## Quick start — fresh Pi
 
+1. Flash **Raspberry Pi OS Lite** (Trixie) with Raspberry Pi Imager: the 32-bit
+   build for a Pi Zero W, 64-bit for newer boards. In Imager's customisation:
+   username `admin`, your Wi-Fi, SSH on.
+2. Connect the sensor, boot, SSH in and run:
+
 ```bash
-curl -sSL https://raw.githubusercontent.com/SchoolAir/schoolair-ex-RMIT-pi/main/schoolair_setup.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/SchoolAir/schoolair-endnode/main/schoolair_setup.sh | sudo bash
+sudo reboot
 ```
 
-This clones the repo to `/home/admin/schoolair/`, installs dependencies, builds
-the SEN6x binaries, configures a Wi-Fi hotspot for first-boot registration,
-and enables all systemd services. Idempotent — safe to re-run.
+This clones the repo to `/home/admin/schoolair/`, installs dependencies (the
+telemetry service gets its own venv, `.venv`, from `requirements.txt`), builds
+the SEN6x binaries, detects whether this is an indoor or outdoor unit,
+configures a Wi-Fi hotspot for first-boot registration, and enables all
+systemd services. It takes about 15 minutes on a Pi Zero W. Idempotent —
+safe to re-run. Indoor units install pigpiod by themselves after the reboot,
+once they are online.
 
 To use a different admin username:
 
@@ -58,6 +68,13 @@ Both use the same `schoolair-update` and the same 40-minute rollback watchdog.
 A dev update waits for any flower move to finish first, and a version that was
 rolled back is recorded in `/var/lib/schoolair/dev-update-rolled-back` and not
 tried again. To put a unit on dev: `echo dev | sudo tee /etc/schoolair-channel`.
+A fresh setup ignores the channel file and installs `main` unless told otherwise,
+so a new dev unit is set up with:
+
+```bash
+echo dev | sudo tee /etc/schoolair-channel
+curl -sSL https://raw.githubusercontent.com/SchoolAir/schoolair-endnode/dev/schoolair_setup.sh | sudo REPO_BRANCH=dev bash
+```
 The channel is sent in the `X-Schoolair-Channel` header with every upload.
 
 **To update a single Pi manually:**
@@ -95,6 +112,10 @@ schoolair-wizard         Browser-based registration + Wi-Fi setup (Microdot,
   .service               port 80). Started on demand. Stops itself after a
                          successful registration; idle-timeout stops it on LAN.
 
+schoolair-ble            Bluetooth registration (Improv Wi-Fi over BLE).
+  .service               Pulled in by the wizard and stops with it; exits at
+                         once on a registered device.
+
 schoolair.service        Main telemetry process (see below). Starts after the
                          launcher exits. Restarts automatically on failure.
 
@@ -108,7 +129,7 @@ schoolair-netwatch       Persistent — monitors WiFi after boot. On uplink loss
 
 ### Latest reading file
 
-Every sample the telemetry process takes (once a minute, `SAMPLE_INTERVAL`) is
+Every sample the telemetry process takes (every 15 s, `SAMPLE_INTERVAL`) is
 written, atomically, to `/run/schoolair/latest.json`. A metric the sensor had no
 valid value for is `null`:
 
@@ -157,6 +178,80 @@ holds, and deletes it when it has a reading again. That request can only turn
 refreshed for 5 minutes is ignored. It has its own file because the shared
 `/run/schoolair-led-state` is rewritten to "ok" by every upload.
 
+### Hardware detection
+
+A unit works out what it is from what is connected to it, so one image and one
+setup serve every model. Nothing is configured by hand, and no jumpers are used.
+
+| Part | How it is found | Result |
+|---|---|---|
+| Sensor: SEN63C or SEN65 | `detect_unit_type.sh` asks the sensor for its product name over I2C (via `sen6x_read`) | `/etc/schoolair-unit-type`: `indoor` (SEN63C) or `outdoor` (SEN65) |
+| Wilting flower | `detect_flower.sh` looks for the stepper's ULN2003 driver board on GPIO17/27/22/23 (below) | `/etc/schoolair-flower-fitted` present or absent |
+| Status light | Not detected: assumed present on every indoor unit (below) | `schoolair-led.service` drives GPIO24 |
+
+**Flower.** Each ULN2003 input has about 13 kΩ to ground. With the Pi's pull-up
+on, a pin wired to the board reads low (about 0.7 V, too little to move the
+motor) and an open pin reads high. If all four read low, the marker is created.
+If all four read high, it is removed. A mix means a loose jumper wire: the
+script logs which pins and leaves the marker as it was. The motor itself, behind
+the board's socket, can't be seen. The pins are never probed while the flower
+service holds them (it drives them as outputs, and an input mid-move would lose
+the position). The old GPIO26 strap is no longer read.
+
+**Status light.** Today's light is a plain two-leg LED on GPIO24, and it is
+assumed to be there. It can't be detected as wired: with either pull, a plain
+LED reads the same as an open pin, and the Pi has no analog input to tell the
+difference. Driving GPIO24 with no LED on it is harmless and costs one pin that
+nothing else needs. The plan is for the plain LED to stay the fallback:
+- If a richer status light (for example a WS2812 smart LED) or a screen is added
+  later, it gets its own check here. The plain LED is driven only when neither
+  is found.
+- If one is ever needed, a plain LED can be made detectable without an extra
+  pin. Put a 10 kΩ resistor across its legs, in the LED's own lead: the
+  pull-up test then reads low only while the LED is plugged in, just like the
+  flower's board.
+
+**When it runs.** The sensor type is detected at a clone's first boot and on
+every setup/update. The flower is checked:
+- at every boot, before the flower starts (`schoolair-detect-hardware.service`).
+  This catches a flower fitted or taken out between boots;
+- at a clone's first boot, and on every setup/update. While the flower service
+  runs it owns the pins, so an update only catches a newly fitted flower;
+- on request, by hand: `sudo schoolair-redetect` waits for any move, stops the
+  flower, probes, and starts it again if the board is still there (it re-homes);
+- on request, from the server: `"redetect": "<id>"` in an ingest response runs
+  the same command. The unit runs each id once and reports it back in the
+  `X-Schoolair-Redetect-Done` header.
+
+**Hardware record.** Every check also goes to `/var/lib/schoolair/hardware.json`
+(`hardware_record.py`), which keeps a history the marker files don't:
+- one entry per part (`SEN63C`, `SEN65`, `flower`, `status_led`, and the
+  auxiliary I2C sensors such as `mgs_v2` and `o3`), with `first_seen` and
+  `last_seen`;
+- a part that goes away keeps its entry: `present` turns false, `last_seen`
+  stays its last confirmation, and `missing_since` / `last_missed` give the
+  first and the latest check that didn't find it. If it comes back, that
+  absence moves to `last_gap`. A SEN6x swap therefore shows the old model
+  missing and the new one first seen;
+- `"how": "assumed"` (with a `basis`) marks a part that is taken to be there
+  rather than detected: today the status light on indoor units;
+- `checks` gives the last check of each kind, and `first_check` /
+  `last_check` the first and latest check overall.
+
+The SEN6x and the status light are checked at every boot
+(`schoolair-hardware-check.service`, after `sen6x.service`), on every
+setup/update and by `schoolair-redetect`. The telemetry service also confirms
+the SEN6x as it reads it (every 6 h, or at once if the model changes or the
+sensor stops answering for 10 min) and records the auxiliary sensors it finds at
+start. The Bluetooth registration reads the record to tell the page which
+sensor the unit has. A check that can't tell (sensor not ready, pins in use)
+changes nothing, and `prepare_image.sh` removes the record from golden images.
+`python3 ~/schoolair/hardware_record.py show` prints it.
+
+Every request to the server carries `X-Schoolair-Hardware`: `indoor+flower`,
+`indoor`, `outdoor` or `unknown`. `prepare_image.sh` removes the flower marker
+from golden images, so each clone checks its own hardware.
+
 ### Installing the flower
 
 The flower's code is developed in `SchoolAir/Flower-End-node`, which is
@@ -176,12 +271,8 @@ The service is installed and enabled on every indoor unit. A drop-in
 (`deploy/schoolair-flower-fitted.conf`) lets it start only when both of these
 are true:
 
-- **A flower is fitted.** The AQU dock's harness ties GPIO26 (physical pin 37)
-  to ground (pin 39). `detect_flower.sh` switches on the pull-up and reads the
-  pin: low means a strap, and it creates `/etc/schoolair-flower-fitted`. It runs
-  at a clone's first boot and on every setup/update. `prepare_image.sh` removes
-  the marker from golden images. A unit without the harness (the bench unit) is
-  marked by hand: `sudo touch /etc/schoolair-flower-fitted`.
+- **A flower is fitted** (`/etc/schoolair-flower-fitted`, set by
+  `detect_flower.sh`; see [Hardware detection](#hardware-detection)).
 - **pigpiod is installed** (`/var/lib/schoolair-pigpio-installed`). On a new
   unit that happens only once the network is up. `schoolair-pigpio-setup.service`
   then starts the flower.
@@ -194,7 +285,14 @@ only when its pin changed. Both first wait for any move in progress to finish
 
 `main.py` runs two concurrent coroutines:
 
-- **Ingest loop** — samples the sensor every minute and publishes each sample
+- **Logs stay on the card.** The journal is persistent (64 MB cap, synced
+  every minute), so after a reboot `journalctl -b -1` reads the previous boot
+  and `journalctl --list-boots` lists them. Before 2.3.21 it lived in RAM.
+- **Starts without a network.** `schoolair.service` waits only for the sensor,
+  not for Wi-Fi: readings and `latest.json` begin within about a minute of
+  power-up wherever the unit is, and uploads queue in SQLite until a network
+  appears.
+- **Ingest loop** — samples the sensor every 15 s and publishes each sample
   locally (see *Latest reading file*). On a clock-aligned schedule (5 min during
   the active window, 15 min outside it) the mean of that interval's samples
   becomes one reading, which is uploaded at once or kept in SQLite and drained
@@ -285,6 +383,45 @@ through:
 After registration the wizard writes `AUTH_TOKEN` to `.env`, restarts
 `schoolair.service`, and exits. nginx activates to proxy port 80 → port 8080.
 
+### Over Bluetooth
+
+While the wizard runs, `schoolair-ble.service` also advertises the device as
+`SchoolAir-<ID>` (a 5-character ID from the CPU serial —
+`device_identity.short_id()`). The registration web page connects over Web
+Bluetooth, writes the registration token and device name to the SchoolAir
+service, then sends the Wi-Fi details over Improv Wi-Fi. The device joins the
+network, registers exactly as the wizard does, and reports each step back
+(wrong password, no internet, token rejected, done) without the phone ever
+joining the hotspot. On a failure the hotspot comes back, so both paths stay
+usable. Writes need an encrypted link: the phone shows a pairing prompt once.
+
+A registered device that loses its network advertises too, whenever netwatch
+brings the AP up (see below). The page then sees `"registered": true` in the
+first Status value and only reconnects it to Wi-Fi: the token is validated but
+not used up, and the registration is left as it is. A registered device that is
+online doesn't advertise, unless Bluetooth was opened on request.
+
+**On request.** `sudo schoolair-bluetooth MINUTES` opens Bluetooth registration
+for 1-60 minutes, even on a registered unit that is online. The LED
+double-blinks meanwhile; asking again moves the end, and a registration in
+progress is finished before it closes. The server asks for it with
+`"bluetooth": {"id": "<id>", "minutes": N}` in an ingest response (sent with
+`scripts/unit-request bluetooth <unit>` in schoolair-server). The unit runs each
+id once and reports it back in the `X-Schoolair-Bluetooth-Done` header. Only the
+server can ask: the request arrives in the reply to the unit's own HTTPS upload,
+and the unit opens no port. It is picked up with the next upload, within 5
+minutes during the active window and 15 outside it.
+
+Guards against someone nearby tying a unit up: a phone that stays silent for
+2 minutes (the page reads Status every 30 s while open) or stays connected
+for 15 minutes is disconnected, never mid-attempt; after 5 failed attempts in a
+row the device stops advertising and refuses writes for 5 minutes. Wi-Fi
+passwords are never logged, and the wizard shell-quotes the SSID and password
+it hands to `nmcli`.
+
+Protocol layer: `registration_wizard/improv.py`; SchoolAir payloads:
+`ble_flow.py`; BlueZ GATT server and flow: `ble_provision.py`.
+
 ---
 
 ## WiFi loss recovery
@@ -298,14 +435,14 @@ uplink lost
     ▼ (2-minute grace period — ignores brief blips)
     │
     ▼
-AP + wizard started
+AP + wizard (+ Bluetooth) started
     │
-    ├── user connects to SchoolAir_AP and reconfigures WiFi via wizard
+    ├── user connects to SchoolAir_AP, or to the device over Bluetooth, and reconfigures WiFi
     │       └── uplink restored → AP closed → telemetry restarted
     │
     └── no manual action taken
             │
-            ▼ (every 5 minutes, if saved networks exist AND no client on AP)
+            ▼ (every 5 minutes, if saved networks exist AND no client on AP or Bluetooth)
             briefly close AP → try each saved network profile → reopen AP if failed
             │
             └── saved network available → AP closed → telemetry restarted
@@ -317,8 +454,8 @@ trigger the fallback.
 **Reconnect probe:** While the AP is up, the watchdog checks every 5 minutes
 whether any of the Pi's saved WiFi profiles are now reachable. The AP drops for
 about 10 seconds during each probe. If a client is currently connected to the
-AP hotspot, that probe cycle is skipped so as not to interrupt an active wizard
-session.
+AP hotspot, a phone is connected over Bluetooth, or a registration is running,
+that probe cycle is skipped so as not to interrupt an active wizard session.
 
 **Timing overrides** (useful when testing):
 
@@ -375,15 +512,23 @@ Pi reads and drains at the higher cadence (school hours).
 - Window boundaries must be on a 15-minute mark (`:00`, `:15`, `:30`, `:45`).
 - Maximum window length is 9 hours.
 - `incident` (optional block): while the air is changing fast, the sensor is
-  read every `sample_seconds` (10) instead of every minute, so the wilting
+  read every `sample_seconds` (10) instead of every 15 s, so the wilting
   flower can follow within seconds. An incident starts when PM2.5 more than
   doubles (`pm25_jump_factor` 2) or rises across `pm25_threshold` (15 µg/m³),
-  or CO2 rises by `co2_jump_ppm` (100) in a minute or across `co2_threshold`
+  or CO2 rises by `co2_jump_ppm` (100) between two readings or across `co2_threshold`
   (1000 ppm). It ends after `steady_minutes` (5) with every reading within
   ±`steady_pm25` (2) and ±`steady_co2` (50) of the window's mean. Only
   `latest.json` sees the extra readings: the upload mean keeps one reading a
   minute, so uploads are unchanged. `"enabled": false` switches it off. See
   `jobs/incident.py`.
+- `demo` (optional block): **for demonstrations only.** While the file
+  `/run/schoolair/demo` exists (`touch /run/schoolair/demo` as admin, no
+  restart needed) the sensor is read every `sample_seconds` (3) whatever the
+  incident detector says, so the flower reacts while people watch. `rm` the
+  file to end it; it ends by itself after `max_minutes` (120, from the file's
+  mtime, so a new `touch` extends it) and at reboot. Uploads are unchanged.
+  Each switch is logged, `latest.json` carries `"mode": "demo"`, and the local
+  dashboard shows it. See `jobs/demo.py`.
 - `temp_offset_c` (default `0`): this unit's temperature correction in °C,
   for a sensor warmed by its enclosure. Measure the unit against a room
   thermometer and enter the difference, e.g. `-4.7` if it reads 4.7 °C high.
@@ -397,7 +542,7 @@ Pi reads and drains at the higher cadence (school hours).
 
 | Env var                  | Default   | Meaning                        |
 |--------------------------|-----------|--------------------------------|
-| `SAMPLE_INTERVAL`        | `60` s    | 1 min — local sensor read and `latest.json` cadence |
+| `SAMPLE_INTERVAL`        | `15` s    | local sensor read and `latest.json` cadence (60 s before 2.3.20) |
 | `READ_INTERVAL_ACTIVE`   | `300` s   | 5 min — upload cadence inside the window (mean of its samples) |
 | `READ_INTERVAL_IDLE`     | `900` s   | 15 min — upload cadence outside the window (mean of its samples) |
 | `DRAIN_INTERVAL_ACTIVE`  | `1800` s  | 30 min — max time between drains inside the window |
@@ -433,6 +578,9 @@ SEN6x sensor connected via I2C on a Pi.
 cd schoolair/        # repo root
 pytest -m "not hardware"    # laptop-safe (102 tests)
 pytest                      # full suite — Pi only
+
+# Bluetooth registration against the local BlueZ (advertises from hci0 briefly)
+SCHOOLAIR_BLE_SYSTEM_TEST=1 pytest tests/registration_wizard/test_ble_bluez_system.py
 ```
 
 See `tests/README.md` for a breakdown by module.
@@ -475,7 +623,10 @@ schoolair-pi/
 ├── registration_wizard/
 │   ├── launcher.sh            Boot-time decision: start wizard or not
 │   ├── netwatch.sh            Persistent WiFi watchdog daemon
-│   └── wizard.py              Microdot browser portal (registration + Wi-Fi)
+│   ├── wizard.py              Microdot browser portal (registration + Wi-Fi)
+│   ├── ble_provision.py       Bluetooth registration (BlueZ GATT server)
+│   ├── ble_flow.py            SchoolAir BLE payloads (token, status)
+│   └── improv.py              Improv Wi-Fi protocol framing
 │
 ├── scripts/
 │   ├── mock-sensor.sh         Fake sensor output for local development

@@ -70,3 +70,32 @@ def test_pigpiod_restarts_only_when_its_drop_in_changed():
     guard = TEXT.rindex('if [ "$PIGPIOD_CONF_CHANGED" = 1 ]', 0, restart)
     assert "wait_for_flower_move" in TEXT[guard:restart]   # see test_flower_install.py
     assert TEXT.count("systemctl restart pigpiod") == 1
+
+
+def test_telemetry_does_not_wait_for_the_network():
+    """Readings and latest.json don't need Wi-Fi; waiting for network-online.target
+    kept the flower still for minutes after a power-up away from home (2026-10-02)."""
+    unit = (Path(__file__).parents[1] / "deploy/schoolair.service").read_text()
+    body = "\n".join(l for l in unit.splitlines() if not l.startswith("#"))
+    assert "network-online.target" not in body
+    assert "After=network.target sen6x.service" in body
+
+
+def test_journal_is_persistent_and_capped():
+    """Twice (2026-09-30, 2026-10-02) a reboot's cause was unreadable because the
+    journal lived in RAM. Martin: logs on the card, on all units, bounded."""
+    block = TEXT[TEXT.index("90-schoolair.conf << 'EOF'"):TEXT.index("systemctl restart systemd-journald")]
+    # Must sort after Raspberry Pi OS's 40-rpi-volatile-storage.conf, or it loses.
+    assert "journald.conf.d/90-schoolair.conf" in TEXT and "00-schoolair.conf <<" not in TEXT
+    assert "Storage=persistent" in block
+    assert "SystemMaxUse=64M" in block
+    assert "SyncIntervalSec=1min" in block
+    assert "mkdir -p /etc/systemd/journald.conf.d /var/log/journal" in TEXT
+    assert "Storage=volatile" not in block
+
+
+def test_journal_moves_to_the_card_without_a_reboot():
+    """Restarting journald doesn't leave /run; the update has to ask it to flush."""
+    restart = TEXT.index("systemctl restart systemd-journald")
+    assert TEXT.index("journalctl --flush", restart) - restart < 600
+    assert "test -e /run/systemd/journal/flushed" in TEXT

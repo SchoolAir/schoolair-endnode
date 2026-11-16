@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# schoolair-bluetooth — open Bluetooth registration for a while, now.
+#
+#   schoolair-bluetooth MINUTES [REQUEST_ID]
+#
+# Installed root-owned to /usr/local/bin; admin may run it with sudo (sudoers,
+# schoolair_setup.sh step 14). Run by hand (`sudo schoolair-bluetooth 15`) or
+# by jobs/ingest.py when the server's ingest response carries
+# {"bluetooth": {"id": "<id>", "minutes": N}}. Nothing else can ask: the unit
+# hears only from its server, in replies to its own HTTPS uploads.
+#
+# Writes the window's end (Unix time) to WINDOW_FILE and starts
+# schoolair-ble.service, which then advertises even on a registered unit that
+# is online, until the window ends; led_status.py double-blinks meanwhile.
+# Asking again while it is open moves the end.
+#
+# REQUEST_ID is written to DONE_FILE once the service is running, and reported
+# back in every upload's X-Schoolair-Bluetooth-Done header so the server can
+# clear its request.
+set -u
+
+DONE_FILE="${DONE_FILE:-/var/lib/schoolair-bluetooth-done}"
+WINDOW_FILE="${WINDOW_FILE:-/run/schoolair-ble-window}"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+MAX_MINUTES=60
+log() { echo "[schoolair-bluetooth] $*"; }
+
+minutes="${1:-}"
+request="${2:-}"
+if ! [[ "$minutes" =~ ^[0-9]{1,2}$ ]] || (( 10#$minutes < 1 || 10#$minutes > MAX_MINUTES )); then
+    log "minutes must be 1-${MAX_MINUTES}"
+    exit 2
+fi
+# The id comes from the server and ends up in a file and an HTTP header.
+if [ -n "$request" ] && ! [[ "$request" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+    log "invalid request id — ignored"
+    exit 2
+fi
+
+until=$(( $(date +%s) + 10#$minutes * 60 ))
+tmp="${WINDOW_FILE}.tmp"
+echo "$until" > "$tmp" && mv -f "$tmp" "$WINDOW_FILE"
+
+if ! "$SYSTEMCTL" start schoolair-ble.service; then
+    rm -f "$WINDOW_FILE"
+    log "could not start schoolair-ble.service"
+    exit 1
+fi
+log "Bluetooth registration open for ${minutes} min (until $(date -d "@$until" '+%H:%M:%S'))"
+
+if [ -n "$request" ]; then
+    mkdir -p "$(dirname "$DONE_FILE")"
+    echo "$request" > "$DONE_FILE"
+fi

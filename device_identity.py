@@ -17,6 +17,7 @@ the saved identity with the current one — see the wizard's _bind_identity().
 Stdlib-only: imported both by jobs/ingest.py (venv) and by the wizard (system python).
 """
 
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -60,6 +61,24 @@ def read_mac() -> str:
         except OSError:
             pass
     return UNKNOWN
+
+
+# Crockford base32: no I, L, O or U, so a short ID read off a sticker can't be
+# misread as another (0/O, 1/I/L).
+_SHORT_ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+SHORT_ID_LENGTH = 5
+
+
+def short_id(cpu_serial: "str | None" = None) -> str:
+    """5-character ID for this Pi, derived from its CPU serial: what the
+    Bluetooth name (SchoolAir-<ID>) and the printed sticker show, so an
+    installer can tell units apart. 25 bits from SHA-256 of the serial, so
+    two units in one school practically never share one. Pass the serial to
+    compute another unit's ID (e.g. when printing stickers)."""
+    serial = (cpu_serial or read_cpu_serial()).strip().lower()
+    value = int.from_bytes(hashlib.sha256(serial.encode()).digest()[:4], "big") >> 7
+    return "".join(_SHORT_ID_ALPHABET[(value >> (5 * i)) & 31]
+                   for i in reversed(range(SHORT_ID_LENGTH)))
 
 
 def _read_env(path: Path) -> dict:

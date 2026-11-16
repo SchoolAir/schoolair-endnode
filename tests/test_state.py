@@ -22,7 +22,7 @@ def test_set_publishes_latest_reading(tmp_path, monkeypatch):
     assert state.latest_data == data
     assert state.latest_recorded_at == "2026-09-28T21:31:43+00:00"
     published = json.loads(target.read_text())
-    assert published == {"data": data, "recorded_at": "2026-09-28T21:31:43+00:00"}
+    assert published == {"data": data, "recorded_at": "2026-09-28T21:31:43+00:00", "mode": "normal"}
     assert not os.path.exists(str(target) + ".tmp"), "temp file must be renamed away"
 
 

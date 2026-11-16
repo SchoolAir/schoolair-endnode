@@ -124,6 +124,7 @@ async def ws_sensors(request, ws):
             "error":      _device_error(),
             "nickname":   NICKNAME,
             "sent_at":    state.latest_recorded_at,
+            "mode":       state.latest_mode,   # "demo" while /run/schoolair/demo exists; see jobs/demo.py
         }
         await ws.send(json.dumps(frame))
         await asyncio.sleep(30)

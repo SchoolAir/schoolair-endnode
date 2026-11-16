@@ -24,6 +24,7 @@ import pwd
 import random
 import re
 import secrets
+import shlex
 import sys
 import time
 import urllib.error
@@ -1328,19 +1329,14 @@ async def _setup_client_profile(ssid: str, password: str, delete_committed: bool
     await _cmd(f'nmcli con delete "{TEMP_PROFILE}" 2>/dev/null; true')
     if delete_committed:
         await _cmd(f'nmcli con delete "{committed}" 2>/dev/null; true')
-    if password:
-        rc, _, err = await _cmd(
-            f'nmcli con add type wifi ifname {AP_INTERFACE} '
-            f'con-name "{TEMP_PROFILE}" ssid "{ssid}" '
-            f'wifi-sec.key-mgmt wpa-psk wifi-sec.psk "{password}" '
-            f'ipv4.method auto ipv6.method ignore'
-        )
-    else:
-        rc, _, err = await _cmd(
-            f'nmcli con add type wifi ifname {AP_INTERFACE} '
-            f'con-name "{TEMP_PROFILE}" ssid "{ssid}" '
-            f'ipv4.method auto ipv6.method ignore'
-        )
+    # The SSID and password come straight from a form or a Bluetooth write and
+    # this runs as root through a shell: quote them, never interpolate raw.
+    security = f"wifi-sec.key-mgmt wpa-psk wifi-sec.psk {shlex.quote(password)} " if password else ""
+    rc, _, err = await _cmd(
+        f'nmcli con add type wifi ifname {AP_INTERFACE} '
+        f'con-name "{TEMP_PROFILE}" ssid {shlex.quote(ssid)} '
+        f'{security}ipv4.method auto ipv6.method ignore'
+    )
     if rc != 0:
         return False, f"Could not create connection profile: {err}"
     return True, "ok"
@@ -1463,6 +1459,17 @@ async def _post_legacy_registration(org_token: str, nickname: str) -> tuple:
         return False, f"Legacy registration failed: {exc}", {}
 
 
+_SECRET_FIELD_RE = re.compile(r'("(?:auth_token|device_token|token|password)"\s*:\s*")[^"]*(")')
+
+
+def _redact_secrets(text: str) -> str:
+    """The register response carries this device's auth_token. Its body was
+    logged as-is, and since 2.3.21 the journal is kept on the SD card, so
+    every registration left the token on the card. Keep the rest for
+    debugging; blank out the secret values."""
+    return _SECRET_FIELD_RE.sub(r"\1<redacted>\2", text)
+
+
 async def _post_heartbeat(payload: dict) -> tuple[bool, str, str]:
     """POST to the primary server's register endpoint.
 
@@ -1488,7 +1495,7 @@ async def _post_heartbeat(payload: dict) -> tuple[bool, str, str]:
     loop = asyncio.get_running_loop()
     try:
         code, resp_body = await loop.run_in_executor(None, _do)
-        print(f"[heartbeat] HTTP {code}: {resp_body[:200]}")
+        print(f"[heartbeat] HTTP {code}: {_redact_secrets(resp_body)[:200]}")
         if code == 200:
             try:
                 device_auth_token = json.loads(resp_body).get("auth_token", "")
@@ -1499,10 +1506,10 @@ async def _post_heartbeat(payload: dict) -> tuple[bool, str, str]:
     except urllib.error.HTTPError as exc:
         body_str = ""
         try:
-            body_str = exc.read().decode()[:200]
+            body_str = exc.read().decode()
         except Exception:
             pass
-        print(f"[heartbeat] HTTP {exc.code}: {body_str}")
+        print(f"[heartbeat] HTTP {exc.code}: {_redact_secrets(body_str)[:200]}")
         if exc.code in (401, 403):
             return False, "Token rejected by SchoolAir Cloud", ""
         return False, f"Server error HTTP {exc.code}", ""
@@ -1510,6 +1517,53 @@ async def _post_heartbeat(payload: dict) -> tuple[bool, str, str]:
         return False, f"Could not reach SchoolAir Cloud: {exc.reason}", ""
     except Exception as exc:
         return False, f"Heartbeat failed: {exc}", ""
+
+
+
+async def register_and_save(reg: dict, ssid: "str | None", current_wifi: "str | None", via: str) -> tuple[bool, str]:
+    """Register with the server and save the result as run_registration() does.
+    The Bluetooth flow and ssh_register.py (registration over SSH) both use it.
+
+    reg: token, nickname, site, environment, migrate (optional).
+    ssid: the network joined for this registration (its profile is committed),
+    or None when registering over the network the device is already on
+    (current_wifi, recorded as the SSID). Returns (ok, friendly error message).
+    """
+    success, hb_msg, device_auth_token = await _post_heartbeat({
+        "token":       reg["token"],
+        "mac_address": _get_mac_address(),
+        "cpu_serial":  _get_cpu_serial(),
+        "nickname":    reg["nickname"],
+        "migrate":     reg.get("migrate", False),
+        "new_asset":   {"nickname": reg["nickname"], "type": reg["environment"],
+                        "site_name": reg.get("site") or None},
+    })
+    if not success:
+        return False, _friendly_error(hb_msg)
+
+    if ssid is not None:
+        await _commit_wifi_profile(ssid)
+    write_status({
+        "token":         reg["token"],
+        "site":          reg.get("site") or "",
+        "asset_name":    reg["nickname"],
+        "environment":   reg["environment"],
+        "ssid":          ssid or current_wifi,
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+        "via":           via,
+    })
+    try:
+        _write_auth_token(reg["token"])
+        if device_auth_token:
+            _write_new_auth_token(device_auth_token)
+    except Exception as e:
+        print(f"[register] warning: could not write tokens: {e}")
+    _bind_identity()
+    try:
+        os.remove(STAGING_FILE)
+    except FileNotFoundError:
+        pass
+    return True, ""
 
 
 # ── State helper ──────────────────────────────────────────────────────────────

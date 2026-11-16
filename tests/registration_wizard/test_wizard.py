@@ -11,6 +11,8 @@ so that wizard.py's bare `from config import ...` resolves correctly.
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import json
+
 import pytest
 import wizard
 
@@ -430,3 +432,81 @@ async def test_step1_without_mismatch_has_no_identity_banner(net, monkeypatch, t
     request.args.get.return_value = None
     body = (await wizard.index(request)).body.decode()
     assert "different SchoolAir device" not in body
+
+
+# ── Secrets never reach the log ───────────────────────────────────────────────
+
+async def test_registration_log_does_not_contain_the_auth_token(monkeypatch, capsys):
+    """The register response carries the device's auth_token; the journal is on
+    the SD card since 2.3.21, so it must not be printed."""
+    secret = "c1d8398d8c31b58a3074d2b3200fc4f7"
+    body = json.dumps({"message": "Device registration success", "auth_token": secret, "device_id": 4})
+
+    class Resp:
+        status = 200
+        def read(self): return body.encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(wizard.urllib.request, "urlopen", lambda *a, **k: Resp())
+    ok, _, token = await wizard._post_heartbeat({"token": "prov-tok", "mac_address": "aa"})
+
+    out = capsys.readouterr().out
+    assert ok and token == secret            # still handed to the caller
+    assert secret not in out
+    assert '"auth_token": "<redacted>"' in out and "device_id" in out
+
+
+def test_redact_secrets_blanks_every_secret_field():
+    text = '{"token": "t1", "password": "p", "device_token": "d", "site": "Trinitat Nova"}'
+    out = wizard._redact_secrets(text)
+    assert "t1" not in out and '"p"' not in out and '"d"' not in out
+    assert "Trinitat Nova" in out
+
+
+# ── _setup_client_profile: SSID and password are shell-quoted ──────────────────
+
+@pytest.mark.parametrize("ssid,password", [
+    ('School "Net"', 'pa"ss; touch /tmp/pwned; "'),
+    ("Guest $(reboot)", "`id` $HOME 'x'"),
+])
+async def test_setup_client_profile_quotes_untrusted_input(monkeypatch, ssid, password):
+    """Both come from a form or a Bluetooth write and run through a root shell."""
+    import shlex
+    commands = []
+
+    async def fake_cmd(cmd):
+        commands.append(cmd)
+        return 0, "", ""
+
+    monkeypatch.setattr(wizard, "_cmd", fake_cmd)
+    assert (await wizard._setup_client_profile(ssid, password))[0]
+
+    argv = shlex.split(commands[-1])
+    assert argv[argv.index("ssid") + 1] == ssid
+    assert argv[argv.index("wifi-sec.psk") + 1] == password
+
+
+async def test_setup_client_profile_open_network_has_no_security(monkeypatch):
+    commands = []
+    monkeypatch.setattr(wizard, "_cmd", AsyncMock(side_effect=lambda c: commands.append(c) or (0, "", "")))
+    await wizard._setup_client_profile("Open Net", "")
+    assert "wifi-sec" not in commands[-1]
+    assert "'Open Net'" in commands[-1]
+
+
+async def test_setup_client_profile_through_a_real_shell(monkeypatch, tmp_path):
+    """End to end through /bin/sh: a hostile password reaches nmcli intact and runs nothing."""
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    args_file, pwned = tmp_path / "args", tmp_path / "pwned"
+    nmcli = fakebin / "nmcli"
+    nmcli.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {args_file}\n')
+    nmcli.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fakebin}:/usr/bin:/bin")
+    password = f'x"; touch {pwned}; echo "$(touch {pwned})`touch {pwned}`'
+
+    assert (await wizard._setup_client_profile("Net", password))[0]
+
+    assert not pwned.exists()
+    assert password in args_file.read_text().splitlines()

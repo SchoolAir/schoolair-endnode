@@ -2,10 +2,10 @@
 
 Incident mode: read the sensor every few seconds while the air is changing
 fast, so a local consumer (the wilting flower) can follow within seconds
-instead of a minute. Found on 2026-09-30, cooking test: with one reading a
+instead of 15 s. Found on 2026-09-30, cooking test: with one reading a
 minute the flower moved in one-minute steps behind the room.
 
-  Normal    — a reading every SAMPLE_INTERVAL (60 s), as before.
+  Normal    — a reading every SAMPLE_INTERVAL (15 s since 2.3.20; 60 s before).
   Incident  — a reading every `sample_seconds` (10 s), entered when a reading
               jumps: PM2.5 more than `pm25_jump_factor` times the previous
               reading, or rising across `pm25_threshold`; CO2 up by
