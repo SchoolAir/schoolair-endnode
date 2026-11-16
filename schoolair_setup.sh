@@ -387,6 +387,32 @@ Unattended-Upgrade::Automatic-Reboot-Time "03:00";
 EOF
 ok "unattended-upgrades: security origins, minimal steps, reboot at 03:00 if needed"
 
+# ── 2c. Bluetooth: Low Energy only ────────────────────────────────────────────
+# Runs in both setup and update mode. Registration is BLE only, and with Classic
+# (BR/EDR) on as well, a computer running BlueZ (Chromium/Chrome on Linux) saw
+# the unit as dual-mode and tried a Classic connection, which the unit never
+# answers: the registration page hung on "connecting" (found 2026-11-16; phones
+# connect over LE and were unaffected). In LE-only mode the advertisement says
+# "BR/EDR not supported". Restarting bluetoothd drops a phone that is connected
+# right now, so only when the setting changes; schoolair-ble restarts by itself.
+step "2c / Bluetooth: Low Energy only"
+BT_CONF=/etc/bluetooth/main.conf
+if [ -f "$BT_CONF" ]; then
+    if grep -qE '^ControllerMode *= *le$' "$BT_CONF"; then
+        ok "bluetoothd already in LE-only mode"
+    else
+        if grep -qE '^#? *ControllerMode *=' "$BT_CONF"; then
+            sed -i -E 's/^#? *ControllerMode *=.*/ControllerMode = le/' "$BT_CONF"
+        else
+            sed -i '0,/^\[General\]/s//[General]\nControllerMode = le/' "$BT_CONF"
+        fi
+        systemctl try-restart bluetooth.service 2>/dev/null || true
+        ok "bluetoothd: LE only (ControllerMode = le)"
+    fi
+else
+    warn "${BT_CONF} not found — Bluetooth left as it is"
+fi
+
 # ── 3. Clone / update SchoolAir app ───────────────────────────────────────────
 step "3 / Clone SchoolAir app  →  ${SCHOOLAIR_DIR}"
 rm -rf "$REPO_DIR"
@@ -1096,6 +1122,7 @@ chk "schoolair-update installed"          test -x /usr/local/bin/schoolair-updat
 chk "schoolair-redetect installed"        test -x /usr/local/bin/schoolair-redetect
 chk "schoolair-bluetooth installed"       test -x /usr/local/bin/schoolair-bluetooth
 chk "Bluetooth tools (bluez)"             command -v btmgmt
+chk "Bluetooth LE only"                   grep -qE '^ControllerMode *= *le$' /etc/bluetooth/main.conf
 chk "dbus-next importable"                python3 -c "import dbus_next"
 chk "schoolair-ble.service installed"     test -f /etc/systemd/system/schoolair-ble.service
 chk "NM hotspot '${AP_CONN}'"             nmcli con show "$AP_CONN"
