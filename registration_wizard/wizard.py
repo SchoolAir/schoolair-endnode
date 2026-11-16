@@ -1519,6 +1519,53 @@ async def _post_heartbeat(payload: dict) -> tuple[bool, str, str]:
         return False, f"Heartbeat failed: {exc}", ""
 
 
+
+async def register_and_save(reg: dict, ssid: "str | None", current_wifi: "str | None", via: str) -> tuple[bool, str]:
+    """Register with the server and save the result as run_registration() does.
+    The Bluetooth flow and ssh_register.py (registration over SSH) both use it.
+
+    reg: token, nickname, site, environment, migrate (optional).
+    ssid: the network joined for this registration (its profile is committed),
+    or None when registering over the network the device is already on
+    (current_wifi, recorded as the SSID). Returns (ok, friendly error message).
+    """
+    success, hb_msg, device_auth_token = await _post_heartbeat({
+        "token":       reg["token"],
+        "mac_address": _get_mac_address(),
+        "cpu_serial":  _get_cpu_serial(),
+        "nickname":    reg["nickname"],
+        "migrate":     reg.get("migrate", False),
+        "new_asset":   {"nickname": reg["nickname"], "type": reg["environment"],
+                        "site_name": reg.get("site") or None},
+    })
+    if not success:
+        return False, _friendly_error(hb_msg)
+
+    if ssid is not None:
+        await _commit_wifi_profile(ssid)
+    write_status({
+        "token":         reg["token"],
+        "site":          reg.get("site") or "",
+        "asset_name":    reg["nickname"],
+        "environment":   reg["environment"],
+        "ssid":          ssid or current_wifi,
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+        "via":           via,
+    })
+    try:
+        _write_auth_token(reg["token"])
+        if device_auth_token:
+            _write_new_auth_token(device_auth_token)
+    except Exception as e:
+        print(f"[register] warning: could not write tokens: {e}")
+    _bind_identity()
+    try:
+        os.remove(STAGING_FILE)
+    except FileNotFoundError:
+        pass
+    return True, ""
+
+
 # ── State helper ──────────────────────────────────────────────────────────────
 
 LED_STATE_FILE = "/run/schoolair-led-state"

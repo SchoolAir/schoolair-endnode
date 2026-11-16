@@ -575,41 +575,10 @@ class Provisioner:
         return True
 
     async def _register(self, ssid: "str | None", reg: dict) -> bool:
-        success, hb_msg, device_auth_token = await backend._post_heartbeat({
-            "token":       reg["token"],
-            "mac_address": backend._get_mac_address(),
-            "cpu_serial":  backend._get_cpu_serial(),
-            "nickname":    reg["nickname"],
-            "migrate":     reg["migrate"],
-            "new_asset":   {"nickname": reg["nickname"], "type": reg["environment"],
-                            "site_name": reg["site"] or None},
-        })
-        if not success:
-            return self._fail("registration_rejected", backend._friendly_error(hb_msg), improv.ERROR_UNKNOWN)
-
         # Saved exactly as run_registration() saves a wizard registration.
-        if ssid is not None:
-            await backend._commit_wifi_profile(ssid)
-        backend.write_status({
-            "token":         reg["token"],
-            "site":          reg["site"],
-            "asset_name":    reg["nickname"],
-            "environment":   reg["environment"],
-            "ssid":          ssid or self.wifi,
-            "registered_at": backend.datetime.now(backend.timezone.utc).isoformat(),
-            "via":           "ble",
-        })
-        try:
-            backend._write_auth_token(reg["token"])
-            if device_auth_token:
-                backend._write_new_auth_token(device_auth_token)
-        except Exception as e:
-            log(f"warning: could not write tokens: {e}")
-        backend._bind_identity()
-        try:
-            os.remove(backend.STAGING_FILE)
-        except FileNotFoundError:
-            pass
+        ok, message = await backend.register_and_save(reg, ssid, self.wifi, via="ble")
+        if not ok:
+            return self._fail("registration_rejected", message, improv.ERROR_UNKNOWN)
         return True
 
     def _fail(self, code: str, message: str, improv_error: int) -> bool:
