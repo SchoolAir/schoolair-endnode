@@ -77,6 +77,7 @@ def reset_ingest_state():
     ingest._verifying.clear()
     ingest.alert_cooldown.clear()
     ingest._sensor_failing     = False
+    ingest._sensor_failing_since = None
     ingest._sensor_lock        = None
     yield
     ingest._alert_buffer.clear()
@@ -93,6 +94,7 @@ def reset_ingest_state():
     ingest._settings_event     = None
     ingest._verifying.clear()
     ingest._sensor_failing     = False
+    ingest._sensor_failing_since = None
     ingest._sensor_lock        = None
 
 
@@ -366,6 +368,33 @@ async def test_run_read_no_signal_on_sensor_error():
 
     assert ingest._pending_live is None
     assert not ingest._live_event.is_set()
+
+
+async def test_run_read_sends_nothing_while_the_sensor_has_only_just_stopped():
+    """Failing for less than SEN6X_MISSING_AFTER_S: one bad read is not a missing sensor."""
+    ingest._live_event = asyncio.Event()
+    ingest._sensor_failing_since = ingest._time_mod.monotonic() - 60
+
+    with patch("jobs.ingest.read_sensor", side_effect=RuntimeError("sensor off")), \
+         patch("jobs.ingest.state"):
+        await _run_read(S, [])
+
+    assert ingest._pending_live is None
+    assert not ingest._live_event.is_set()
+
+
+async def test_run_read_sends_the_units_state_once_the_sensor_is_missing():
+    """No SEN6x for SEN6X_MISSING_AFTER_S (none fitted, or it died): the unit
+    still uploads, without readings, so it keeps hearing from the server."""
+    ingest._live_event = asyncio.Event()
+    ingest._sensor_failing_since = ingest._time_mod.monotonic() - ingest.SEN6X_MISSING_AFTER_S - 1
+
+    with patch("jobs.ingest.read_sensor", side_effect=RuntimeError("sensor off")), \
+         patch("jobs.ingest._note_sen6x"), patch("jobs.ingest.state"):
+        await _run_read(S, [])
+
+    assert ingest._pending_live["data"] == {"unit": {"sensor": None}}
+    assert ingest._live_event.is_set()
 
 
 # ── Temperature offset setting ────────────────────────────────────────────────

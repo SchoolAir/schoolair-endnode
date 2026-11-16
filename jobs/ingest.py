@@ -1255,6 +1255,12 @@ def _note_sen6x(model: str | None, now: float) -> None:
         print(f"[hardware] could not update the hardware record: {e}")
 
 
+def _sen6x_missing() -> bool:
+    """No SEN6x has answered for SEN6X_MISSING_AFTER_S."""
+    return (_sensor_failing_since is not None
+            and _time_mod.monotonic() - _sensor_failing_since >= SEN6X_MISSING_AFTER_S)
+
+
 # The record goes to the server in an upload's body ("hardware") whenever it
 # differs from what the server last accepted: after a start, and after each
 # change (at most a few times a day). The dashboard shows it per unit.
@@ -1346,7 +1352,17 @@ async def _run_read(settings: dict, active_sensors: list):
     data = await _take_sample(active_sensors, recorded_at, keep=True)
     samples, _samples = _samples, []
     if not samples:
-        return  # no successful read this interval: nothing to send
+        if not _sen6x_missing():
+            return  # no successful read this interval: nothing to send
+        # No SEN6x has answered for SEN6X_MISSING_AFTER_S (none fitted, or it
+        # died): upload the unit's own state instead, as the ESP32's sensorless
+        # units do, so it still reports its version and hears the server's
+        # requests (an OTA, Bluetooth on request, a hardware re-check). Without
+        # it such a unit never contacted the server again (found on the
+        # sensorless bench Pi, 2026-11-16).
+        _pending_live = {"data": {"unit": {"sensor": None}}, "recorded_at": recorded_at, "severity": 0}
+        _get_live_event().set()
+        return
 
     entry = {"data": average_readings(samples), "recorded_at": recorded_at, "severity": 0}
 
