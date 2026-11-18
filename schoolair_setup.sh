@@ -899,6 +899,10 @@ if [ -f "${DEPLOY_DIR}/schoolair-first-boot.service" ]; then
     install_with_backup "${DEPLOY_DIR}/schoolair-first-boot.service" /etc/systemd/system/schoolair-first-boot.service
     ok "schoolair-first-boot.service installed"
 fi
+if [ -f "${DEPLOY_DIR}/schoolair-card-config.service" ]; then
+    install_with_backup "${DEPLOY_DIR}/schoolair-card-config.service" /etc/systemd/system/schoolair-card-config.service
+    ok "schoolair-card-config.service installed"
+fi
 
 systemctl daemon-reload
 systemctl enable schoolair-launcher.service
@@ -906,6 +910,7 @@ systemctl enable schoolair-netwatch.service
 systemctl enable schoolair.service
 systemctl enable sen6x.service
 systemctl enable schoolair-first-boot.service 2>/dev/null || true
+systemctl enable schoolair-card-config.service 2>/dev/null || true
 systemctl enable schoolair-pigpio-setup.service 2>/dev/null || true
 systemctl enable schoolair-led.service 2>/dev/null || true
 systemctl enable schoolair-detect-hardware.service 2>/dev/null || true
@@ -1143,6 +1148,7 @@ chk "telemetry venv works"                "${SCHOOLAIR_DIR}/.venv/bin/python" -c
 chk "schoolair.service enabled"           systemctl is-enabled schoolair.service
 chk "sen6x.service enabled"              systemctl is-enabled sen6x.service
 chk "schoolair-first-boot enabled"        systemctl is-enabled schoolair-first-boot.service
+chk "schoolair-card-config enabled"       systemctl is-enabled schoolair-card-config.service
 chk "schoolair_rollback.sh executable"    test -x "${ADMIN_HOME}/schoolair_rollback.sh"
 chk "update-watchdog timer enabled"       systemctl is-enabled schoolair-update-watchdog.timer
 chk "nginx proxies to ${TELEMETRY_PORT}"  grep -q "${TELEMETRY_PORT}" /etc/nginx/sites-available/default

@@ -1,0 +1,20 @@
+[Unit]
+Description=SchoolAir card configuration (schoolair.json from the installer)
+# After first-boot (the unit type is known) and the sensor's start (to report
+# the right sensor when registering); before the launcher, which then finds the
+# unit registered, or falls back to the hotspot and Bluetooth as before.
+After=NetworkManager.service schoolair-first-boot.service sen6x.service
+Wants=NetworkManager.service
+Before=schoolair-launcher.service
+ConditionPathExists=/boot/firmware/schoolair.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -u /home/admin/schoolair/registration_wizard/card_config.py
+TimeoutStartSec=300
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
