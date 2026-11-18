@@ -47,7 +47,9 @@ if echo "$reading" | grep -q '"co2"'; then
     # effect after the next reboot). GPIO14 was for the flower's servo, retired
     # in Rev H; the stepper doesn't need it. Kept because it is harmless and
     # changing the boot console on units in the field is not worth the risk.
-    if grep -q "console=serial0" /boot/firmware/cmdline.txt 2>/dev/null; then
+    # An OTA update (schoolair_setup.sh --update) sets KEEP_CMDLINE=1: the boot
+    # config of a unit already in the field stays as it is.
+    if [ "${KEEP_CMDLINE:-0}" != 1 ] && grep -q "console=serial0" /boot/firmware/cmdline.txt 2>/dev/null; then
         sed -i 's/console=serial0,[0-9]* //' /boot/firmware/cmdline.txt
         log "Serial console disabled (GPIO14 free)"
     fi

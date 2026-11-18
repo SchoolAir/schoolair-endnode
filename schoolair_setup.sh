@@ -571,6 +571,23 @@ else
     fi
 fi
 
+# Indoor or outdoor? Everything indoor-only (pigpiod, the status LED, the
+# flower) hangs off /etc/schoolair-unit-type. first_boot.sh writes it on a
+# golden-image clone's first boot; a fresh install writes it in step 8, right
+# after I2C is turned on. A unit first set up with older firmware has neither,
+# so an update detects it too (I2C is on since setup, and step 7 has stopped
+# sen6x, so the bus is free). Never overwrites a type that is already known.
+ensure_unit_type() {
+    if [ -s /etc/schoolair-unit-type ]; then
+        ok "Unit type already known: $(cat /etc/schoolair-unit-type)"
+    elif KEEP_CMDLINE="$([[ "$MODE" == "--update" ]] && echo 1 || echo 0)" \
+         bash "${SCHOOLAIR_DIR}/detect_unit_type.sh"; then
+        ok "Unit type: $(cat /etc/schoolair-unit-type)"
+    else
+        warn "Sensor not identified — unit type unknown (indoor-only parts are skipped; re-run with the sensor connected)"
+    fi
+}
+
 if [[ "$MODE" == "setup" ]]; then
 
 # ── 8. I2C + baudrate ────────────────────────────────────────────────────────
@@ -578,17 +595,8 @@ step "8 / I2C enable + baudrate"
 raspi-config nonint do_i2c 0
 ok "I2C enabled (takes effect after reboot)"
 
-# Indoor or outdoor? Everything indoor-only (pigpiod, the status LED, the
-# flower) hangs off /etc/schoolair-unit-type, and only first_boot.sh wrote it,
-# on a golden-image clone's first boot. A fresh install never got one. do_i2c
-# above also turns I2C on right away, so the sensor can be probed now.
-if [ -s /etc/schoolair-unit-type ]; then
-    ok "Unit type already known: $(cat /etc/schoolair-unit-type)"
-elif bash "${SCHOOLAIR_DIR}/detect_unit_type.sh"; then
-    ok "Unit type: $(cat /etc/schoolair-unit-type)"
-else
-    warn "Sensor not identified — unit type unknown (indoor-only parts are skipped; re-run setup with the sensor connected)"
-fi
+# do_i2c above also turns I2C on right away, so the sensor can be probed now.
+ensure_unit_type
 
 if   [ -f /boot/firmware/config.txt ]; then CFG=/boot/firmware/config.txt
 elif [ -f /boot/config.txt ];           then CFG=/boot/config.txt
@@ -688,6 +696,7 @@ fi
 
 else
     skip "8–12 / I2C + networking config  (update mode — unchanged since setup)"
+    ensure_unit_type
 fi
 
 # ── 13. nginx ─────────────────────────────────────────────────────────────────
