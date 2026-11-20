@@ -1,7 +1,7 @@
 """tests/registration_wizard/test_card_config.py
 
-registration_wizard/card_config.py: the installer's schoolair.json on first
-boot, with the system commands, the server and the wizard helpers mocked.
+registration_wizard/card_config.py: the setup file on the card's boot
+partition (schoolair_config.json, or the earlier schoolair.json) on first boot, with the system commands, the server and the wizard helpers mocked.
 """
 
 import json
@@ -18,6 +18,12 @@ CARD = {
     "hostname": "schoolair-26B18-40ed",
     "wifi": {"country": "es", "networks": [{"ssid": "SchoolNet", "psk": PSK}]},
     "register": {"asset": " Room 12 ", "site": "Main Campus", "invite": INVITE},
+}
+KEY = "Kx9_single-use-token"
+PORTAL = {
+    "one_time_key": KEY, "building": "Main Campus", "room": " Room 12 ",
+    "wifi_name": "SchoolNet", "wifi_password": PSK,
+    "wifi_country": "es", "hostname": "schoolair-26B18-40ed",
 }
 STATUS = {"tokens": [{"state": "used"}, {"state": "unused"}, {"state": "unused"}]}
 
@@ -70,16 +76,77 @@ def test_take_card_file_reads_then_deletes(tmp_path):
     assert not f.exists()
 
 
-def test_take_card_file_absent(tmp_path):
-    assert cc.take_card_file(str(tmp_path / "none.json")) is None
+def test_take_card_files_absent(tmp_path):
+    (tmp_path / "config.txt").write_text("x")
+    assert cc.take_card_files(str(tmp_path)) is None
 
 
-def test_take_card_file_deletes_even_invalid_json(tmp_path):
-    f = tmp_path / "schoolair.json"
+def test_take_card_files_deletes_even_invalid_json(tmp_path):
+    f = tmp_path / "schoolair_config.json"
     f.write_text("{not json")
     with pytest.raises(ValueError):
-        cc.take_card_file(str(f))
+        cc.take_card_files(str(tmp_path))
     assert not f.exists()
+
+
+def test_take_card_files_reads_a_renamed_download(tmp_path):
+    f = tmp_path / "schoolair_config (1).json"
+    f.write_text(json.dumps(PORTAL))
+    assert cc.take_card_files(str(tmp_path)) == ("schoolair_config (1).json", PORTAL)
+    assert not f.exists()
+
+
+def test_take_card_files_uses_the_newest_and_deletes_all(tmp_path):
+    import os
+    old, new, legacy = (tmp_path / n for n in
+                        ("schoolair_config.json", "schoolair_config (1).json", "schoolair.json"))
+    old.write_text(json.dumps({**PORTAL, "room": "Old"}))
+    legacy.write_text(json.dumps(CARD))
+    new.write_text(json.dumps(PORTAL))
+    for age, f in ((300, old), (200, legacy), (100, new)):
+        t = 1_700_000_000 - age
+        os.utime(f, (t, t))
+    name, data = cc.take_card_files(str(tmp_path))
+    assert name == "schoolair_config (1).json" and data["room"] == " Room 12 "
+    assert list(tmp_path.iterdir()) == []
+
+
+# ── the portal's form ─────────────────────────────────────────────────────────
+
+def test_validate_portal_form():
+    assert cc.validate(PORTAL) == {
+        "hostname": "schoolair-26B18-40ed", "country": "ES",
+        "networks": [{"ssid": "SchoolNet", "psk": PSK}],
+        "register": {"asset": "Room 12", "site": "Main Campus", "invite": KEY, "environment": None},
+    }
+
+
+def test_validate_portal_form_as_the_portal_writes_it():
+    """Only the five fields the page writes; an open network has no password."""
+    cfg = cc.validate({"one_time_key": KEY, "building": "", "room": "Lab",
+                       "wifi_name": "Open", "wifi_password": ""})
+    assert cfg["hostname"] is None and cfg["country"] is None
+    assert cfg["networks"] == [{"ssid": "Open", "psk": ""}]
+    assert cfg["register"]["site"] == "" and cfg["register"]["asset"] == "Lab"
+
+
+def test_validate_portal_form_wifi_only():
+    cfg = cc.validate({"wifi_name": "SchoolNet", "wifi_password": PSK})
+    assert cfg["register"] is None and len(cfg["networks"]) == 1
+
+
+@pytest.mark.parametrize("card, message", [
+    ({"one_time_key": KEY}, "room is missing"),
+    ({"room": "A", "environment": "space"}, "indoor or outdoor"),
+    ({"wifi_name": "A", "wifi_password": "short"}, "wifi_password must be 8 to 63"),
+    ({"wifi_name": "x" * 33}, "wifi_name must be 1 to 32 bytes"),
+    ({"wifi_country": "ESP"}, "wifi_country"),
+    ({"hostname": "bad host"}, "hostname"),
+    ({"room": 12}, "room must be text"),
+])
+def test_validate_portal_form_rejects(card, message):
+    with pytest.raises(cc.Invalid, match=message):
+        cc.validate(card)
 
 
 # ── Wi-Fi ─────────────────────────────────────────────────────────────────────
@@ -108,10 +175,12 @@ def test_apply_wifi_reports_a_failed_profile(monkeypatch, capsys):
 @pytest.fixture
 def card(tmp_path, monkeypatch):
     """schoolair.json on the 'boot partition'; system steps and registration mocked."""
-    f = tmp_path / "schoolair.json"
+    boot = tmp_path / "boot"
+    boot.mkdir()
+    f = boot / "schoolair.json"
     f.write_text(json.dumps(CARD))
     record = tmp_path / "state" / "card-config.json"
-    monkeypatch.setattr(cc, "CARD_FILE", str(f))
+    monkeypatch.setattr(cc, "BOOT_DIR", str(boot))
     monkeypatch.setattr(cc, "RECORD_FILE", str(record))
     mocks = {
         "apply_hostname": MagicMock(return_value=True),
@@ -120,7 +189,7 @@ def card(tmp_path, monkeypatch):
     }
     for name, mock in mocks.items():
         monkeypatch.setattr(cc, name, mock)
-    return {"file": f, "record": record, **mocks}
+    return {"file": f, "boot": boot, "record": record, **mocks}
 
 
 async def test_applies_everything_and_records_no_secrets(card, capsys):
@@ -135,6 +204,23 @@ async def test_applies_everything_and_records_no_secrets(card, capsys):
                                              "registered": True, "error": None}
     out = capsys.readouterr().out
     for secret in (PSK, "aaa.bbb.ccc"):
+        assert secret not in record and secret not in out
+
+
+async def test_applies_the_portal_form(card, capsys):
+    card["file"].unlink()
+    f = card["boot"] / "schoolair_config.json"
+    f.write_text(json.dumps(PORTAL))
+    assert await cc.main_async() == 0
+    assert not f.exists()
+    card["apply_hostname"].assert_called_once_with("schoolair-26B18-40ed")
+    card["apply_wifi"].assert_called_once_with("ES", [{"ssid": "SchoolNet", "psk": PSK}])
+    assert card["register"].call_args.args[0] == {"asset": "Room 12", "site": "Main Campus",
+                                                  "invite": KEY, "environment": None}
+    record = card["record"].read_text()
+    assert json.loads(record)["file"] == "schoolair_config.json"
+    out = capsys.readouterr().out
+    for secret in (PSK, KEY):
         assert secret not in record and secret not in out
 
 

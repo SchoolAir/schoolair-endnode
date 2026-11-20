@@ -134,7 +134,7 @@ step "Removing the flower-fitted marker"
 # flower's driver board; left here, every clone of this image would think it has a flower.
 sudo rm -f /etc/schoolair-flower-fitted /var/lib/schoolair/hardware.json /var/lib/schoolair/hardware.json.lock
 # A card configuration belongs to one unit (the installer adds a fresh one per card).
-sudo rm -f /boot/firmware/schoolair.json /var/lib/schoolair/card-config.json
+sudo rm -f /boot/firmware/schoolair.json /boot/firmware/schoolair_config*.json /var/lib/schoolair/card-config.json
 ok "/etc/schoolair-flower-fitted and the hardware record removed — each clone checks its own hardware"
 
 # ── 9. SSH host keys ──────────────────────────────────────────────────────────

@@ -383,25 +383,37 @@ through:
 After registration the wizard writes `AUTH_TOKEN` to `.env`, restarts
 `schoolair.service`, and exits. nginx activates to proxy port 80 → port 8080.
 
-### From the installer's card file
+### From the card's setup file
 
-The SchoolAir installer writes the same image to every card and adds one file
-per unit to the boot partition, `/boot/firmware/schoolair.json`: the hostname,
-the Wi-Fi country and networks, and the asset, site and (optionally) an invite
-link. `schoolair-card-config.service` runs `registration_wizard/card_config.py`
+Every card holds the same image; one small file per unit on the boot partition
+(FAT, writable from any computer) says what makes it that unit. The school
+portal (schoolair.org/install) writes it, or has the person drag it onto the
+card, and the SchoolAir Installer writes it with the image:
+
+```json
+/boot/firmware/schoolair_config.json
+{"one_time_key": "<single-use registration token>",
+ "building": "Main Campus", "room": "Room 12",
+ "wifi_name": "SchoolNet", "wifi_password": "...",
+ "wifi_country": "ES", "hostname": "schoolair-26B18-40ed", "environment": "indoor"}
+```
+
+Any `schoolair_config*.json` is read (a browser saves a second download as
+`schoolair_config (1).json`); the last three fields are optional extras.
+The earlier form, `/boot/firmware/schoolair.json` with `"version": 1`, still
+works. `schoolair-card-config.service` runs `registration_wizard/card_config.py`
 once, after first-boot and before the launcher:
 
 1. reads the file and deletes it at once (it holds the Wi-Fi password and the
-   invite link);
-2. sets the hostname (`set_hostname.sh`), the Wi-Fi country and the networks
-   (saved as the wizard saves them, the first listed preferred);
-3. with an invite link, registers with its next unused registration, as
+   key); with several, the newest is used and all are deleted;
+2. sets the hostname (`set_hostname.sh`), the Wi-Fi country and network
+   (saved as the wizard saves them);
+3. with a key, registers the unit as the room in the building, as
    `ssh_register.py` does (`via: "card"`).
 
 What was applied, without the secrets, is kept in
-`/var/lib/schoolair/card-config.json`. Without an invite link, or if
-registration fails, the launcher finds no token and opens the hotspot and
-Bluetooth as usual.
+`/var/lib/schoolair/card-config.json`. Without a key, or if registration fails,
+the launcher finds no token and opens the hotspot and Bluetooth as usual.
 
 ### Over Bluetooth
 
