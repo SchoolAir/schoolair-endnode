@@ -49,6 +49,8 @@ def test_validate_minimal():
     ([], "version"),
     ({"version": 1, "hostname": "bad host"}, "hostname"),
     ({"version": 1, "hostname": "-x"}, "hostname"),
+    ({"version": 1, "hostname": "my-pi"}, "SchoolAir's pattern"),
+    ({"version": 1, "hostname": "schoolair-26D18-40ed"}, "SchoolAir's pattern"),
     ({"version": 1, "wifi": {"country": "ESP"}}, "country"),
     ({"version": 1, "wifi": {"networks": [{"psk": "12345678"}]}}, "ssid is missing"),
     ({"version": 1, "wifi": {"networks": [{"ssid": "x" * 33}]}}, "1 to 32 bytes"),

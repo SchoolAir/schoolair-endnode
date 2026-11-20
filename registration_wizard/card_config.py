@@ -64,7 +64,9 @@ SET_HOSTNAME = "/home/admin/set_hostname.sh"
 UNIT_TYPE_FILE = "/etc/schoolair-unit-type"
 NETWORK_WAIT_S = 120
 
-_HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+# SchoolAir's own pattern only (set_hostname.sh: schoolair-YYMDD-XXXX, the month
+# in hex): a unit stays recognisable in a network scan, so no other name is applied.
+_HOSTNAME = re.compile(r"^schoolair-[0-9]{2}[1-9A-C][0-9]{2}-[0-9a-f]{4}$")
 
 
 class Invalid(ValueError):
@@ -85,7 +87,7 @@ def _hostname(hn):
     if hn is None or hn == "":
         return None
     if not isinstance(hn, str) or not _HOSTNAME.match(hn):
-        raise Invalid("hostname is not a valid hostname")
+        raise Invalid("hostname must follow SchoolAir's pattern, schoolair-YYMDD-XXXX")
     return hn
 
 

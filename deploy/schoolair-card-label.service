@@ -1,0 +1,15 @@
+[Unit]
+Description=SchoolAir card label (schoolair-unit.json on the boot partition)
+# After card-config, which may have just registered the unit or renamed it.
+After=schoolair-first-boot.service schoolair-card-config.service
+Before=schoolair-launcher.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -u /home/admin/schoolair/registration_wizard/card_label.py
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

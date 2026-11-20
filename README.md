@@ -415,6 +415,21 @@ What was applied, without the secrets, is kept in
 `/var/lib/schoolair/card-config.json`. Without a key, or if registration fails,
 the launcher finds no token and opens the hotspot and Bluetooth as usual.
 
+### The card's label
+
+`registration_wizard/card_label.py` keeps `/boot/firmware/schoolair-unit.json`
+on the boot partition: the SchoolAir version, hostname, CPU serial and short
+ID, whether the unit reads `schoolair_config.json`, and whether it is
+registered, with the asset and site it was registered as. No tokens or Wi-Fi
+passwords. Any computer can read it, so the SchoolAir Installer can tell a
+SchoolAir card (registered or not) from an empty card or plain Raspberry Pi OS
+before offering to erase it. `schoolair-card-label.service` refreshes it at
+every start, the wizard after each registration, and `prepare_image.sh` leaves
+a `"new": true` label on the golden image.
+
+The hostname in a setup file is applied only if it follows SchoolAir's own
+pattern (`schoolair-YYMDD-XXXX`), so units stay recognisable in a network scan.
+
 ### Over Bluetooth
 
 While the wizard runs, `schoolair-ble.service` also advertises the device as
