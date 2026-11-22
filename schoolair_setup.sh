@@ -1067,7 +1067,8 @@ if [[ "$MODE" == "--update" ]]; then
     # at the LED. One retry covers a transient (e.g. pigpiod not ready yet
     # on this same first activation); a persistent failure just gets a
     # clear warning instead of update failure.
-    if ! systemctl is-active --quiet schoolair-led.service; then
+    # A flower unit has no LED: its unit's condition keeps it off there.
+    if [ ! -e /etc/schoolair-flower-fitted ] && ! systemctl is-active --quiet schoolair-led.service; then
         systemctl restart schoolair-led.service 2>/dev/null || true
         sleep 3
         systemctl is-active --quiet schoolair-led.service \
