@@ -80,6 +80,13 @@ if [ -z "$hi" ]; then
     touch "$FLOWER_MARKER"
     record yes
     log "ULN2003 driver found on GPIO${lo# } — flower fitted"
+    # The status LED must not run beside the flower (see schoolair-led.service).
+    # At boot it starts before this detection, so stop it now; its unit's
+    # condition keeps it off from the next start on.
+    if "$SYSTEMCTL" is-active --quiet schoolair-led.service 2>/dev/null; then
+        "$SYSTEMCTL" stop schoolair-led.service 2>/dev/null \
+            && log "flower fitted — status LED service stopped" || true
+    fi
     exit 0
 elif [ -z "$lo" ]; then
     rm -f "$FLOWER_MARKER"
