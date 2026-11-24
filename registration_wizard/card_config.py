@@ -291,6 +291,16 @@ async def wait_for_network(timeout: int = NETWORK_WAIT_S) -> bool:
     return False
 
 
+def why_unusable(status: dict) -> str:
+    """Why none of the key's registrations can be used, from invite-status."""
+    states = {t.get("state") for t in status.get("tokens", [])}
+    if states <= {"invalid"}:
+        return "SchoolAir doesn't know this key (from another SchoolAir server, or mistyped)"
+    if states <= {"expired", "invalid"}:
+        return "the key has expired: make a new one"
+    return "the key has already been used"
+
+
 async def register(reg: dict) -> "tuple[bool, str]":
     """Registers with the invite link's next unused registration, as ssh_register does."""
     tokens = ssh_register.parse_invite(reg["invite"])
@@ -308,7 +318,7 @@ async def register(reg: dict) -> "tuple[bool, str]":
         status = ssh_register.invite_status(tokens)
         token = ssh_register.next_unused(tokens, status, tried)
         if token is None:
-            return False, message or "every registration in the invite link has been used"
+            return False, message or why_unusable(status)
         tried.add(token)
         valid, vmsg = await backend._validate_token(token)
         if not valid:

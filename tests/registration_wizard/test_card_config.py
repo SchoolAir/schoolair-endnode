@@ -310,7 +310,7 @@ async def test_gives_up_after_two(unit):
 async def test_all_registrations_used(unit):
     unit["invite_status"].return_value = {"tokens": [{"state": "used"}] * 3}
     ok, why = await cc.register(REG)
-    assert not ok and "every registration" in why
+    assert not ok and "already been used" in why
     unit["register_and_save"].assert_not_called()
 
 
@@ -324,3 +324,13 @@ async def test_already_registered_is_left_alone(unit):
 async def test_server_unreachable(unit, monkeypatch):
     monkeypatch.setattr(cc, "wait_for_network", AsyncMock(return_value=False))
     assert await cc.register(REG) == (False, "SchoolAir could not be reached")
+
+
+@pytest.mark.parametrize("states, words", [
+    (["invalid"], "doesn't know this key"),
+    (["expired"], "expired"),
+    (["expired", "invalid"], "expired"),
+    (["used", "expired"], "already been used"),
+])
+def test_why_unusable(states, words):
+    assert words in cc.why_unusable({"tokens": [{"state": s} for s in states]})
