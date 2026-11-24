@@ -295,7 +295,29 @@ fi
 # ── 2. System packages ─────────────────────────────────────────────────────────
 if [[ "$MODE" == "setup" ]]; then
     step "2 / System packages"
-    apt-get update -qq
+    # A Pi has no clock battery: until it syncs, its clock can be weeks behind,
+    # and apt then rejects the package lists' signatures ("not live until"),
+    # keeps the image's old lists, and fails to fetch versions since replaced
+    # (seen on a converted Trixie card, 2026-11-24). Wait for the clock; if the
+    # network blocks NTP, take the time from an HTTPS server's Date header.
+    _synced() { [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == yes ]]; }
+    for _i in $(seq 1 30); do _synced && break; sleep 2; done
+    if _synced; then
+        ok "Clock synchronised: $(date -u '+%F %T') UTC"
+    else
+        _http_date=$(curl -fsSI --max-time 10 https://deb.debian.org 2>/dev/null | tr -d '\r' | sed -n 's/^[Dd]ate: //p' | head -1)
+        if [[ -n "$_http_date" ]] && date -s "$_http_date" >/dev/null 2>&1; then
+            ok "Clock set from the web (NTP not synchronised yet): $(date -u '+%F %T') UTC"
+        else
+            warn "Clock not synchronised: package lists may be rejected"
+        fi
+    fi
+    # Stale lists make the install fail later with 404s: fail here instead, clearly.
+    _apt_out=$(apt-get update 2>&1) || true
+    if grep -qE '^(W|E): .*(signature|InRelease|Release file)' <<<"$_apt_out"; then
+        echo "$_apt_out" | grep -E '^(W|E):' >&2
+        die "apt-get update could not refresh the package lists (see above): check the clock and the network, then run the setup again"
+    fi
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
         git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades bluez
     ok "git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades bluez"
