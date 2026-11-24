@@ -23,6 +23,7 @@ def unit(tmp_path, monkeypatch):
     monkeypatch.setattr(cl, "_identity", lambda: ("00000000a1b2c3d4", "K3F9Q"))
     monkeypatch.setattr(cl, "_version", lambda: "2.3.27")
     monkeypatch.setattr(cl.socket, "gethostname", lambda: "schoolair-26B18-40ed")
+    monkeypatch.setattr(cl, "_wifi_networks", lambda: ["SchoolNet"])
     return {"env": env, "status": status, "label": tmp_path / "schoolair-unit.json"}
 
 
@@ -44,7 +45,7 @@ def test_registered_says_as_what_without_secrets(unit):
     label = json.loads(text)
     assert label["registered"] is True
     assert (label["asset"], label["site"]) == ("Room 12", "Main")
-    for secret in ("tok-secret", "dev-secret", "SchoolNet"):
+    for secret in ("tok-secret", "dev-secret"):  # network names may show, never tokens
         assert secret not in text
 
 
@@ -69,3 +70,21 @@ def test_not_rewritten_when_unchanged(unit):
 
 def test_never_raises(unit, tmp_path):
     assert cl.write(path=str(tmp_path / "missing-dir" / "label.json")) is False
+
+
+def test_wifi_networks_from_nmcli(monkeypatch):
+    """Client profiles only, most preferred first; the setup hotspot left out."""
+    profiles = {
+        ("-t", "-f", "NAME,TYPE,AUTOCONNECT-PRIORITY", "connection", "show"):
+            "SchoolAir_AP:802-11-wireless:0\nwifi-Guest:802-11-wireless:5\n"
+            "wifi-School\\:Net:802-11-wireless:20\nWired:802-3-ethernet:0\n",
+        ("-g", "802-11-wireless.ssid,802-11-wireless.mode", "connection", "show", "SchoolAir_AP"): "SchoolAir_Setup\nap\n",
+        ("-g", "802-11-wireless.ssid,802-11-wireless.mode", "connection", "show", "wifi-Guest"): "Guest\ninfrastructure\n",
+        ("-g", "802-11-wireless.ssid,802-11-wireless.mode", "connection", "show", "wifi-School:Net"): "School:Net\ninfrastructure\n",
+    }
+    monkeypatch.setattr(cl, "_nmcli", lambda *a: profiles.get(a, ""))
+    assert cl._wifi_networks() == ["School:Net", "Guest"]
+
+
+def test_label_lists_saved_networks(unit):
+    assert cl.build()["wifi_networks"] == ["SchoolNet"]
