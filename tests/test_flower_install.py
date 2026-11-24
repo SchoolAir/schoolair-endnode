@@ -306,3 +306,35 @@ def test_the_led_waits_for_pigpiod_instead_of_crash_looping():
     assert "ConditionPathExists=/var/lib/schoolair-pigpio-installed" in led
     unit = (ROOT / "deploy/schoolair-pigpio-setup.service").read_text()
     assert unit.index("touch /var/lib/schoolair-pigpio-installed") < unit.index("systemctl start schoolair-led.service")
+
+
+# ── No status LED beside the flower (2026-11-22) ─────────────────────────────
+
+def test_led_service_never_starts_on_a_flower_unit():
+    """The LED's pigpio waves replaced the flower's step pattern mid-move on the
+    bench unit; the flower MVP has no LED, so the unit must not run there."""
+    led = (ROOT / "deploy/schoolair-led.service").read_text()
+    assert "ConditionPathExists=!/etc/schoolair-flower-fitted" in led.split("[Service]")[0]
+
+
+def test_detecting_the_flower_stops_a_running_led_service(tmp_path):
+    pinctrl = tmp_path / "pinctrl"
+    pinctrl.write_text('#!/bin/sh\n[ "$1" = get ] && echo "17: ip pu | lo // GPIO"\nexit 0\n')
+    pinctrl.chmod(0o755)
+    calls = tmp_path / "calls"
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n'
+                         '[ "$1 $3" = "is-active schoolair-led.service" ] && exit 0\nexit 3\n')
+    systemctl.chmod(0o755)
+    marker = tmp_path / "fitted"
+    env = {**os.environ, "PINCTRL": str(pinctrl), "SYSTEMCTL": str(systemctl),
+           "FLOWER_MARKER": str(marker), "HW_RECORD": str(tmp_path / "none.py")}
+    r = subprocess.run(["bash", str(ROOT / "detect_flower.sh")], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert marker.exists()
+    assert "stop schoolair-led.service" in calls.read_text()
+
+
+def test_update_does_not_restart_the_led_on_a_flower_unit():
+    check = SETUP[SETUP.index("# A flower unit has no LED"):]
+    assert check.index("[ ! -e /etc/schoolair-flower-fitted ]") < check.index("systemctl restart schoolair-led.service")

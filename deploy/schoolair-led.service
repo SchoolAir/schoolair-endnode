@@ -20,6 +20,13 @@ Description=SchoolAir: status LED (breathing/blink patterns via pigpiod)
 # needs no network and nothing else from the normal boot, only pigpiod
 # (which schoolair's pigpiod-early drop-in likewise starts early).
 ConditionPathExists=/etc/schoolair-unit-type
+# Not on flower units: the flower MVP has no LED (its movements are the status
+# signal), and the LED's pigpio waves share pigpiod with the stepper. On
+# 2026-11-22 the LED service replaced the flower's step pattern mid-move on
+# the bench unit, losing its position (Martin: "the LED service should not be
+# active as we don't use it in this version"). The unit stays enabled, so it
+# comes back by itself if the flower is ever removed (detect_flower.sh).
+ConditionPathExists=!/etc/schoolair-flower-fitted
 ConditionPathExists=/var/lib/schoolair-pigpio-installed
 DefaultDependencies=no
 Wants=pigpiod.service

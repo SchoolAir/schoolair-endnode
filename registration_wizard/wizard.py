@@ -1082,8 +1082,19 @@ def _bind_identity() -> None:
         print(f"[wizard] Device identity saved (serial={serial} mac={mac})")
     except Exception as e:
         print(f"[wizard] Warning: could not save device identity: {e}")
-        return
-    device_identity.clear_mismatch()
+    else:
+        device_identity.clear_mismatch()
+    _refresh_card_label()
+
+
+def _refresh_card_label() -> None:
+    """The label on the boot partition now says registered, and as what
+    (card_label.py). Never raises."""
+    try:
+        import card_label
+        card_label.write()
+    except Exception as e:
+        print(f"[wizard] Warning: could not update the card label: {e}")
 
 
 def _identity_mismatch_html() -> str:

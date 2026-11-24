@@ -295,7 +295,29 @@ fi
 # ── 2. System packages ─────────────────────────────────────────────────────────
 if [[ "$MODE" == "setup" ]]; then
     step "2 / System packages"
-    apt-get update -qq
+    # A Pi has no clock battery: until it syncs, its clock can be weeks behind,
+    # and apt then rejects the package lists' signatures ("not live until"),
+    # keeps the image's old lists, and fails to fetch versions since replaced
+    # (seen on a converted Trixie card, 2026-11-24). Wait for the clock; if the
+    # network blocks NTP, take the time from an HTTPS server's Date header.
+    _synced() { [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == yes ]]; }
+    for _i in $(seq 1 30); do _synced && break; sleep 2; done
+    if _synced; then
+        ok "Clock synchronised: $(date -u '+%F %T') UTC"
+    else
+        _http_date=$(curl -fsSI --max-time 10 https://deb.debian.org 2>/dev/null | tr -d '\r' | sed -n 's/^[Dd]ate: //p' | head -1)
+        if [[ -n "$_http_date" ]] && date -s "$_http_date" >/dev/null 2>&1; then
+            ok "Clock set from the web (NTP not synchronised yet): $(date -u '+%F %T') UTC"
+        else
+            warn "Clock not synchronised: package lists may be rejected"
+        fi
+    fi
+    # Stale lists make the install fail later with 404s: fail here instead, clearly.
+    _apt_out=$(apt-get update 2>&1) || true
+    if grep -qE '^(W|E): .*(signature|InRelease|Release file)' <<<"$_apt_out"; then
+        echo "$_apt_out" | grep -E '^(W|E):' >&2
+        die "apt-get update could not refresh the package lists (see above): check the clock and the network, then run the setup again"
+    fi
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
         git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades bluez
     ok "git python3-pip python3-venv i2c-tools nginx avahi-daemon gcc make unattended-upgrades bluez"
@@ -571,6 +593,23 @@ else
     fi
 fi
 
+# Indoor or outdoor? Everything indoor-only (pigpiod, the status LED, the
+# flower) hangs off /etc/schoolair-unit-type. first_boot.sh writes it on a
+# golden-image clone's first boot; a fresh install writes it in step 8, right
+# after I2C is turned on. A unit first set up with older firmware has neither,
+# so an update detects it too (I2C is on since setup, and step 7 has stopped
+# sen6x, so the bus is free). Never overwrites a type that is already known.
+ensure_unit_type() {
+    if [ -s /etc/schoolair-unit-type ]; then
+        ok "Unit type already known: $(cat /etc/schoolair-unit-type)"
+    elif KEEP_CMDLINE="$([[ "$MODE" == "--update" ]] && echo 1 || echo 0)" \
+         bash "${SCHOOLAIR_DIR}/detect_unit_type.sh"; then
+        ok "Unit type: $(cat /etc/schoolair-unit-type)"
+    else
+        warn "Sensor not identified — unit type unknown (indoor-only parts are skipped; re-run with the sensor connected)"
+    fi
+}
+
 if [[ "$MODE" == "setup" ]]; then
 
 # ── 8. I2C + baudrate ────────────────────────────────────────────────────────
@@ -578,17 +617,8 @@ step "8 / I2C enable + baudrate"
 raspi-config nonint do_i2c 0
 ok "I2C enabled (takes effect after reboot)"
 
-# Indoor or outdoor? Everything indoor-only (pigpiod, the status LED, the
-# flower) hangs off /etc/schoolair-unit-type, and only first_boot.sh wrote it,
-# on a golden-image clone's first boot. A fresh install never got one. do_i2c
-# above also turns I2C on right away, so the sensor can be probed now.
-if [ -s /etc/schoolair-unit-type ]; then
-    ok "Unit type already known: $(cat /etc/schoolair-unit-type)"
-elif bash "${SCHOOLAIR_DIR}/detect_unit_type.sh"; then
-    ok "Unit type: $(cat /etc/schoolair-unit-type)"
-else
-    warn "Sensor not identified — unit type unknown (indoor-only parts are skipped; re-run setup with the sensor connected)"
-fi
+# do_i2c above also turns I2C on right away, so the sensor can be probed now.
+ensure_unit_type
 
 if   [ -f /boot/firmware/config.txt ]; then CFG=/boot/firmware/config.txt
 elif [ -f /boot/config.txt ];           then CFG=/boot/config.txt
@@ -688,6 +718,7 @@ fi
 
 else
     skip "8–12 / I2C + networking config  (update mode — unchanged since setup)"
+    ensure_unit_type
 fi
 
 # ── 13. nginx ─────────────────────────────────────────────────────────────────
@@ -890,6 +921,14 @@ if [ -f "${DEPLOY_DIR}/schoolair-first-boot.service" ]; then
     install_with_backup "${DEPLOY_DIR}/schoolair-first-boot.service" /etc/systemd/system/schoolair-first-boot.service
     ok "schoolair-first-boot.service installed"
 fi
+if [ -f "${DEPLOY_DIR}/schoolair-card-config.service" ]; then
+    install_with_backup "${DEPLOY_DIR}/schoolair-card-config.service" /etc/systemd/system/schoolair-card-config.service
+    ok "schoolair-card-config.service installed"
+fi
+if [ -f "${DEPLOY_DIR}/schoolair-card-label.service" ]; then
+    install_with_backup "${DEPLOY_DIR}/schoolair-card-label.service" /etc/systemd/system/schoolair-card-label.service
+    ok "schoolair-card-label.service installed"
+fi
 
 systemctl daemon-reload
 systemctl enable schoolair-launcher.service
@@ -897,6 +936,8 @@ systemctl enable schoolair-netwatch.service
 systemctl enable schoolair.service
 systemctl enable sen6x.service
 systemctl enable schoolair-first-boot.service 2>/dev/null || true
+systemctl enable schoolair-card-config.service 2>/dev/null || true
+systemctl enable schoolair-card-label.service 2>/dev/null || true
 systemctl enable schoolair-pigpio-setup.service 2>/dev/null || true
 systemctl enable schoolair-led.service 2>/dev/null || true
 systemctl enable schoolair-detect-hardware.service 2>/dev/null || true
@@ -1048,7 +1089,8 @@ if [[ "$MODE" == "--update" ]]; then
     # at the LED. One retry covers a transient (e.g. pigpiod not ready yet
     # on this same first activation); a persistent failure just gets a
     # clear warning instead of update failure.
-    if ! systemctl is-active --quiet schoolair-led.service; then
+    # A flower unit has no LED: its unit's condition keeps it off there.
+    if [ ! -e /etc/schoolair-flower-fitted ] && ! systemctl is-active --quiet schoolair-led.service; then
         systemctl restart schoolair-led.service 2>/dev/null || true
         sleep 3
         systemctl is-active --quiet schoolair-led.service \
@@ -1134,6 +1176,8 @@ chk "telemetry venv works"                "${SCHOOLAIR_DIR}/.venv/bin/python" -c
 chk "schoolair.service enabled"           systemctl is-enabled schoolair.service
 chk "sen6x.service enabled"              systemctl is-enabled sen6x.service
 chk "schoolair-first-boot enabled"        systemctl is-enabled schoolair-first-boot.service
+chk "schoolair-card-config enabled"       systemctl is-enabled schoolair-card-config.service
+chk "schoolair-card-label enabled"        systemctl is-enabled schoolair-card-label.service
 chk "schoolair_rollback.sh executable"    test -x "${ADMIN_HOME}/schoolair_rollback.sh"
 chk "update-watchdog timer enabled"       systemctl is-enabled schoolair-update-watchdog.timer
 chk "nginx proxies to ${TELEMETRY_PORT}"  grep -q "${TELEMETRY_PORT}" /etc/nginx/sites-available/default
