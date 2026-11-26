@@ -35,9 +35,24 @@ fast both ways, so it is not mistaken for a reading. No fresh reading, no nod,
 so a still flower means the sensor or the flower has stopped. See
 calibration.json "heartbeat".
 
+Status motions (STATUS-MOTIONS.md in SchoolAir/schoolair, hardware/wilting-flower):
+the flower has no LED, so its movements say what a height cannot. A still flower
+is always a reading; a moving flower is telling you something else. Built so far:
+  1 waiting for setup   the endnode has no AUTH_TOKEN: wilted, a small upward nod
+                        every 10 s (every 60 s after 30 min), readings ignored
+  4 normal service      height = air quality, no gestures (the heartbeat stays off)
+  5 sensor fault        no valid reading for 2 min: hold the height, shiver every 60 s
+  7 factory reset       the token goes away: back to state 1, no reboot needed
+Off switch, checked every few seconds, no restart needed: "status_motions":
+{"enabled": false} in calibration.json (a calibration.json without the block counts
+as off, so units already in schools keep their behaviour), or an empty file named
+flower-quiet on the SD card's boot partition. Off = exactly the behaviour before.
+
 Usage:
   flower_service.py                 run forever (what the systemd unit does)
   flower_service.py --nod           one nod, then exit
+  flower_service.py --shiver        one shiver, then exit
+  flower_service.py --status-motions [on|off]   show, or switch the status motions
   flower_service.py --once          one read-score-move cycle, then exit
   flower_service.py --score         print the latest reading and the height it maps to
   flower_service.py --goto 40       move to 40 mm and exit (assumes position is known)
@@ -85,6 +100,55 @@ def demo_mode():
     exists, and the flower polls and smooths faster (mapping.demo). Checked on every
     cycle so it can be toggled by hand without restarting anything."""
     return os.path.exists(DEMO_FLAG)
+# Status motions. The endnode is set up once its .env holds an AUTH_TOKEN (the same
+# test its registration wizard makes); a factory reset or a fresh image clears it.
+ENDNODE_ENV = os.environ.get("SCHOOLAIR_ENV", "/home/admin/schoolair/.env")
+# An empty file with this name on the boot partition turns the status motions off:
+# anyone can make it by putting the card in a computer, no SSH needed.
+QUIET_FILES = tuple(os.environ.get("FLOWER_QUIET_FILES", "/boot/firmware/flower-quiet:/boot/flower-quiet").split(":"))
+
+# Raised by the endnode (device_identity.py) when this card's .env belongs to another
+# Pi, e.g. a card cloned from a registered unit: its AUTH_TOKEN is not this unit's.
+IDENTITY_MISMATCH = os.environ.get("SCHOOLAIR_IDENTITY_MISMATCH", "/run/schoolair/identity-mismatch")
+
+def endnode_set_up(path=None):
+    """True once the endnode is registered: the same test as its ssh_register.py, a
+    non-empty AUTH_TOKEN and no identity mismatch (a clone is not set up). If the .env
+    can't be read for any reason other than not existing, answer True: normal
+    service is the safe default."""
+    if os.path.exists(IDENTITY_MISMATCH):
+        return False
+    try:
+        with open(path or ENDNODE_ENV) as f:
+            for line in f:
+                if line.startswith("AUTH_TOKEN="):
+                    return bool(line[len("AUTH_TOKEN="):].strip())
+        return False
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+def led_service_running():
+    """Is the endnode's status LED daemon active? A flower unit has no LED (since
+    2026-11-07), and a gesture every 10 s should not wait 3 s for one that isn't there.
+    Unsure (no systemctl) counts as running."""
+    import subprocess
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", "schoolair-led"], timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+def status_motions_on(cal):
+    """The off switch, read fresh from calibration.json so it works without a restart."""
+    if any(os.path.exists(q) for q in QUIET_FILES):
+        return False
+    try:
+        block = load_cal().get("status_motions", {})
+    except (OSError, ValueError):
+        block = cal.get("status_motions", {})
+    return bool(block.get("enabled", False))
+
 LED_YIELD_S = 3.0      # the LED daemon polls the flag about once a second; 1.5 s lost a race on 2026-10-01
 MOVE_GRACE_S = 3.0
 WAVE_CHAIN = 9998      # pigpio wave_tx_at(): a chain of several waves is playing (a one-wave chain reports that wave's id)
@@ -128,8 +192,10 @@ class Stepper:
         for p in self.pins:
             self.pi.write(p, 0)
 
-    def move(self, mm, direction, us, full=False):
-        """Move |mm| in 'up' or 'down'. Blocks until done. Returns the mm actually commanded."""
+    def move(self, mm, direction, us, full=False, flag=True):
+        """Move |mm| in 'up' or 'down'. Blocks until done. Returns the mm actually commanded.
+        flag=False: the caller already holds the moving flag (a gesture of several
+        short moves raises it once, so it waits for the LED once, not before each move)."""
         seq = FULL if full else HALF
         steps_per_rev = 2048 if full else 4096
         if direction == "up":
@@ -138,7 +204,7 @@ class Stepper:
         cycles = steps // len(seq)
         if cycles == 0:
             return 0.0
-        flagged = raise_moving_flag()
+        flagged = raise_moving_flag() if flag else False
         try:
             if flagged:
                 time.sleep(LED_YIELD_S)          # let the LED daemon step off the waves
@@ -347,9 +413,11 @@ class Flower:
         for k in ("current_position_mm", "position_state", "position_note"):
             if k in fresh: self.cal[k] = fresh[k]
 
-    def _move(self, mm, direction, us, full=False):
+    def _move(self, mm, direction, us, full=False, flag=True):
         try:
-            return self.st.move(mm, direction, us, full=full)
+            if flag:
+                return self.st.move(mm, direction, us, full=full)
+            return self.st.move(mm, direction, us, full=full, flag=False)
         except MoveInterrupted as e:
             self.pos = None
             self._save(state="unknown", note=f"move interrupted {time.strftime('%Y-%m-%d %H:%M')}: {e}; will home")
@@ -535,6 +603,96 @@ class Flower:
         log.info("nod x%d (%s then %s, %.0f mm) at %.1f mm", repeats, first, second, dip, self.pos)
         return True
 
+    # ------------------------------------------------------------ status motions
+    def _sm(self, key, default):
+        return self.cal.get("status_motions", {}).get(key, default)
+
+    def _gesture(self, name, moves):
+        """Play a list of (direction, mm, pause_s) and end where it started. The moving
+        flag is raised once for the whole gesture. Returns False if it cannot fit."""
+        if self.pos is None:
+            return False
+        lo, hi = self.cal["working_min_mm"], self.cal["working_max_mm"]
+        h = self.pos
+        for d, mm, _ in moves:                    # check the whole path stays in range first
+            h += mm if d == "up" else -mm
+            if not (lo - 0.01 <= h <= hi + 0.01):
+                return False
+        self._save(state="moving", note=name)
+        flagged = raise_moving_flag()
+        try:
+            if flagged and led_service_running():
+                time.sleep(LED_YIELD_S)          # once per gesture; skipped where no LED runs
+            for d, mm, pause in moves:
+                if d == "down":
+                    self._move(mm, "down", self.down_us, flag=False)
+                else:
+                    self._move(mm, "up", self.up_us, full=self.up_full, flag=False)
+                if pause:
+                    time.sleep(pause)
+        finally:
+            if flagged:
+                lower_moving_flag()
+        self._save()
+        return True
+
+    def nod_up(self):
+        """Status nod (state 1): up nod_mm, pause, back down. At the top it dips instead."""
+        mm, pause = float(self._sm("nod_mm", 4.0)), float(self._sm("nod_pause_s", 0.5))
+        return (self._gesture("status nod", [("up", mm, pause), ("down", mm, 0)])
+                or self._gesture("status nod", [("down", mm, pause), ("up", mm, 0)]))
+
+    def shiver(self):
+        """Sensor fault (state 5): +-shiver_mm, shiver_times times, around the height."""
+        mm, n = float(self._sm("shiver_mm", 1.0)), int(self._sm("shiver_times", 3))
+        up_first = [("up", mm, 0.1), ("down", mm, 0.1)] * n
+        down_first = [("down", mm, 0.1), ("up", mm, 0.1)] * n
+        ok = self._gesture("shiver", down_first) or self._gesture("shiver", up_first)
+        if ok:
+            log.info("shiver x%d (%.1f mm) at %.1f mm", n, mm, self.pos)
+        return ok
+
+    def status_mode(self):
+        """'off' (switch off: behaviour as before), 'setup' (state 1) or 'service'."""
+        if not status_motions_on(self.cal):
+            return "off"
+        return "service" if endnode_set_up() else "setup"
+
+    def setup_tick(self, now):
+        """State 1: wilted, readings ignored, an upward nod every 10 s, every 60 s after 30 min."""
+        if getattr(self, "_setup_since", None) is None:
+            self._setup_since, self._last_status_nod = now, 0.0
+            log.info("status: waiting for setup (no AUTH_TOKEN in %s); wilted, nodding", ENDNODE_ENV)
+        self._led_clear()                         # the motions are the status here
+        wilted = float(self.cal["positions"]["wilted"])
+        if self.pos is None or abs(self.pos - wilted) >= 0.05:
+            self.goto(wilted)
+        slow = now - self._setup_since > float(self._sm("setup_slow_after_min", 30)) * 60
+        every = float(self._sm("setup_slow_nod_every_s", 60) if slow else self._sm("setup_nod_every_s", 10))
+        if now - self._last_status_nod >= every:
+            self.nod_up()
+            self._last_status_nod = time.time()   # count from the end, so a nod never runs back to back
+        return every
+
+    def fault_tick(self, status, now):
+        """State 5: without a valid reading for fault_after_s, hold and shiver every shiver_every_s."""
+        if status.get("status") == "ok":
+            if getattr(self, "_fault_since", None) is not None:
+                log.info("status: valid readings again, shiver stops")
+            self._fault_since = None
+            return
+        if getattr(self, "_fault_since", None) is None:
+            self._fault_since, self._last_shiver = now, 0.0
+            return
+        if now - self._fault_since < float(self._sm("fault_after_s", 120)):
+            return
+        if now - self._last_shiver >= float(self._sm("shiver_every_s", 60)):
+            if self._last_shiver == 0.0:
+                log.info("status: sensor fault for %d s (%s); holding at %s mm and shivering",
+                         now - self._fault_since, status.get("status"), self.pos)
+            self.shiver()
+            self._last_shiver = time.time()
+
     def maybe_nightly_home(self, status):
         """Once a night (nightly_home.at, local time, default 04:00) re-home and return,
         so an unexplained loss of position (2026-10-02: the carriage was found 25 mm
@@ -571,6 +729,9 @@ class Flower:
         hb = self.cal.get("heartbeat", {})
         if not hb.get("enabled", False) or status.get("status") != "ok" or status.get("moved"):
             return
+        if getattr(self, "_mode", "off") != "off":
+            # Status motions: a still flower is always a reading, so no nod in service.
+            return
         if hb.get("requires_fresh_reading", True) and status.get("age_min", 999) > self.cal["mapping"]["max_reading_age_min"]:
             return
         if not self._in_heartbeat_hours(hb):
@@ -584,8 +745,15 @@ class Flower:
     def run(self):
         poll = self.cal["mapping"]["poll_seconds"]
         self._demo_logged = False
+        self._mode = self.status_mode()
         try:
-            if self.cal.get("self_test", {}).get("on_cold_boot", True) and self._is_cold_boot():
+            cold = self.cal.get("self_test", {}).get("on_cold_boot", True) and self._is_cold_boot()
+            if cold and self._mode == "setup":
+                # State 1 on power-up: the home is the motor test; then wilted and nodding.
+                log.info("cold boot, not set up yet: home (motor test), then wilted")
+                self.cal["position_state"] = "unknown"
+                self.home()
+            elif cold:
                 self.self_test()
             elif self.cal.get("position_state") == "known" and isinstance(self.pos, (int, float)):
                 log.info("position known (%.1f mm), skipping homing", self.pos)
@@ -594,16 +762,44 @@ class Flower:
                 self.home()
         except MoveInterrupted:
             pass                                 # position unknown now; the first cycle homes
-        log.info("running; polling every %d s", poll)
+        log.info("running; polling every %d s; status motions %s", poll, self._mode)
+        next_poll = 0.0
         while True:
+            now = time.time()
+            mode = self.status_mode()
+            if mode != self._mode:
+                log.info("status motions: %s -> %s", self._mode, mode)
+                if self._mode == "setup":
+                    self._setup_since = None
+                    next_poll = 0.0               # set up now: go to the reading at once
+                self._fault_since = None
+                self._mode = mode
+            if mode == "setup":
+                try:
+                    every = self.setup_tick(now)
+                    self.maybe_nightly_home({"status": "setup"})
+                except MoveInterrupted:
+                    every = 10
+                time.sleep(max(1.0, min(every, 5.0)))
+                continue
+            if mode == "service" and now < next_poll:
+                try:
+                    self.fault_tick(getattr(self, "_last_status", {"status": "ok"}), now)
+                except MoveInterrupted:
+                    pass
+                time.sleep(max(1.0, min(5.0, next_poll - time.time())))
+                continue
             try:
                 s = self.step()
+                self._last_status = s
                 if s.get("moved") or s.get("status") != "ok":
                     log.info("%s", json.dumps(s))
                 if s.get("status") != "ok":          # refresh every poll: the LED drops requests older than 5 min
                     self._led(self.cal.get("self_test", {}).get("led_state_when_no_reading", "thinking"))
                 else:
                     self._led_clear()
+                if mode == "service":
+                    self.fault_tick(s, time.time())
                 self.maybe_nod(s)
                 self.maybe_nightly_home(s)
             except MoveInterrupted:
@@ -611,7 +807,11 @@ class Flower:
             demo = demo_mode()
             if demo != self._demo_logged:
                 log.info("demo mode %s (%s)", "on" if demo else "off", DEMO_FLAG); self._demo_logged = demo
-            time.sleep(self.cal["mapping"].get("demo", {}).get("poll_seconds", poll) if demo else poll)
+            wait = self.cal["mapping"].get("demo", {}).get("poll_seconds", poll) if demo else poll
+            if mode == "off":
+                time.sleep(wait)
+            else:                                # wake every few seconds for the switch and the gestures
+                next_poll = time.time() + wait
 
 def main(argv):
     fl = Flower()
@@ -650,6 +850,19 @@ def _dispatch(fl, argv):
         # out of the stop uses the slow recovery setting (a separate --goto would not).
     if "--nod" in argv:
         fl.nod(); return
+    if "--shiver" in argv:
+        fl.shiver(); return
+    if "--status-motions" in argv:
+        i = argv.index("--status-motions")
+        want = argv[i + 1] if i + 1 < len(argv) else None
+        if want in ("on", "off"):
+            cal = load_cal()
+            cal.setdefault("status_motions", {})["enabled"] = want == "on"
+            save_cal(cal)
+        quiet = [q for q in QUIET_FILES if os.path.exists(q)]
+        print(json.dumps({"enabled_in_calibration": load_cal().get("status_motions", {}).get("enabled", False),
+                          "quiet_file": quiet or None, "set_up": endnode_set_up(),
+                          "mode": fl.status_mode()}, indent=2)); return
     if "--self-test" in argv:
         fl.self_test(); return
     if "--goto" in argv:

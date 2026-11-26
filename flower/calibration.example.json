@@ -146,5 +146,18 @@
     "enabled": true,
     "at": "04:00",
     "note": "local time; re-home and return once a night so a lost position never lasts longer than a day"
+  },
+  "status_motions": {
+    "enabled": false,
+    "setup_nod_every_s": 10,
+    "setup_slow_after_min": 30,
+    "setup_slow_nod_every_s": 60,
+    "nod_mm": 4.0,
+    "nod_pause_s": 0.5,
+    "fault_after_s": 120,
+    "shiver_every_s": 60,
+    "shiver_mm": 1.0,
+    "shiver_times": 3,
+    "note": "The flower's status language (STATUS-MOTIONS.md). Off until the bench test passes. On: not set up (no AUTH_TOKEN) = wilted + nod every 10 s; no valid reading for 2 min = hold + shiver every 60 s; no heartbeat nod in service. Off also by an empty file flower-quiet on the boot partition. Read live, no restart needed."
   }
 }
