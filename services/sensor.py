@@ -26,7 +26,12 @@ _REINIT_BIN = (
     if "MOCK_SENSOR_SCRIPT" in os.environ
     else os.getenv("SENSOR_REINIT_BIN", "/home/admin/i2c/sen6x/sen6x_read")
 )
-_REINIT_AFTER = 5  # consecutive failures before attempting re-init
+# Re-init after 5 consecutive failures, then again after every 5 more for as
+# long as the reads keep failing. One attempt is not enough: if the sensor is
+# unplugged, the first re-init runs while it is still away and fails, and once
+# the Qwiic cable is back the sensor powers up idle (co2=32767) and needs
+# another start_continuous_measurement (bench .242, 2026-11-26).
+_REINIT_AFTER = 5
 
 _consecutive_failures = 0
 
@@ -223,7 +228,7 @@ def read_sensor() -> dict:
         error = RuntimeError("Sensor script timed out")
 
     _consecutive_failures += 1
-    if _consecutive_failures == _REINIT_AFTER and _REINIT_BIN:
+    if _consecutive_failures % _REINIT_AFTER == 0 and _REINIT_BIN:
         _try_reinit()
     raise error
 

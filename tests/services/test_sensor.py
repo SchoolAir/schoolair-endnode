@@ -193,6 +193,40 @@ def test_read_sensor_resets_failure_counter_on_success():
     assert sensor._consecutive_failures == 0
 
 
+def _failing_reads(n, reinit):
+    """n failed reads in a row with re-init enabled; returns how often it re-inited."""
+    with patch.object(sensor, "_REINIT_BIN", "/fake/sen6x_read"), \
+         patch.object(sensor, "_try_reinit", reinit), \
+         patch("subprocess.run", return_value=_proc(returncode=2, stderr="not ready")):
+        for _ in range(n):
+            with pytest.raises(RuntimeError):
+                read_sensor()
+    return reinit.call_count
+
+
+def test_read_sensor_reinits_after_five_failures():
+    sensor._consecutive_failures = 0
+    assert _failing_reads(4, MagicMock()) == 0
+    sensor._consecutive_failures = 0
+    assert _failing_reads(5, MagicMock()) == 1
+
+
+def test_read_sensor_keeps_retrying_reinit_while_reads_fail():
+    # Unplugged sensor: the first re-init fails because the sensor is away;
+    # after the replug it is idle until a later re-init starts it again.
+    sensor._consecutive_failures = 0
+    assert _failing_reads(20, MagicMock()) == 4   # at 5, 10, 15 and 20
+
+
+def test_read_sensor_counts_again_from_zero_after_a_good_read():
+    sensor._consecutive_failures = 0
+    reinit = MagicMock()
+    _failing_reads(3, reinit)
+    with patch("subprocess.run", return_value=_proc(json.dumps({"sen6x": {"co2": 400}}))):
+        read_sensor()
+    assert _failing_reads(4, reinit) == 0         # 3 + 4 failures, but not in a row
+
+
 # ── _i2c_scan ─────────────────────────────────────────────────────────────────
 
 I2CDETECT_OUTPUT = """\
