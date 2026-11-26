@@ -786,7 +786,7 @@ ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update wit
 step "15 / systemd services"
 DEPLOY_DIR="${SCHOOLAIR_DIR}/deploy"
 
-for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-ble.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-detect-hardware.service schoolair-hardware-check.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer; do
+for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-ble.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-detect-hardware.service schoolair-hardware-check.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer schoolair-mqtt.service; do
     if [ -f "${DEPLOY_DIR}/${svc}" ]; then
         install_with_backup "${DEPLOY_DIR}/${svc}" "/etc/systemd/system/${svc}"
         ok "${svc} installed"
@@ -938,6 +938,9 @@ systemctl enable sen6x.service
 systemctl enable schoolair-first-boot.service 2>/dev/null || true
 systemctl enable schoolair-card-config.service 2>/dev/null || true
 systemctl enable schoolair-card-label.service 2>/dev/null || true
+# The MQTT feed (mqtt_publish.py). Enabled everywhere, but it only publishes
+# where the unit's .env says MQTT_ENABLED=1; elsewhere it exits at once.
+systemctl enable schoolair-mqtt.service 2>/dev/null || true
 systemctl enable schoolair-pigpio-setup.service 2>/dev/null || true
 systemctl enable schoolair-led.service 2>/dev/null || true
 systemctl enable schoolair-detect-hardware.service 2>/dev/null || true
@@ -1009,6 +1012,9 @@ if [[ "$MODE" == "--update" ]]; then
     systemctl restart schoolair-led.service      || warn "schoolair-led.service restart failed"
     systemctl restart sen6x.service           || warn "sen6x.service restart failed"
     systemctl restart schoolair.service       || warn "schoolair.service restart failed"
+    # New mqtt_publish.py code or .env settings only take effect on restart.
+    # Exits 0 at once on units where MQTT is off, so this is cheap there.
+    systemctl restart schoolair-mqtt.service  || warn "schoolair-mqtt.service restart failed"
     # New flower code only takes effect on restart; same wait as for pigpiod.
     # restart, not try-restart: on the update that first installs the flower it
     # isn't running yet, and try-restart left it stopped until the next reboot.
@@ -1178,6 +1184,8 @@ chk "sen6x.service enabled"              systemctl is-enabled sen6x.service
 chk "schoolair-first-boot enabled"        systemctl is-enabled schoolair-first-boot.service
 chk "schoolair-card-config enabled"       systemctl is-enabled schoolair-card-config.service
 chk "schoolair-card-label enabled"        systemctl is-enabled schoolair-card-label.service
+chk "schoolair-mqtt enabled"              systemctl is-enabled schoolair-mqtt.service
+chk "paho-mqtt importable"                "${SCHOOLAIR_DIR}/.venv/bin/python" -c "import paho.mqtt.client"
 chk "schoolair_rollback.sh executable"    test -x "${ADMIN_HOME}/schoolair_rollback.sh"
 chk "update-watchdog timer enabled"       systemctl is-enabled schoolair-update-watchdog.timer
 chk "nginx proxies to ${TELEMETRY_PORT}"  grep -q "${TELEMETRY_PORT}" /etc/nginx/sites-available/default

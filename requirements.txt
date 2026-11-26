@@ -9,6 +9,7 @@ microdot==2.6.1
 simple-websocket
 netifaces==0.11.0
 packaging==26.2
+paho-mqtt==2.1.0
 pluggy==1.6.0
 prompt_toolkit==3.0.52
 Pygments==2.20.0
