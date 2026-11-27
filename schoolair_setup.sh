@@ -956,8 +956,9 @@ systemctl enable sen6x.service
 systemctl enable schoolair-first-boot.service 2>/dev/null || true
 systemctl enable schoolair-card-config.service 2>/dev/null || true
 systemctl enable schoolair-card-label.service 2>/dev/null || true
-# The MQTT feed (mqtt_publish.py). Enabled everywhere, but it only publishes
-# where the unit's .env says MQTT_ENABLED=1; elsewhere it exits at once.
+# The MQTT feed (mqtt_publish.py). On everywhere unless the unit's .env says
+# MQTT_ENABLED=0; the default in-house broker is only used where its name
+# resolves to a private address (Can Picard's LAN), so elsewhere it just waits.
 systemctl enable schoolair-mqtt.service 2>/dev/null || true
 # The trap for the flower's mid-move aborts (pigpio_watch.py): logs who connects
 # to pigpiod. Enabled everywhere, but it only starts where a flower is fitted.
@@ -1034,7 +1035,7 @@ if [[ "$MODE" == "--update" ]]; then
     systemctl restart sen6x.service           || warn "sen6x.service restart failed"
     systemctl restart schoolair.service       || warn "schoolair.service restart failed"
     # New mqtt_publish.py code or .env settings only take effect on restart.
-    # Exits 0 at once on units where MQTT is off, so this is cheap there.
+    # Exits 0 at once on units where MQTT is turned off, so this is cheap there.
     systemctl restart schoolair-mqtt.service  || warn "schoolair-mqtt.service restart failed"
     # Never a pigpio client, so safe to restart mid-move; skipped on units without a flower.
     systemctl restart schoolair-pigpio-watch.service || warn "schoolair-pigpio-watch.service restart failed"

@@ -48,8 +48,13 @@ def test_public_ids_differ_between_units():
 
 # ── settings ─────────────────────────────────────────────────────────────────
 
-def test_off_by_default():
-    assert mp.load_config({})["enabled"] is False
+def test_on_by_default_and_off_only_when_turned_off():
+    # Martin, 2026-11-27: "standard and on unless turned off"
+    assert mp.load_config({})["enabled"] is True
+    for off in ("0", "false", "no", "off"):
+        assert mp.load_config({"MQTT_ENABLED": off})["enabled"] is False
+    assert mp.load_config({})["ha"] is True
+    assert mp.load_config({"MQTT_HA_DISCOVERY": "0"})["ha"] is False
 
 
 def test_config_from_env(tmp_path):
@@ -63,11 +68,13 @@ def test_config_from_env(tmp_path):
     assert cfg["prefix"] == "test/units"
 
 
-def test_missing_env_file_is_just_off(tmp_path):
-    assert mp.load_config(mp.read_env(tmp_path / "nope"))["enabled"] is False
+def test_missing_env_file_means_the_defaults(tmp_path):
+    cfg = mp.load_config(mp.read_env(tmp_path / "nope"))
+    assert cfg["enabled"] and cfg["host"] == "cp-localmqtt.com"
 
 
 def test_main_does_nothing_when_off(monkeypatch, tmp_path, capsys):
+    (tmp_path / ".env").write_text("MQTT_ENABLED=0\n")
     monkeypatch.setattr(mp, "ENV_PATH", tmp_path / ".env")
     for k in list(os.environ):
         if k.startswith("MQTT_"):
@@ -221,6 +228,9 @@ def test_end_to_end_retained_topics_password_and_last_will(broker, tmp_path, mon
     login = "MQTT_USERNAME=unit\nMQTT_PASSWORD=unitpw\n" if mode == "password" else ""
     latest = tmp_path / "latest.json"
     latest.write_text(json.dumps(GOOD))
+    uptime, wireless = tmp_path / "uptime", tmp_path / "wireless"
+    uptime.write_text("3600.4 100.0\n")
+    wireless.write_text(WIRELESS)
     env = tmp_path / ".env"
     env.write_text(f"MQTT_ENABLED=1\nMQTT_HOST=127.0.0.1\nMQTT_PORT={port}\nMQTT_TLS=0\n"
                    + login + "MQTT_TOPIC_PREFIX=t/units\n")
@@ -228,7 +238,8 @@ def test_end_to_end_retained_topics_password_and_last_will(broker, tmp_path, mon
     proc = subprocess.Popen(
         [sys.executable, str(ROOT / "mqtt_publish.py")],
         env={**clean, "PYTHONUNBUFFERED": "1", "SCHOOLAIR_ENV": str(env), "LATEST_READING_FILE": str(latest),
-             "FLOWER_MARKER": str(tmp_path / "no-flower"), "UNIT_TYPE_FILE": str(tmp_path / "no-type")},
+             "FLOWER_MARKER": str(tmp_path / "no-flower"), "UNIT_TYPE_FILE": str(tmp_path / "no-type"),
+             "PROC_UPTIME": str(uptime), "PROC_WIRELESS": str(wireless)},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         time.sleep(3)                                    # connect + first publish
@@ -241,6 +252,13 @@ def test_end_to_end_retained_topics_password_and_last_will(broker, tmp_path, mon
         assert got[f"{base}/online"] == "true"
         assert json.loads(got[f"{base}/info"])["kind"] == "box"
         assert json.loads(got[f"{base}/readings"])["co2"] == 905
+        # Home Assistant finds the unit by itself: retained discovery configs.
+        ha, _ = _subscribe(paho, port, "viewer", "viewpw", "homeassistant/#", seconds=1.5)
+        cfg = json.loads(ha[f"homeassistant/sensor/schoolair_{unit}/co2/config"])
+        assert cfg["state_topic"] == f"{base}/co2"
+        # Every minute: uptime (and Wi-Fi, flower on a Pi), from the fake /proc.
+        assert got[f"{base}/uptime"] == "3600"
+        assert got[f"{base}/wifi_rssi"] == "-48"
 
         # A new sample is published within a couple of seconds.
         latest.write_text(json.dumps({**GOOD, "recorded_at": "later",
@@ -271,3 +289,106 @@ def test_setup_installs_enables_and_restarts_the_feed():
     assert "systemctl enable schoolair-mqtt.service" in setup
     assert "systemctl restart schoolair-mqtt.service" in setup     # new code / .env on update
     assert 'chk "paho-mqtt importable"' in setup
+
+
+# ── the default broker's guard ───────────────────────────────────────────────
+
+def _resolver(*addrs):
+    def resolve(host, port, type=None):
+        if not addrs:
+            raise socket.gaierror("not found")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, 0)) for a in addrs]
+    return resolve
+
+
+def test_default_broker_used_on_the_cp_network():
+    assert mp.private_broker_address("cp-localmqtt.com", _resolver("192.168.6.47")) == "192.168.6.47"
+
+
+def test_default_broker_not_used_anywhere_else():
+    # A school: the name is unknown. Or someone bought the name: a public address.
+    assert mp.private_broker_address("cp-localmqtt.com", _resolver()) is None
+    assert mp.private_broker_address("cp-localmqtt.com", _resolver("52.57.248.25")) is None
+    assert mp.private_broker_address("cp-localmqtt.com", _resolver("127.0.0.1")) is None
+
+
+def test_main_waits_instead_of_sending_when_the_default_broker_is_not_private(monkeypatch, tmp_path, capsys):
+    (tmp_path / ".env").write_text("")
+    monkeypatch.setattr(mp, "ENV_PATH", tmp_path / ".env")
+    for k in list(os.environ):
+        if k.startswith("MQTT_"):
+            monkeypatch.delenv(k)
+    pytest.importorskip("paho.mqtt.client")
+    monkeypatch.setattr(mp, "private_broker_address", lambda host: None)
+    monkeypatch.setattr(mp.device_identity, "read_cpu_serial", lambda: "00000000a1b2c3d4")
+
+    class Stop(Exception):
+        pass
+
+    def no_sleep(s):
+        raise Stop
+    monkeypatch.setattr(mp.time, "sleep", no_sleep)
+    with pytest.raises(Stop):
+        mp.main()
+    assert "not on this network" in capsys.readouterr().out
+
+
+# ── every minute: Wi-Fi, uptime, flower ──────────────────────────────────────
+
+WIRELESS = """Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
+ face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22
+ wlan0: 0000   62.  -48.  -256        0      0      0     27      0        0
+"""
+
+
+def test_wifi_signal_from_proc():
+    assert mp.parse_wireless(WIRELESS) == -48
+    assert mp.parse_wireless("") is None
+    assert mp.parse_wireless(WIRELESS.replace("-48.", "0.")) is None     # not associated
+
+
+def test_wifi_name_from_nmcli():
+    assert mp.parse_nmcli_ssid("no:Other\nyes:CP-IOT\n") == "CP-IOT"
+    assert mp.parse_nmcli_ssid("yes:Room 4\\: lab\n") == "Room 4: lab"
+    assert mp.parse_nmcli_ssid("no:Other\n") is None
+
+
+def test_flower_height_only_when_the_flower_knows_it(tmp_path):
+    cal = tmp_path / "calibration.json"
+    cal.write_text(json.dumps({"current_position_mm": 64.123, "position_state": "known"}))
+    assert mp.flower_status(str(cal)) == {"flower_state": "known", "flower_height": 64.1}
+    cal.write_text(json.dumps({"current_position_mm": None, "position_state": "unknown"}))
+    assert mp.flower_status(str(cal)) == {"flower_state": "unknown"}
+    cal.write_text("{broken")
+    assert mp.flower_status(str(cal)) == {}
+
+
+def test_status_messages():
+    values = mp.status_values(ssid="CP-IOT", wireless_text=WIRELESS, uptime_text="86400.52 1000.0\n",
+                              flower={"flower_height": 64.1, "flower_state": "known"})
+    msgs = dict(mp.status_messages(values, "b"))
+    assert msgs == {"b/wifi_ssid": "CP-IOT", "b/wifi_rssi": "-48", "b/uptime": "86400",
+                    "b/flower_height": "64.1", "b/flower_state": "known"}
+    assert mp.status_values(ssid=None, wireless_text="", uptime_text="") == {}
+
+
+# ── Home Assistant discovery ─────────────────────────────────────────────────
+
+def test_discovery_one_device_per_unit_with_units_and_classes():
+    info = {"kind": "flower", "sensor": "indoor", "firmware": "2.3.30"}
+    msgs = dict(mp.discovery_messages(["co2", "pm25", "wifi_ssid", "readings"], "X76VJRCCFP",
+                                      "s/X76VJRCCFP", info, "homeassistant"))
+    assert set(msgs) == {f"homeassistant/sensor/schoolair_X76VJRCCFP/{n}/config" for n in ("co2", "pm25", "wifi_ssid")}
+    co2 = json.loads(msgs["homeassistant/sensor/schoolair_X76VJRCCFP/co2/config"])
+    assert co2["state_topic"] == "s/X76VJRCCFP/co2"
+    assert (co2["unit_of_measurement"], co2["device_class"], co2["state_class"]) == ("ppm", "carbon_dioxide", "measurement")
+    assert co2["availability_topic"] == "s/X76VJRCCFP/online" and co2["payload_not_available"] == "false"
+    assert co2["device"]["name"] == "SchoolAir Flower X76VJ" and co2["device"]["sw_version"] == "2.3.30"
+    ssid = json.loads(msgs["homeassistant/sensor/schoolair_X76VJRCCFP/wifi_ssid/config"])
+    assert ssid["entity_category"] == "diagnostic" and "state_class" not in ssid
+    assert json.loads(msgs["homeassistant/sensor/schoolair_X76VJRCCFP/pm25/config"])["unit_of_measurement"] == "µg/m³"
+
+
+def test_every_published_value_has_a_discovery_entry():
+    names = set(mp.METRICS.values()) | {"no2", "wifi_ssid", "wifi_rssi", "uptime", "flower_height", "flower_state"}
+    assert names <= set(mp.HA_SENSORS)

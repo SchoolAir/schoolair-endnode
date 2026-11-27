@@ -1,5 +1,5 @@
 [Unit]
-Description=SchoolAir MQTT feed: every sensor sample to the broker (off unless MQTT_ENABLED=1 in .env)
+Description=SchoolAir MQTT feed: every sensor sample to the broker (on unless MQTT_ENABLED=0 in .env)
 # Reads /run/schoolair/latest.json, which schoolair.service writes; see
 # mqtt_publish.py. Never part of the upload path: if this stops or the broker
 # is down, readings still reach the server.
@@ -11,7 +11,7 @@ Type=simple
 User=admin
 WorkingDirectory=/home/admin/schoolair
 ExecStart=/home/admin/schoolair/.venv/bin/python -u /home/admin/schoolair/mqtt_publish.py
-# Exits 0 when MQTT is off in .env, so it doesn't restart in a loop; a crash
+# Exits 0 when MQTT_ENABLED=0 in .env, so it doesn't restart in a loop; a crash
 # restarts after 30 s.
 Restart=on-failure
 RestartSec=30
