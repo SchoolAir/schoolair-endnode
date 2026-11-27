@@ -23,7 +23,7 @@
   "speed_mm_per_s": 1.0,
   "travel_stop_to_stop_mm": 65.0,
   "working_min_mm": 10.0,
-  "working_max_mm": 57.5,
+  "working_max_mm": 69.5,
   "top_margin_mm": 17.5,
   "holds_position_unpowered": true,
   "homing": {
@@ -34,18 +34,18 @@
     "known_overshoot_mm": 3.0,
     "known_overshoot_note": "margin past the expected stop when the position is known; the full overshoot_mm only applies to a blind home"
   },
-  "working_max_note": "57.5 for the 165 mm drive rod (2026-10-12 CAD): above about 58.5 the straight rod wedges in the stem's natural curve near the head and the motor grinds.",
+  "working_max_note": "69.5 since 2026-11-27 for the standard build (Martin): 165 mm drive rod and the new carriage, which sits lower on the Tr8x8, leaving 4 mm of thread above the carriage at 69.5 with the top stop fitted; erect 69 is about 4 degrees off vertical (bench .242, 2026-11-26). Was 57.5 with the old carriage: above about 58.5 its straight rod wedged in the stem's curve.",
   "bottom_stop_mm": 0.0,
   "bottom_stop_note": "Mechanical bottom stop of the original lid, the frame all positions are measured in. Lids from the 2026-10-12 CAD carry a 17.5 mm post, so the stop sits at 10 (= wilted); see homing.stop_position_mm. Working range 10 to 57.5.",
   "worst_air_mm": 10.0,
   "worst_air_note": "10 mm = fully wilted on the 2026-10-12 hardware (165 mm rod, 145 mm stem, 11 g head); 25 mm = horizontal.",
   "positions": {
-    "erect": 57.0,
+    "erect": 69.0,
     "leaning": 50.0,
     "horizontal": 25.0,
     "wilted": 10.0
   },
-  "positions_note": "mm above the old bottom stop, from the bench on 2026-10-12 with a 165 mm drive rod (about 140 mm above the carriage boss), 145 mm stem from roof to head and 11 g added to the head: erect = 12 on the clock; leaning = 11; horizontal = 9 (the guideline line on the dashboard chart); wilted = past horizontal.",
+  "positions_note": "mm above the old bottom stop, from the bench on 2026-10-12 with a 165 mm drive rod (about 140 mm above the carriage boss), 145 mm stem from roof to head and 11 g added to the head: erect = 12 on the clock; leaning = 11; horizontal = 9 (the guideline line on the dashboard chart); wilted = past horizontal. Erect raised to 69 on 2026-11-27 for the new carriage (bench .242, 2026-11-26); leaning and horizontal not yet rechecked with it.",
   "mapping": {
     "tables": {
       "co2": [
@@ -148,16 +148,16 @@
     "note": "local time; re-home and return once a night so a lost position never lasts longer than a day"
   },
   "status_motions": {
-    "enabled": false,
-    "setup_nod_every_s": 10,
+    "enabled": true,
+    "setup_nod_every_s": 20,
     "setup_slow_after_min": 30,
     "setup_slow_nod_every_s": 60,
-    "nod_mm": 4.0,
-    "nod_pause_s": 0.5,
+    "nod_mm": 6.0,
+    "nod_pause_s": 1.0,
     "fault_after_s": 120,
     "shiver_every_s": 60,
-    "shiver_mm": 1.0,
+    "shiver_mm": 0.8,
     "shiver_times": 3,
-    "note": "The flower's status language (STATUS-MOTIONS.md). Off until the bench test passes. On: not set up (no AUTH_TOKEN) = wilted + nod every 10 s; no valid reading for 2 min = hold + shiver every 60 s; no heartbeat nod in service. Off also by an empty file flower-quiet on the boot partition. Read live, no restart needed."
+    "note": "The flower's status language (STATUS-MOTIONS.md). On by default since 2026-11-27 (Martin); sizes tuned on the bench on 2026-11-26. Not set up (no AUTH_TOKEN) = wilted + a 6 mm nod every 20 s; no valid reading for 2 min = hold + a 0.8 mm shiver every 60 s; no heartbeat nod in service. Off with enabled false, or an empty file flower-quiet on the boot partition. Read live, no restart needed."
   }
 }

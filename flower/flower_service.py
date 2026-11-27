@@ -38,15 +38,17 @@ calibration.json "heartbeat".
 Status motions (STATUS-MOTIONS.md in SchoolAir/schoolair, hardware/wilting-flower):
 the flower has no LED, so its movements say what a height cannot. A still flower
 is always a reading; a moving flower is telling you something else. Built so far:
-  1 waiting for setup   the endnode has no AUTH_TOKEN: wilted, a small upward nod
-                        every 10 s (every 60 s after 30 min), readings ignored
+  1 waiting for setup   the endnode has no AUTH_TOKEN: wilted, an upward nod (6 mm,
+                        1 s at the top) every 20 s (every 60 s after 30 min), readings ignored
   4 normal service      height = air quality, no gestures (the heartbeat stays off)
-  5 sensor fault        no valid reading for 2 min: hold the height, shiver every 60 s
+  5 sensor fault        no valid reading for 2 min: hold the height, shiver (0.8 mm x 3)
+                        every 60 s
   7 factory reset       the token goes away: back to state 1, no reboot needed
 Off switch, checked every few seconds, no restart needed: "status_motions":
-{"enabled": false} in calibration.json (a calibration.json without the block counts
-as off, so units already in schools keep their behaviour), or an empty file named
-flower-quiet on the SD card's boot partition. Off = exactly the behaviour before.
+{"enabled": false} in calibration.json, or an empty file named flower-quiet on the SD
+card's boot partition. Off = exactly the behaviour before. On by default since
+2026-11-27 (Martin): a calibration.json without the block counts as on. Sizes tuned
+on the bench on 2026-11-26.
 
 Usage:
   flower_service.py                 run forever (what the systemd unit does)
@@ -131,7 +133,7 @@ def endnode_set_up(path=None):
 
 def led_service_running():
     """Is the endnode's status LED daemon active? A flower unit has no LED (since
-    2026-11-07), and a gesture every 10 s should not wait 3 s for one that isn't there.
+    2026-11-07), and a gesture every 20 s should not wait 3 s for one that isn't there.
     Unsure (no systemctl) counts as running."""
     import subprocess
     try:
@@ -147,15 +149,129 @@ def status_motions_on(cal):
         block = load_cal().get("status_motions", {})
     except (OSError, ValueError):
         block = cal.get("status_motions", {})
-    return bool(block.get("enabled", False))
+    return bool(block.get("enabled", True))     # absent = on since 2026-11-27 (Martin)
 
 LED_YIELD_S = 3.0      # the LED daemon polls the flag about once a second; 1.5 s lost a race on 2026-10-01
 MOVE_GRACE_S = 3.0
 WAVE_CHAIN = 9998      # pigpio wave_tx_at(): a chain of several waves is playing (a one-wave chain reports that wave's id)
 WAVE_NONE = 9999       # pigpio wave_tx_at(): nothing is playing
+# A foreign wave id must be seen this many polls in a row (0.1 s apart) before a
+# move counts as replaced. pigpiod now and then names a wave nobody created for a
+# single poll (bench .242, 2026-11-26 22:55 and 23:13: "wave 1" with no other
+# client running, each followed by a needless blind home onto the stop). A real
+# takeover, such as the LED's breathing wave, keeps playing and is still caught.
+FOREIGN_POLLS = 3
 
 class MoveInterrupted(RuntimeError):
     """The step pattern stopped before the move was complete; the position is unknown."""
+
+# ---------------------------------------------------------------- wave trap
+# The "wave 1" answers of 2026-11-26 are not understood yet, and the debounce above
+# would hide them. So every odd answer, tolerated or not, and every move that runs
+# past its deadline leaves one JSON file in TRAP_DIR: every poll of that move, a
+# burst of fast re-reads taken right after the odd answer, and a snapshot of the
+# system at that moment (who is connected to pigpiod, CPU and power state, the
+# pigpiod journal). Best effort: a trap never raises and never slows the move,
+# because the snapshot runs in a thread and does not use pigpio.
+TRAP_DIR = os.environ.get("FLOWER_TRAP_DIR", os.path.join(HERE, "traps"))
+TRAP_KEEP = 50          # newest files kept
+TRAP_FAST_READS = 10    # extra wave_tx_at() reads, 5 ms apart, after an odd answer
+
+def _cmd(args, timeout=5, tail=200):
+    import subprocess
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return "\n".join((r.stdout + r.stderr).splitlines()[-tail:])
+    except Exception as e:
+        return f"failed: {e}"
+
+def system_snapshot():
+    """What else was going on. Runs as the service user (admin): `ss` names only
+    admin's own processes, and dmesg or the journal may be refused; that is fine."""
+    snap = {"time": time.strftime("%Y-%m-%d %H:%M:%S")}
+    try:
+        with open("/proc/loadavg") as f:
+            snap["loadavg"] = f.read().strip()
+    except Exception as e:
+        snap["loadavg"] = f"failed: {e}"
+    snap["pigpiod_sockets"] = _cmd(["ss", "-tnp", "( sport = :8888 or dport = :8888 )"])
+    snap["throttled"] = _cmd(["vcgencmd", "get_throttled"])
+    snap["ps"] = _cmd(["ps", "-eo", "pid,ppid,user,etime,pcpu,cmd"], tail=400)
+    snap["pigpiod_journal"] = _cmd(["journalctl", "-u", "pigpiod", "--since", "-60s", "--no-pager", "-o", "short-precise"])
+    snap["dmesg"] = _cmd(["dmesg", "-T"], tail=40)
+    for name, path in (("moving_flag", MOVING_FLAG), ("led_request", LED_REQUEST_FILE)):
+        try:
+            with open(path) as f:
+                snap[name] = f.read().strip()
+        except OSError:
+            snap[name] = None
+    return snap
+
+class WaveTrap:
+    """Collects one move's polls; write() saves them only if something odd was seen."""
+    def __init__(self, wid, chain, expected_s, steps, us):
+        self.info = {"wid": wid, "chain": chain, "expected_s": round(expected_s, 3),
+                     "steps": steps, "us": us, "started": time.strftime("%Y-%m-%d %H:%M:%S")}
+        self.t0 = time.monotonic()
+        self.polls = []         # [t, busy, at]
+        self.bursts = []        # {"t", "reads": [[t, at, micros, cbs], ...]}
+        self.snap = {}
+        self._thread = None
+
+    def poll(self, busy, at):
+        if len(self.polls) < 5000:            # a full 73.5 mm home is about 600 polls
+            self.polls.append([round(time.monotonic() - self.t0, 3), busy, at])
+
+    def odd(self, pi):
+        """An odd answer: re-read fast now, and start the system snapshot once."""
+        try:
+            reads = []
+            for _ in range(TRAP_FAST_READS):
+                row = [round(time.monotonic() - self.t0, 4), pi.wave_tx_at()]
+                for name in ("wave_get_micros", "wave_get_cbs"):
+                    try:
+                        row.append(getattr(pi, name)())
+                    except Exception:
+                        row.append(None)
+                reads.append(row)
+                time.sleep(0.005)
+            if len(self.bursts) < 50:
+                self.bursts.append({"t": reads[0][0], "reads": reads})
+        except Exception as e:
+            self.bursts.append({"error": str(e)})
+        if self._thread is None:
+            import threading
+            def take():
+                try:
+                    self.snap.update(system_snapshot())
+                except Exception as e:
+                    self.snap["error"] = str(e)
+            self._thread = threading.Thread(target=take, daemon=True)
+            self._thread.start()
+
+    def write(self, outcome):
+        """Save the trap file in the background. outcome: tolerated, aborted, deadline."""
+        import threading
+        def save():
+            try:
+                if self._thread is not None:
+                    self._thread.join(20)
+                os.makedirs(TRAP_DIR, exist_ok=True)
+                rec = dict(self.info, outcome=outcome, elapsed_s=round(time.monotonic() - self.t0, 3),
+                           polls=self.polls, bursts=self.bursts, system=self.snap)
+                path = os.path.join(TRAP_DIR, time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}-{outcome}.json")
+                with open(path + ".tmp", "w") as f:
+                    json.dump(rec, f, indent=1)
+                os.replace(path + ".tmp", path)
+                log.warning("wave trap saved: %s", path)
+                old = sorted(n for n in os.listdir(TRAP_DIR) if n.endswith(".json"))
+                for n in old[:-TRAP_KEEP]:
+                    os.remove(os.path.join(TRAP_DIR, n))
+            except Exception as e:
+                log.warning("wave trap not saved (%s)", e)
+        t = threading.Thread(target=save, daemon=True)
+        t.start()
+        return t
 
 def raise_moving_flag():
     try:
@@ -223,18 +339,44 @@ class Stepper:
                 remaining -= n
             expected_s = cycles * len(seq) * us / 1e6
             deadline = time.monotonic() + expected_s + MOVE_GRACE_S
+            trap = WaveTrap(wid, chain, expected_s, cycles * len(seq), us)
+            outcome = None                       # set when this move must leave a trap file
             self.pi.wave_chain(chain)
-            while self.pi.wave_tx_busy():
-                # Ours is being played if pigpiod names our wave or a chain (9998);
-                # 9999 means it just finished. Anything else replaced us.
-                at = self.pi.wave_tx_at()
-                if at not in (wid, WAVE_CHAIN, WAVE_NONE):
-                    self._abort(wid)
-                    raise MoveInterrupted(f"another pigpio client replaced the step pattern (wave {at}) mid-move")
-                if time.monotonic() > deadline:
-                    self._abort(wid)
-                    raise MoveInterrupted(f"step pattern still busy {MOVE_GRACE_S:.0f} s after its {expected_s:.0f} s should have ended")
-                time.sleep(0.1)
+            foreign, t0 = 0, time.monotonic()
+            try:
+                while True:
+                    busy = self.pi.wave_tx_busy()
+                    if not busy:
+                        trap.poll(busy, None)
+                        break
+                    # Ours is being played if pigpiod names our wave or a chain (9998);
+                    # 9999 means it just finished. Anything else, seen FOREIGN_POLLS
+                    # times in a row, replaced us; a single odd answer is logged only.
+                    at = self.pi.wave_tx_at()
+                    trap.poll(busy, at)
+                    if at in (wid, WAVE_CHAIN, WAVE_NONE):
+                        foreign = 0
+                    else:
+                        foreign += 1
+                        outcome = outcome or "tolerated"
+                        trap.info["odd_ids"] = sorted(set(trap.info.get("odd_ids", [])) | {at})
+                        trap.info["odd_is_wid_plus_1"] = at == wid + 1
+                        log.warning("wave_tx_at() named wave %s (ours is %s) %.1f s into a %.1f s move, %d of %d",
+                                    at, wid, time.monotonic() - t0, expected_s, foreign, FOREIGN_POLLS)
+                        trap.odd(self.pi)
+                        if foreign >= FOREIGN_POLLS:
+                            outcome = "aborted"
+                            self._abort(wid)
+                            raise MoveInterrupted(f"another pigpio client replaced the step pattern (wave {at}) mid-move")
+                    if time.monotonic() > deadline:
+                        outcome = "deadline"
+                        trap.odd(self.pi)
+                        self._abort(wid)
+                        raise MoveInterrupted(f"step pattern still busy {MOVE_GRACE_S:.0f} s after its {expected_s:.0f} s should have ended")
+                    time.sleep(0.1)
+            finally:
+                if outcome:
+                    trap.write(outcome)
             self.release()
             self.pi.wave_delete(wid)
         finally:
@@ -638,13 +780,13 @@ class Flower:
 
     def nod_up(self):
         """Status nod (state 1): up nod_mm, pause, back down. At the top it dips instead."""
-        mm, pause = float(self._sm("nod_mm", 4.0)), float(self._sm("nod_pause_s", 0.5))
+        mm, pause = float(self._sm("nod_mm", 6.0)), float(self._sm("nod_pause_s", 1.0))
         return (self._gesture("status nod", [("up", mm, pause), ("down", mm, 0)])
                 or self._gesture("status nod", [("down", mm, pause), ("up", mm, 0)]))
 
     def shiver(self):
         """Sensor fault (state 5): +-shiver_mm, shiver_times times, around the height."""
-        mm, n = float(self._sm("shiver_mm", 1.0)), int(self._sm("shiver_times", 3))
+        mm, n = float(self._sm("shiver_mm", 0.8)), int(self._sm("shiver_times", 3))
         up_first = [("up", mm, 0.1), ("down", mm, 0.1)] * n
         down_first = [("down", mm, 0.1), ("up", mm, 0.1)] * n
         ok = self._gesture("shiver", down_first) or self._gesture("shiver", up_first)
@@ -659,7 +801,7 @@ class Flower:
         return "service" if endnode_set_up() else "setup"
 
     def setup_tick(self, now):
-        """State 1: wilted, readings ignored, an upward nod every 10 s, every 60 s after 30 min."""
+        """State 1: wilted, readings ignored, an upward nod every 20 s, every 60 s after 30 min."""
         if getattr(self, "_setup_since", None) is None:
             self._setup_since, self._last_status_nod = now, 0.0
             log.info("status: waiting for setup (no AUTH_TOKEN in %s); wilted, nodding", ENDNODE_ENV)
@@ -668,7 +810,7 @@ class Flower:
         if self.pos is None or abs(self.pos - wilted) >= 0.05:
             self.goto(wilted)
         slow = now - self._setup_since > float(self._sm("setup_slow_after_min", 30)) * 60
-        every = float(self._sm("setup_slow_nod_every_s", 60) if slow else self._sm("setup_nod_every_s", 10))
+        every = float(self._sm("setup_slow_nod_every_s", 60) if slow else self._sm("setup_nod_every_s", 20))
         if now - self._last_status_nod >= every:
             self.nod_up()
             self._last_status_nod = time.time()   # count from the end, so a nod never runs back to back
@@ -860,7 +1002,7 @@ def _dispatch(fl, argv):
             cal.setdefault("status_motions", {})["enabled"] = want == "on"
             save_cal(cal)
         quiet = [q for q in QUIET_FILES if os.path.exists(q)]
-        print(json.dumps({"enabled_in_calibration": load_cal().get("status_motions", {}).get("enabled", False),
+        print(json.dumps({"enabled_in_calibration": load_cal().get("status_motions", {}).get("enabled", True),
                           "quiet_file": quiet or None, "set_up": endnode_set_up(),
                           "mode": fl.status_mode()}, indent=2)); return
     if "--self-test" in argv:
