@@ -345,8 +345,12 @@ step "2b / SD card longevity"
 # order across both directories, so 00-schoolair.conf lost to it (found on the
 # bench after 2.3.21: /var/log/journal stayed empty).
 mkdir -p /etc/systemd/journald.conf.d /var/log/journal
-rm -f /etc/systemd/journald.conf.d/00-schoolair.conf
-cat > /etc/systemd/journald.conf.d/90-schoolair.conf << 'EOF'
+JOURNALD_CHANGED=0
+if [[ -e /etc/systemd/journald.conf.d/00-schoolair.conf ]]; then
+    rm -f /etc/systemd/journald.conf.d/00-schoolair.conf
+    JOURNALD_CHANGED=1
+fi
+cat > /etc/systemd/journald.conf.d/90-schoolair.conf.new << 'EOF'
 [Journal]
 Storage=persistent
 SystemMaxUse=64M
@@ -359,7 +363,21 @@ EOF
 # Ownership and ACLs journald expects on /var/log/journal (the admin user keeps
 # read access through the systemd-journal group this grants).
 systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
-systemctl restart systemd-journald 2>/dev/null || true
+if cmp -s /etc/systemd/journald.conf.d/90-schoolair.conf.new /etc/systemd/journald.conf.d/90-schoolair.conf; then
+    rm -f /etc/systemd/journald.conf.d/90-schoolair.conf.new
+else
+    mv /etc/systemd/journald.conf.d/90-schoolair.conf.new /etc/systemd/journald.conf.d/90-schoolair.conf
+    JOURNALD_CHANGED=1
+fi
+# Restart journald only when its settings changed. A restart on every update
+# cut the running flower service off from the journal: after the restarts at
+# 01:26 and 02:30 on 2026-11-27 (bench .242) its log lines stopped being kept
+# until the flower itself restarted (flower-agent). So when a restart is
+# needed, the long-running services that log to the journal restart after it.
+if [[ "$JOURNALD_CHANGED" == 1 ]]; then
+    systemctl restart systemd-journald 2>/dev/null || true
+    JOURNALD_RESTARTED=1
+fi
 # A restart alone keeps writing to /run: journald moves to /var/log/journal only
 # when asked to flush, which systemd-journal-flush.service does at boot. Without
 # this a unit stayed RAM-only from the update until its next reboot (seen on a
@@ -1025,7 +1043,8 @@ if [[ "$MODE" == "--update" ]]; then
     # isn't running yet, and try-restart left it stopped until the next reboot.
     # Its drop-in's conditions still keep it off where no flower is fitted (an
     # unmet condition skips the start; it is not a failure).
-    if [ "$FLOWER_CHANGED" = 1 ]; then
+    # Also after a journald restart (step 2b), or its log lines are not kept.
+    if [ "$FLOWER_CHANGED" = 1 ] || [ "${JOURNALD_RESTARTED:-0}" = 1 ]; then
         wait_for_flower_move
         systemctl restart schoolair-flower.service || warn "schoolair-flower.service restart failed"
     fi

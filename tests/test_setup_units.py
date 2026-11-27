@@ -84,7 +84,7 @@ def test_telemetry_does_not_wait_for_the_network():
 def test_journal_is_persistent_and_capped():
     """Twice (2026-09-30, 2026-10-02) a reboot's cause was unreadable because the
     journal lived in RAM. Martin: logs on the card, on all units, bounded."""
-    block = TEXT[TEXT.index("90-schoolair.conf << 'EOF'"):TEXT.index("systemctl restart systemd-journald")]
+    block = TEXT[TEXT.index("90-schoolair.conf.new << 'EOF'"):TEXT.index("systemctl restart systemd-journald")]
     # Must sort after Raspberry Pi OS's 40-rpi-volatile-storage.conf, or it loses.
     assert "journald.conf.d/90-schoolair.conf" in TEXT and "00-schoolair.conf <<" not in TEXT
     assert "Storage=persistent" in block
