@@ -786,7 +786,7 @@ ok "sudoers: ${ADMIN_USER} may start schoolair-wizard / run schoolair-update wit
 step "15 / systemd services"
 DEPLOY_DIR="${SCHOOLAIR_DIR}/deploy"
 
-for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-ble.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-detect-hardware.service schoolair-hardware-check.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer schoolair-mqtt.service; do
+for svc in sen6x.service schoolair.service schoolair-wizard.service schoolair-ble.service schoolair-launcher.service schoolair-netwatch.service schoolair-pigpio-setup.service schoolair-detect-hardware.service schoolair-hardware-check.service schoolair-led.service schoolair-update-watchdog.service schoolair-update-watchdog.timer schoolair-dev-update.service schoolair-dev-update.timer schoolair-mqtt.service schoolair-pigpio-watch.service; do
     if [ -f "${DEPLOY_DIR}/${svc}" ]; then
         install_with_backup "${DEPLOY_DIR}/${svc}" "/etc/systemd/system/${svc}"
         ok "${svc} installed"
@@ -941,6 +941,9 @@ systemctl enable schoolair-card-label.service 2>/dev/null || true
 # The MQTT feed (mqtt_publish.py). Enabled everywhere, but it only publishes
 # where the unit's .env says MQTT_ENABLED=1; elsewhere it exits at once.
 systemctl enable schoolair-mqtt.service 2>/dev/null || true
+# The trap for the flower's mid-move aborts (pigpio_watch.py): logs who connects
+# to pigpiod. Enabled everywhere, but it only starts where a flower is fitted.
+systemctl enable schoolair-pigpio-watch.service 2>/dev/null || true
 systemctl enable schoolair-pigpio-setup.service 2>/dev/null || true
 systemctl enable schoolair-led.service 2>/dev/null || true
 systemctl enable schoolair-detect-hardware.service 2>/dev/null || true
@@ -1015,6 +1018,8 @@ if [[ "$MODE" == "--update" ]]; then
     # New mqtt_publish.py code or .env settings only take effect on restart.
     # Exits 0 at once on units where MQTT is off, so this is cheap there.
     systemctl restart schoolair-mqtt.service  || warn "schoolair-mqtt.service restart failed"
+    # Never a pigpio client, so safe to restart mid-move; skipped on units without a flower.
+    systemctl restart schoolair-pigpio-watch.service || warn "schoolair-pigpio-watch.service restart failed"
     # New flower code only takes effect on restart; same wait as for pigpiod.
     # restart, not try-restart: on the update that first installs the flower it
     # isn't running yet, and try-restart left it stopped until the next reboot.
@@ -1185,6 +1190,7 @@ chk "schoolair-first-boot enabled"        systemctl is-enabled schoolair-first-b
 chk "schoolair-card-config enabled"       systemctl is-enabled schoolair-card-config.service
 chk "schoolair-card-label enabled"        systemctl is-enabled schoolair-card-label.service
 chk "schoolair-mqtt enabled"              systemctl is-enabled schoolair-mqtt.service
+chk "schoolair-pigpio-watch enabled"     systemctl is-enabled schoolair-pigpio-watch.service
 chk "paho-mqtt importable"                "${SCHOOLAIR_DIR}/.venv/bin/python" -c "import paho.mqtt.client"
 chk "schoolair_rollback.sh executable"    test -x "${ADMIN_HOME}/schoolair_rollback.sh"
 chk "update-watchdog timer enabled"       systemctl is-enabled schoolair-update-watchdog.timer

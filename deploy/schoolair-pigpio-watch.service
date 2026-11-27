@@ -1,0 +1,18 @@
+[Unit]
+Description=SchoolAir pigpio watch: log every program that connects to pigpiod (flower units)
+# The trap for the flower's "wave 1" mid-move aborts of 2026-11-26: see
+# pigpio_watch.py. Reads the socket table only, never talks to pigpiod.
+ConditionPathExists=/etc/schoolair-flower-fitted
+After=pigpiod.service schoolair-detect-hardware.service
+
+[Service]
+Type=simple
+# root: only root can see which process owns another user's socket
+User=root
+ExecStart=/usr/bin/python3 -u /home/admin/schoolair/pigpio_watch.py
+Restart=on-failure
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
