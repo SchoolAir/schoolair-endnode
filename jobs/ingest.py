@@ -114,7 +114,7 @@ def _confirm_update_if_pending() -> None:
     except OSError as e:
         print(f"[OTA] Warning: could not clear pending-update marker: {e}")
 
-VERSION = "2.3.30"
+VERSION = "2.3.31"
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
