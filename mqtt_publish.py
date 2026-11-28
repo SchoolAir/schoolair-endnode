@@ -31,6 +31,9 @@ Every minute, how the unit is doing:
     .../{unit}/uptime         86400      seconds since the Pi started
     .../{unit}/flower_height  64.1       flower units: the stem's height, mm
     .../{unit}/flower_state   known      flower units: known / unknown (homes next)
+    .../{unit}/flower_activity homing    flower units: what it is doing right now (homing,
+                                         nod, status nod, shiver, bounce, moving); empty
+                                         while it stands still. Sent as soon as it changes.
 
 And, for Home Assistant, a discovery message per value under
 homeassistant/sensor/schoolair_{unit}/.../config, so the unit appears there
@@ -253,8 +256,10 @@ def _read(path):
 
 
 def flower_status(path: str = FLOWER_CAL) -> dict:
-    """The stem's height and whether the flower knows it, from the flower
-    service's calibration.json (which it rewrites after every move)."""
+    """The stem's height, whether the flower knows it, and what it is doing
+    right now, from the flower service's calibration.json (rewritten on every
+    move). The flower writes "activity" only while it moves; "" then means it
+    stands still, and an empty retained payload clears the topic."""
     try:
         with open(path) as f:
             cal = json.load(f)
@@ -265,6 +270,9 @@ def flower_status(path: str = FLOWER_CAL) -> dict:
     mm = _number(cal.get("current_position_mm"))
     if state == "known" and mm is not None:
         out["flower_height"] = round(mm, 1)
+    if out:
+        activity = cal.get("activity")
+        out["flower_activity"] = activity if isinstance(activity, str) else ""
     return out
 
 
@@ -289,6 +297,12 @@ def status_messages(values: dict, base: str) -> list:
     return [(f"{base}/{k}", v if isinstance(v, str) else json.dumps(v)) for k, v in values.items()]
 
 
+def flower_change_messages(before: dict, after: dict, base: str) -> list:
+    """Only the flower values that changed, checked every POLL_S, so a display
+    shows "Rehoming" when the home starts, not up to a minute later."""
+    return status_messages({k: v for k, v in after.items() if before.get(k) != v}, base)
+
+
 # ── Home Assistant discovery ─────────────────────────────────────────────────
 
 # topic name -> (label, unit, Home Assistant device class, diagnostic?)
@@ -305,11 +319,12 @@ HA_SENSORS = {
     "no2":           ("NO₂", None, None, False),
     "flower_height": ("Flower height", "mm", "distance", False),
     "flower_state":  ("Flower position", None, None, True),
+    "flower_activity": ("Flower activity", None, None, True),
     "wifi_ssid":     ("Wi-Fi network", None, None, True),
     "wifi_rssi":     ("Wi-Fi signal", "dBm", "signal_strength", True),
     "uptime":        ("Uptime", "s", "duration", True),
 }
-_TEXT_SENSORS = {"flower_state", "wifi_ssid"}
+_TEXT_SENSORS = {"flower_state", "flower_activity", "wifi_ssid"}
 
 
 def discovery_messages(names, unit: str, base: str, info: dict, ha_prefix: str) -> list:
@@ -430,6 +445,7 @@ def main() -> int:
     client.loop_start()                           # network in a background thread
 
     last_seen, last_status, announced = None, 0.0, set()
+    last_flower = None    # flower values last sent: a change goes out at once (a home lasts ~1.5 min)
 
     def announce(names):
         """Home Assistant config for values not announced since the (re)connect."""
@@ -451,7 +467,14 @@ def main() -> int:
             for topic, payload in status_messages(values, base):
                 client.publish(topic, payload, qos=0, retain=True)
             announce(values)
-            last_status = time.monotonic()
+            last_status, last_flower = time.monotonic(), flower
+        elif connected and os.path.exists(FLOWER_MARKER):
+            flower = flower_status()
+            if flower and flower != last_flower:
+                for topic, payload in flower_change_messages(last_flower or {}, flower, base):
+                    client.publish(topic, payload, qos=0, retain=True)
+                announce(flower)
+                last_flower = flower
         doc = read_latest()
         key = None if doc is None else (doc.get("recorded_at"), doc.get("error"))
         # Only a sample actually handed to the broker counts as sent, so the

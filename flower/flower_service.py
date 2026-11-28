@@ -44,6 +44,8 @@ is always a reading; a moving flower is telling you something else. Built so far
   5 sensor fault        no valid reading for 2 min: hold the height, shiver (0.8 mm x 3)
                         every 60 s
   7 factory reset       the token goes away: back to state 1, no reboot needed
+  rollback              the updater wrote ROLLBACK_FLAG after undoing a failed update:
+                        one bounce (down 6 mm, straight back up) at the next valid reading
 Off switch, checked every few seconds, no restart needed: "status_motions":
 {"enabled": false} in calibration.json, or an empty file named flower-quiet on the SD
 card's boot partition. Off = exactly the behaviour before. On by default since
@@ -108,6 +110,11 @@ ENDNODE_ENV = os.environ.get("SCHOOLAIR_ENV", "/home/admin/schoolair/.env")
 # An empty file with this name on the boot partition turns the status motions off:
 # anyone can make it by putting the card in a computer, no SSH needed.
 QUIET_FILES = tuple(os.environ.get("FLOWER_QUIET_FILES", "/boot/firmware/flower-quiet:/boot/flower-quiet").split(":"))
+# Written by the endnode updater after it rolled a failed update back (Martin,
+# 2026-11-27: updates run at night and stay invisible; only a rollback shows). The
+# flower answers with one bounce, "I'm back and fine", once it is at a valid reading
+# again, then deletes the file (or remembers its time if it may not).
+ROLLBACK_FLAG = os.environ.get("FLOWER_ROLLBACK_FLAG", os.path.join(HERE, "rolled-back"))
 
 # Raised by the endnode (device_identity.py) when this card's .env belongs to another
 # Pi, e.g. a card cloned from a registered unit: its AUTH_TOKEN is not this unit's.
@@ -542,7 +549,7 @@ class Flower:
         # working down speed is fast (the bench runs 1.5 ms since 2026-10-01).
         self.home_us = mv.get("home_us", max(mv["down_us"], 3000))
 
-    def _save(self, state="known", note=None):
+    def _save(self, state="known", note=None, activity=None):
         # Re-read the file and change only the position keys, so an edit made to
         # calibration.json while the service runs (a new table, a new speed) is
         # never overwritten by this process's stale in-memory copy.
@@ -551,9 +558,21 @@ class Flower:
         fresh["position_state"] = state
         if note:
             fresh["position_note"] = note
+        # What the flower is doing right now, for displays (the endnode's MQTT
+        # flower_activity): "homing", "nod", "status nod", "shiver", "bounce", or
+        # "moving" for a move to a reading. The climb back after a home still says
+        # "homing". Absent while it stands still.
+        if state == "moving":
+            fresh["activity"] = activity or note or "moving"
+        else:
+            fresh.pop("activity", None)
         save_cal(fresh)
         for k in ("current_position_mm", "position_state", "position_note"):
             if k in fresh: self.cal[k] = fresh[k]
+        if "activity" in fresh:
+            self.cal["activity"] = fresh["activity"]
+        else:
+            self.cal.pop("activity", None)
 
     def _move(self, mm, direction, us, full=False, flag=True):
         try:
@@ -593,7 +612,8 @@ class Flower:
         delta = mm - self.pos
         if abs(delta) < 0.05:
             return
-        self._save(state="moving")
+        climb_after_home = delta > 0 and getattr(self, "just_homed", False)
+        self._save(state="moving", activity="homing" if climb_after_home else None)
         if delta > 0:
             rec = self.cal["moves"].get("recovery", {})
             if getattr(self, "just_homed", False) and rec:
@@ -794,6 +814,37 @@ class Flower:
             log.info("shiver x%d (%.1f mm) at %.1f mm", n, mm, self.pos)
         return ok
 
+    def bounce(self):
+        """Down bounce_mm and straight back up, once: "I'm back" (state 3's bounce).
+        Near the bottom it goes up first."""
+        mm = float(self._sm("bounce_mm", 6.0))
+        ok = (self._gesture("bounce", [("down", mm, 0), ("up", mm, 0)])
+              or self._gesture("bounce", [("up", mm, 0), ("down", mm, 0)]))
+        if ok:
+            log.info("bounce (%.1f mm) at %.1f mm", mm, self.pos)
+        return ok
+
+    def maybe_rollback_bounce(self, status):
+        """After the updater rolled an update back: one bounce at the first valid reading."""
+        try:
+            mtime = os.path.getmtime(ROLLBACK_FLAG)
+        except OSError:
+            return False
+        if status.get("status") != "ok" or self.cal.get("rollback_bounced_mtime") == mtime:
+            return False
+        if not self.bounce():
+            return False
+        log.info("status: the endnode rolled an update back (%s); bounced once", ROLLBACK_FLAG)
+        try:
+            os.remove(ROLLBACK_FLAG)
+        except OSError:
+            self.cal["rollback_bounced_mtime"] = mtime   # not ours to delete: never bounce for it again
+            try:
+                fresh = load_cal(); fresh["rollback_bounced_mtime"] = mtime; save_cal(fresh)
+            except (OSError, ValueError) as e:
+                log.warning("cannot record the rollback bounce (%s)", e)
+        return True
+
     def status_mode(self):
         """'off' (switch off: behaviour as before), 'setup' (state 1) or 'service'."""
         if not status_motions_on(self.cal):
@@ -942,6 +993,7 @@ class Flower:
                     self._led_clear()
                 if mode == "service":
                     self.fault_tick(s, time.time())
+                    self.maybe_rollback_bounce(s)
                 self.maybe_nod(s)
                 self.maybe_nightly_home(s)
             except MoveInterrupted:

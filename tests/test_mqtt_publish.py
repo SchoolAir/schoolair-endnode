@@ -356,11 +356,36 @@ def test_wifi_name_from_nmcli():
 def test_flower_height_only_when_the_flower_knows_it(tmp_path):
     cal = tmp_path / "calibration.json"
     cal.write_text(json.dumps({"current_position_mm": 64.123, "position_state": "known"}))
-    assert mp.flower_status(str(cal)) == {"flower_state": "known", "flower_height": 64.1}
+    assert mp.flower_status(str(cal)) == {"flower_state": "known", "flower_height": 64.1, "flower_activity": ""}
     cal.write_text(json.dumps({"current_position_mm": None, "position_state": "unknown"}))
-    assert mp.flower_status(str(cal)) == {"flower_state": "unknown"}
+    assert mp.flower_status(str(cal)) == {"flower_state": "unknown", "flower_activity": ""}
     cal.write_text("{broken")
     assert mp.flower_status(str(cal)) == {}
+
+
+def test_flower_activity_while_it_moves(tmp_path):
+    """Flower-End-node PR #7: "activity" is in calibration.json only while it moves."""
+    cal = tmp_path / "calibration.json"
+    cal.write_text(json.dumps({"current_position_mm": 20.0, "position_state": "moving", "activity": "homing"}))
+    assert mp.flower_status(str(cal)) == {"flower_state": "moving", "flower_activity": "homing"}
+    msgs = dict(mp.status_messages(mp.flower_status(str(cal)), "b"))
+    assert msgs == {"b/flower_state": "moving", "b/flower_activity": "homing"}
+    cal.write_text(json.dumps({"current_position_mm": 69.0, "position_state": "known"}))
+    assert dict(mp.status_messages(mp.flower_status(str(cal)), "b"))["b/flower_activity"] == ""   # clears the retained value
+
+
+def test_flower_change_sends_only_what_changed():
+    before = {"flower_state": "known", "flower_height": 64.1, "flower_activity": ""}
+    after = {"flower_state": "moving", "flower_activity": "homing"}
+    assert mp.flower_change_messages(before, after, "b") == [("b/flower_state", "moving"), ("b/flower_activity", "homing")]
+    assert mp.flower_change_messages(after, dict(after), "b") == []
+    assert mp.flower_change_messages({}, before, "b")[0] == ("b/flower_state", "known")
+
+
+def test_flower_activity_is_a_text_sensor_for_home_assistant():
+    (topic, payload), = mp.discovery_messages(["flower_activity"], "X76VJRCCFP", "b", {"kind": "flower", "sticker": "X76VJ"}, "homeassistant")
+    cfg = json.loads(payload)
+    assert "unit_of_measurement" not in cfg and "state_class" not in cfg
 
 
 def test_status_messages():
