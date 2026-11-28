@@ -85,6 +85,8 @@ def sandbox(tmp_path, monkeypatch):
     env["SCHOOLAIR_BACKUP_ROOT"] = str(backup_root)
     env["SCHOOLAIR_BACKUP_MANIFEST"] = str(backup_root) + ".manifest"
     env["SCHOOLAIR_PENDING_FILE"] = str(pending_file)
+    env["SCHOOLAIR_ROLLED_BACK_FILE"] = str(tmp_path / "rolled-back-versions")
+    env["FLOWER_ROLLBACK_FLAG"] = str(tmp_path / "flower" / "rolled-back")
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
 
     class Sandbox:
@@ -353,3 +355,27 @@ def test_check_rolls_back_when_a_watched_sen6x_stops(sandbox):
     assert result.returncode == 0, result.stderr
     assert target.read_text() == "GOOD"
     assert not sandbox.pending_file.exists()
+
+
+# ── telling the flower ────────────────────────────────────────────────────────
+
+def test_restore_now_tells_the_flower_what_was_rolled_back(sandbox):
+    (sandbox.tmp_path / "flower").mkdir()
+    sandbox.write_pending(deadline_offset_seconds=3600)
+    result = sandbox.run("--restore-now")
+    assert result.returncode == 0, result.stderr
+    assert (sandbox.tmp_path / "flower" / "rolled-back").read_text().strip() == "1.0.1 -> 1.0.0"
+
+
+def test_restore_now_writes_no_flower_flag_without_a_flower(sandbox):
+    sandbox.write_pending(deadline_offset_seconds=3600)
+    result = sandbox.run("--restore-now")
+    assert result.returncode == 0, result.stderr
+    assert not (sandbox.tmp_path / "flower").exists()
+
+
+def test_deadline_rollback_also_tells_the_flower(sandbox):
+    (sandbox.tmp_path / "flower").mkdir()
+    sandbox.write_pending(deadline_offset_seconds=-1)
+    sandbox.run("--check")
+    assert (sandbox.tmp_path / "flower" / "rolled-back").exists()

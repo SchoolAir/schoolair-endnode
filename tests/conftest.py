@@ -19,6 +19,11 @@ def pytest_configure(config):
         "hardware: requires Raspberry Pi with attached sensor — "
         "skip on laptop with: pytest -m 'not hardware'",
     )
+    config.addinivalue_line(
+        "markers",
+        "night_window: tests of the stable units' night install window "
+        "(tests/jobs/test_ingest.py; other tests run as if inside it)",
+    )
 
 
 @pytest.fixture

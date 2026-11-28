@@ -1113,14 +1113,41 @@ async def _wait_for_boundary(seconds: float) -> None:
         pass
 
 
+# School (stable-channel) units install updates only at night, outside school
+# hours, so a class never sees the flower restart or the unit go quiet (Martin,
+# 2026-11-28: 01:00-05:00 local time, stable only). The Pi's own time zone is
+# used. Outside the window the update simply waits: uploads keep coming (every
+# 15 min at most), and the first reply inside the window starts it. The server
+# can still push an urgent fix at once with "update_now": true. Dev units are
+# not held: they test releases straight away.
+UPDATE_WINDOW_HOURS = (1, 5)        # [start, end) in local hours
+_update_wait_logged_hour = None
+
+
+def _in_update_window(now: "datetime | None" = None) -> bool:
+    hour = (now or datetime.now().astimezone()).hour
+    start, end = UPDATE_WINDOW_HOURS
+    return start <= hour < end
+
+
 def _maybe_trigger_update(response: dict) -> None:
     """Check a server response's min_version, however it got here — a normal
     successful ingest, or a rejected/error response. A device with a revoked
     token or one hitting rate limits should still be able to learn it's
     outdated and self-heal, not just a device with a healthy token."""
+    global _update_wait_logged_hour
     min_ver = response.get("min_version")
-    if min_ver and _version_is_older_than(min_ver):
-        asyncio.create_task(_trigger_update())
+    if not (min_ver and _version_is_older_than(min_ver)):
+        return
+    if _channel() == "stable" and response.get("update_now") is not True and not _in_update_window():
+        hour = datetime.now().astimezone().strftime("%Y-%m-%d %H")
+        if hour != _update_wait_logged_hour:           # once an hour, not every upload
+            _update_wait_logged_hour = hour
+            start, end = UPDATE_WINDOW_HOURS
+            print(f"[OTA] v{min_ver} available; waiting for the night window "
+                  f"({start:02d}:00-{end:02d}:00 local) to install")
+        return
+    asyncio.create_task(_trigger_update())
 
 
 async def _handle_response(response: dict) -> None:

@@ -34,6 +34,11 @@ BACKUP_ROOT="${SCHOOLAIR_BACKUP_ROOT:-/var/backups/schoolair-update}"
 BACKUP_MANIFEST="${SCHOOLAIR_BACKUP_MANIFEST:-${BACKUP_ROOT}.manifest}"
 PENDING_FILE="${SCHOOLAIR_PENDING_FILE:-/var/lib/schoolair/update-pending.json}"
 ROLLED_BACK_FILE="${SCHOOLAIR_ROLLED_BACK_FILE:-/var/lib/schoolair/dev-update-rolled-back}"
+# Tells the flower a failed update was rolled back, so it bounces once at its
+# next valid reading ("I'm back and fine"; Martin 2026-11-28, Flower-End-node
+# PR #6, which deletes the file). On the card, not /run: it must outlive the
+# reboot. Written only where the flower is installed.
+FLOWER_ROLLBACK_FLAG="${FLOWER_ROLLBACK_FLAG:-/home/admin/flower/rolled-back}"
 LOG_TAG="[schoolair-rollback]"
 
 log() { echo "${LOG_TAG} $*"; }
@@ -67,14 +72,20 @@ do_restore_now() {
     log "Restoring from backup (immediate)…"
     # Remember the version being reverted, so a dev-channel unit's hourly
     # check (schoolair-dev-update) does not install it again next hour.
-    local to_version
+    local to_version from_version
     to_version="$(python3 -c "import json; print(json.load(open('${PENDING_FILE}')).get('to_version', ''))" 2>/dev/null || true)"
+    from_version="$(python3 -c "import json; print(json.load(open('${PENDING_FILE}')).get('from_version', ''))" 2>/dev/null || true)"
     if [ -n "$to_version" ]; then
         mkdir -p "$(dirname "$ROLLED_BACK_FILE")"
         echo "$to_version" >> "$ROLLED_BACK_FILE"
         log "Recorded ${to_version} as rolled back (${ROLLED_BACK_FILE})"
     fi
     restore_from_backup
+    if [ -d "$(dirname "$FLOWER_ROLLBACK_FLAG")" ]; then
+        echo "${to_version:-?} -> ${from_version:-?}" > "$FLOWER_ROLLBACK_FLAG" \
+            && log "Told the flower (${FLOWER_ROLLBACK_FLAG})" \
+            || log "WARNING: could not write ${FLOWER_ROLLBACK_FLAG}"
+    fi
     restart_services
     rm -f "$PENDING_FILE"
     log "Restore complete."

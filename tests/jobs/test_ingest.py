@@ -1609,3 +1609,68 @@ def test_get_led_state_reads_the_word_and_tolerates_a_missing_file(monkeypatch, 
     assert ingest._get_led_state() is None
     f.write_text("thinking\n")
     assert ingest._get_led_state() == "thinking"
+
+
+# ── night install window (stable units, Martin 2026-11-28) ───────────────────
+
+@pytest.fixture(autouse=True)
+def _inside_update_window(request, monkeypatch):
+    """The older tests above expect an update at once: run them inside the
+    window. The window tests below switch this off with @night_window."""
+    if "night_window" not in request.keywords:
+        monkeypatch.setattr(ingest, "_in_update_window", lambda now=None: True)
+
+
+night_window = pytest.mark.night_window
+
+
+@night_window
+@pytest.mark.parametrize("hour,inside", [(0, False), (1, True), (3, True), (4, True), (5, False),
+                                          (9, False), (14, False), (23, False)])
+def test_window_is_one_to_five_local(hour, inside):
+    assert ingest._in_update_window(datetime(2026, 11, 28, hour, 30)) is inside
+
+
+def _triggered(response, monkeypatch, channel, in_window):
+    monkeypatch.setattr(ingest, "_channel", lambda: channel)
+    monkeypatch.setattr(ingest, "_in_update_window", lambda now=None: in_window)
+    monkeypatch.setattr(ingest, "_update_wait_logged_hour", None)
+    tasks = []
+
+    def fake_task(coro):
+        tasks.append(coro)
+        coro.close()                       # never run the real updater
+    with patch("asyncio.create_task", side_effect=fake_task):
+        ingest._maybe_trigger_update(response)
+    return len(tasks)
+
+
+@night_window
+def test_school_unit_waits_for_the_night(monkeypatch, capsys):
+    assert _triggered({"min_version": "99.0.0"}, monkeypatch, "stable", in_window=False) == 0
+    assert "waiting for the night window (01:00-05:00 local)" in capsys.readouterr().out
+
+
+@night_window
+def test_school_unit_updates_inside_the_window(monkeypatch):
+    assert _triggered({"min_version": "99.0.0"}, monkeypatch, "stable", in_window=True) == 1
+
+
+@night_window
+def test_urgent_fix_goes_at_once(monkeypatch):
+    assert _triggered({"min_version": "99.0.0", "update_now": True}, monkeypatch, "stable", in_window=False) == 1
+
+
+@night_window
+def test_dev_unit_is_not_held(monkeypatch):
+    assert _triggered({"min_version": "99.0.0"}, monkeypatch, "dev", in_window=False) == 1
+
+
+@night_window
+def test_the_wait_is_logged_once_an_hour_not_every_upload(monkeypatch, capsys):
+    _triggered({"min_version": "99.0.0"}, monkeypatch, "stable", in_window=False)
+    capsys.readouterr()
+    tasks = []
+    with patch("asyncio.create_task", side_effect=tasks.append):
+        ingest._maybe_trigger_update({"min_version": "99.0.0"})
+    assert capsys.readouterr().out == "" and tasks == []
